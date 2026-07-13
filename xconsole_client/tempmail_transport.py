@@ -10,15 +10,19 @@ API endpoint reference:
 
 An Email object: { from, to, subject, body, html, date (unix ms) }.
 
+Free tier needs no API key (https://github.com/tempmail-lol/api-python README).
+TEMPMAIL_API_KEY is only for Plus/Ultra / higher rate limits.
+
 Usage:
     from xconsole_client.tempmail_transport import TempmailInbox
-    inbox = TempmailInbox(api_key="...", prefix="xai")
+    inbox = TempmailInbox(prefix="xai")  # free tier
     address = inbox.create()
     # ... send email to address ...
     code = inbox.wait_for_code(timeout=90)
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -34,74 +38,167 @@ BASE_URL = "https://api.tempmail.lol"
 class TempmailInbox:
     """A Tempmail.lol inbox with polling for x.ai verification codes."""
 
-    api_key: str
+    api_key: str = ""
     prefix: str = ""
     base_url: str = BASE_URL
     timeout: float = 90.0
     interval: float = 3.0
     debug: bool = False
+    proxy: str = ""
 
     # populated after create()
     address: str = ""
     token: str = ""
     _created: bool = field(default=False, init=False)
 
-    def _auth_headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.api_key}"}
+    def _proxies(self) -> Optional[dict]:
+        p = (
+            (self.proxy or "").strip()
+            or (os.environ.get("HTTPS_PROXY") or "").strip()
+            or (os.environ.get("HTTP_PROXY") or "").strip()
+            or (os.environ.get("https_proxy") or "").strip()
+            or (os.environ.get("http_proxy") or "").strip()
+        )
+        if not p:
+            return None
+        return {"http": p, "https": p}
+
+    def _headers(self, *, content_type: bool = False) -> dict:
+        # Match free web client headers; Authorization only when Plus/Ultra key set.
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/138.0.0.0 Safari/537.36"
+            ),
+            "Origin": "https://tempmail.lol",
+            "Referer": "https://tempmail.lol/",
+        }
+        if content_type:
+            headers["Content-Type"] = "application/json"
+        key = (self.api_key or "").strip()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return headers
 
     def create(self) -> str:
         """Create a new inbox. Returns the email address."""
         if self._created:
             raise RuntimeError("Inbox already created")
 
-        resp = requests.post(
-            f"{self.base_url}/v2/inbox/create",
-            headers=self._auth_headers(),
-            json={"prefix": self.prefix},
-            timeout=15,
-        )
-        if resp.status_code != 201:
-            raise RuntimeError(
-                f"Tempmail.lol create inbox failed: {resp.status_code} {resp.text[:300]}"
-            )
+        payload: dict = {}
+        if self.prefix:
+            payload["prefix"] = self.prefix
 
-        data = resp.json()
-        self.address = data["address"]
-        self.token = data["token"]
-        self._created = True
+        last_err: Optional[Exception] = None
+        for attempt in range(4):
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/v2/inbox/create",
+                    headers=self._headers(content_type=True),
+                    json=payload,
+                    timeout=20,
+                    proxies=self._proxies(),
+                )
+                if resp.status_code == 429:
+                    last_err = RuntimeError(f"Tempmail.lol rate limited: {resp.text[:200]}")
+                    time.sleep(5 + attempt * 3)
+                    continue
+                if resp.status_code not in (200, 201):
+                    raise RuntimeError(
+                        f"Tempmail.lol create inbox failed: {resp.status_code} {resp.text[:300]}"
+                    )
 
-        if self.debug:
-            print(f"  [Tempmail] inbox created: {self.address}")
+                data = resp.json() if resp.content else {}
+                address = str(data.get("address") or data.get("email") or "").strip()
+                token = str(data.get("token") or "").strip()
+                if not address or not token:
+                    raise RuntimeError(f"Tempmail.lol create missing address/token: {data}")
 
-        return self.address
+                self.address = address
+                self.token = token
+                self._created = True
 
-    def get_emails(self) -> list[dict]:
-        """Fetch all emails currently in the inbox."""
+                if self.debug:
+                    print(f"  [Tempmail] inbox created: {self.address}")
+
+                return self.address
+            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                last_err = exc
+                if self.debug:
+                    print(f"  [Tempmail] create attempt {attempt + 1}/4 failed: {exc}")
+                time.sleep(1.5 + attempt)
+
+        raise RuntimeError(f"Tempmail.lol create failed after retries: {last_err}")
+
+    def get_emails(self, *, budget: Optional[float] = None) -> list[dict]:
+        """Fetch all emails currently in the inbox.
+
+        ``budget`` caps total time spent in this call (including retries) so a
+        slow/hung HTTP stack cannot overrun ``wait_for_code`` deadlines.
+        """
         if not self._created:
             raise RuntimeError("Call create() first")
 
-        resp = requests.get(
-            f"{self.base_url}/v2/inbox",
-            headers=self._auth_headers(),
-            params={"token": self.token},
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            return []
+        started = time.time()
+        # Default single-call budget when not driven by wait_for_code.
+        hard_deadline = started + (budget if budget is not None else 20.0)
+        last_err: Optional[Exception] = None
+        for attempt in range(3):
+            remaining = hard_deadline - time.time()
+            if remaining <= 0:
+                break
+            # Keep each request short so we can re-check the outer deadline.
+            req_timeout = max(1.0, min(10.0, remaining))
+            try:
+                resp = requests.get(
+                    f"{self.base_url}/v2/inbox",
+                    headers=self._headers(),
+                    params={"token": self.token},
+                    timeout=req_timeout,
+                    proxies=self._proxies(),
+                )
+                if resp.status_code != 200:
+                    return []
 
-        data = resp.json()
-        return data.get("emails", [])
+                data = resp.json() if resp.content else {}
+                if isinstance(data, dict) and data.get("expired"):
+                    raise RuntimeError("Tempmail.lol inbox expired")
+                emails = data.get("emails") if isinstance(data, dict) else data
+                if not isinstance(emails, list):
+                    return []
+                return emails
+            except (requests.RequestException, ValueError) as exc:
+                last_err = exc
+                # Don't sleep past the budget.
+                sleep_for = min(0.5 + attempt * 0.5, max(0.0, hard_deadline - time.time()))
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+        if self.debug and last_err:
+            print(f"  [Tempmail] get_emails failed: {last_err}")
+        return []
 
     def wait_for_code(self, timeout: Optional[float] = None) -> str:
         """Poll until a 6-char x.ai code appears. Returns the code string.
 
         Raises TimeoutError if nothing arrives within the timeout.
+        Deadline is enforced strictly — HTTP retries cannot push past it.
         """
-        deadline = time.time() + (timeout or self.timeout)
+        total = float(timeout if timeout is not None else self.timeout)
+        deadline = time.time() + total
         seen_ids: set[str] = set()
 
         while True:
-            emails = self.get_emails()
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Tempmail.lol: no x.ai code for {self.address} within "
+                    f"{total:.0f}s ({len(seen_ids)} emails seen)"
+                )
+
+            # Bound each poll so a hung request cannot overrun the deadline.
+            emails = self.get_emails(budget=min(8.0, remaining))
             for email in emails:
                 # Use from+subject+date as a dedup key
                 eid = f"{email.get('from','')}:{email.get('subject','')}:{email.get('date','')}"
@@ -120,15 +217,19 @@ class TempmailInbox:
                         print(f"  [Tempmail] code found: {code} (from: {email.get('from')})")
                     return code
 
-            if time.time() >= deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
                 raise TimeoutError(
                     f"Tempmail.lol: no x.ai code for {self.address} within "
-                    f"{timeout or self.timeout:.0f}s ({len(seen_ids)} emails seen)"
+                    f"{total:.0f}s ({len(seen_ids)} emails seen)"
                 )
 
             if self.debug:
-                print(f"  [Tempmail] polling... ({len(seen_ids)} emails so far)")
-            time.sleep(self.interval)
+                print(
+                    f"  [Tempmail] polling... ({len(seen_ids)} emails so far, "
+                    f"{remaining:.0f}s left)"
+                )
+            time.sleep(min(self.interval, remaining))
 
 
 # --------------------------------------------------------------------------- #

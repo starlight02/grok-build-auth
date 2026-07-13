@@ -18,7 +18,7 @@ grok-build-auth — 使用须知与免责声明 (NOTICE)
   - 适用于特定用途 (fitness for a particular purpose)
   - 不侵权 (non-infringement)
   - 安全性、稳定性、可靠性、准确性
-  - 与第三方服务（x.ai / Grok、Cloudflare、YesCaptcha、Tempmail.lol、
+  - 与第三方服务（x.ai / Grok、Cloudflare、Tempmail.lol、
     CLIProxyAPI 等）的持续兼容性
   - 任何隐含承诺
 
@@ -118,7 +118,6 @@ grok-build-auth — 使用须知与免责声明 (NOTICE)
 
   - xAI / Grok / x.ai
   - Cloudflare
-  - YesCaptcha 或任何打码服务商
   - Tempmail.lol 或任何临时邮箱服务商
   - CLIProxyAPI 及其上游作者 / 组织
   - 任何代理服务商
@@ -150,7 +149,8 @@ grok-build-auth — 使用须知与免责声明 (NOTICE)
 
   - 本仓库**不得**包含真实 API key、OAuth token、邮箱密码、SSO JWT
   - 运行产物（`sso_output/`、`oauth_output/`、`accounts_output/`、
-    `cliproxyapi_auth/`）默认被 `.gitignore` 忽略，**禁止**提交到公开仓库
+    `cliproxyapi_auth/`、`cliproxyapi_auth_failed/`）默认被 `.gitignore`
+    忽略，**禁止**提交到公开仓库
   - 你应自行妥善保管本地生成的凭证；泄露风险由你自行承担
   - 贡献代码或文档时，必须脱敏：禁止提交真实邮箱、token、cookie、个人身份信息
 

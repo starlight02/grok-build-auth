@@ -15,7 +15,11 @@ Public API:
 """
 from .client import XConsoleAuthClient
 from .models import GrpcResult, PasswordStrength, SignupResult
-from .solver import YesCaptchaSolver, create_solver
+from .solver import (
+    LocalBrowserTurnstileSolver,
+    create_solver,
+    resolve_turnstile_solver,
+)
 from .sso import (
     SSOExtractor,
     parse_sso_jwt_url,
@@ -58,8 +62,9 @@ __all__ = [
     "GrpcResult",
     "PasswordStrength",
     "SignupResult",
-    "YesCaptchaSolver",
+    "LocalBrowserTurnstileSolver",
     "create_solver",
+    "resolve_turnstile_solver",
     "SSOExtractor",
     "parse_sso_jwt_url",
     "parse_jwt_payload",

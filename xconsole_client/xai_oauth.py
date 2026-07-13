@@ -467,7 +467,15 @@ def _finalize_oauth_code(
         proxy=proxy,
     )
     userinfo = fetch_userinfo(str(token.get("access_token") or ""), proxy=proxy)
-    path = save_oauth_record(token, userinfo=userinfo, client_id=client_id, output_dir=output_dir)
+    # Raw oauth_output is opt-in for the Build pipeline:
+    # - cliproxyapi only (run.py default): skip oauth_output
+    # - standalone OAuth (no cliproxy dir): still archive to oauth_output
+    # - explicit output_dir: always write
+    path: Optional[Path] = None
+    if output_dir is not None or not cliproxyapi_auth_dir:
+        path = save_oauth_record(
+            token, userinfo=userinfo, client_id=client_id, output_dir=output_dir
+        )
     cliproxy_path: Optional[Path] = None
     if cliproxyapi_auth_dir:
         cliproxy_path = save_cliproxyapi_auth_record(
@@ -763,7 +771,6 @@ def complete_build_oauth(
     port: int = 0,
     proxy: str = "",
     interactive_fallback: bool = False,
-    yescaptcha_key: Optional[str] = None,
     protocol: bool = True,
     debug: bool = False,
     session_cookies: Optional[Dict[str, str]] = None,
@@ -772,11 +779,10 @@ def complete_build_oauth(
     """Obtain Grok Build/CLI OAuth tokens after protocol signup.
 
     Preference order:
-      1) Pure HTTP protocol (reuse signup cookies, else CreateSession+YesCaptcha)
+      1) Pure HTTP protocol (reuse signup cookies, else CreateSession + local Turnstile)
       2) Playwright auto-login (if protocol=False or protocol fails)
       3) Interactive system-browser fallback (if interactive_fallback=True)
     """
-    key = (yescaptcha_key or os.environ.get("YESCAPTCHA_API_KEY") or "").strip()
     errors: list[str] = []
 
     if protocol:
@@ -785,7 +791,6 @@ def complete_build_oauth(
             return login_with_protocol(
                 email,
                 password,
-                yescaptcha_key=key,
                 proxy=proxy,
                 debug=debug,
                 cliproxyapi_auth_dir=str(cliproxyapi_auth_dir) if cliproxyapi_auth_dir else None,

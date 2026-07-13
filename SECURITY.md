@@ -8,7 +8,7 @@ This project is governed by [`NOTICE`](NOTICE). We **do not** provide assistance
 
 This repository **must not** contain:
 
-- YesCaptcha / captcha vendor API keys  
+- Third-party API keys (Cloudflare, Tempmail, etc.)  
 - Cloudflare tokens or D1 identifiers with real credentials  
 - Temp mailbox API keys  
 - OAuth access / refresh / id tokens  
@@ -23,6 +23,7 @@ Use a local `.env` (see `.env.example`) or shell environment variables.
 - `oauth_output/`  
 - `accounts_output/`  
 - `cliproxyapi_auth/`  
+- `cliproxyapi_auth_failed/`  
 
 If a secret was ever committed to a fork or mirror, **rotate it immediately**.
 
@@ -40,7 +41,7 @@ Do **not** file a public issue with live tokens or account details.
 
 ## Platform operators
 
-If you represent xAI, Cloudflare, a captcha vendor, or another mentioned service and have compliance concerns about this research client, contact the maintainer via a private Security Advisory. We will treat such reports seriously.
+If you represent xAI, Cloudflare, a mailbox vendor, or another mentioned service and have compliance concerns about this research client, contact the maintainer via a private Security Advisory. We will treat such reports seriously.
 
 ## Responsible use
 

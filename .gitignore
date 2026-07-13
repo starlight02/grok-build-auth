@@ -19,6 +19,7 @@ sso_output/
 oauth_output/
 accounts_output/
 cliproxyapi_auth/
+cliproxyapi_auth_failed/
 
 # alias_mail runtime state
 .alias_domain_health.json
@@ -31,7 +32,7 @@ _dbg_*.py
 _consent*
 _parse_consent.py
 *.html.bak
-*.log
+*.log*
 
 # OS / editor
 .DS_Store

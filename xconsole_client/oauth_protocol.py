@@ -5,7 +5,7 @@ After account signup (or with email/password), this module:
 
   1. Starts OAuth PKCE against auth.x.ai
   2. Lands on accounts.x.ai/sign-in?redirect=oauth2-provider&return_to=/oauth2/consent?...
-  3. Solves Cloudflare Turnstile via YesCaptcha
+  3. Solves Cloudflare Turnstile (local browser / Playwright)
   4. Calls auth_mgmt.AuthManagement/CreateSession (gRPC-web)
   5. Follows cookieSetterUrl + OAuth redirects to capture authorization code
   6. Exchanges code for tokens and exports CLIProxyAPI Grok Build auth JSON
@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 
 from . import grpcweb
-from .solver import YesCaptchaSolver
+from .solver import resolve_turnstile_solver
 from .xai_oauth import (
     AUTHORIZATION_ENDPOINT,
     CLIPROXYAPI_GROK_BASE_URL,
@@ -157,12 +157,11 @@ def extract_cookies_from_auth_client(client: Any) -> Dict[str, str]:
 
 
 class ProtocolOAuthClient:
-    """HTTP-only OAuth client using curl_cffi fingerprint + YesCaptcha."""
+    """HTTP-only OAuth client using curl_cffi fingerprint + Turnstile solver."""
 
     def __init__(
         self,
         *,
-        yescaptcha_key: str = "",
         proxy: str = "",
         impersonate: str = "chrome131",
         debug: bool = False,
@@ -170,10 +169,17 @@ class ProtocolOAuthClient:
     ):
         self.debug = debug
         self.turnstile_premium = turnstile_premium
-        self._yescaptcha_key = (yescaptcha_key or "").strip()
-        self.solver: Optional[YesCaptchaSolver] = None
-        if self._yescaptcha_key:
-            self.solver = YesCaptchaSolver(self._yescaptcha_key, debug=debug)
+        # Local browser Turnstile only.
+        try:
+            self.solver = resolve_turnstile_solver(
+                proxy=proxy,
+                debug=debug,
+            )
+        except Exception as exc:
+            self.solver = None
+            self._solver_error = str(exc)
+        else:
+            self._solver_error = ""
         try:
             from curl_cffi import requests as creq
         except ImportError as exc:
@@ -269,7 +275,10 @@ class ProtocolOAuthClient:
         if not self.solver:
             return {
                 "ok": False,
-                "error": "YESCAPTCHA_API_KEY required for CreateSession Turnstile",
+                "error": (
+                    "Turnstile solver unavailable for CreateSession: "
+                    + (self._solver_error or "no solver")
+                ),
                 "grpc_status": None,
                 "session_jwt": None,
                 "raw_fields": [],
@@ -701,7 +710,6 @@ def login_with_protocol(
     email: str,
     password: str,
     *,
-    yescaptcha_key: str = "",
     proxy: str = "",
     debug: bool = False,
     turnstile_premium: bool = True,
@@ -719,7 +727,6 @@ def login_with_protocol(
     curl_cffi session is reused so accounts.x.ai cookies stay attached.
     """
     client = ProtocolOAuthClient(
-        yescaptcha_key=yescaptcha_key,
         proxy=proxy,
         debug=debug,
         turnstile_premium=turnstile_premium,

@@ -8,7 +8,7 @@ A **protocol-research client** for publicly observable **x.ai / Grok web authent
 
 for protocol analysis, interoperability research, and **authorized** local integration testing.
 
-The default path does not launch a browser. Cloudflare Turnstile is solved via a createTask-compatible captcha service.
+Default path: signup/OAuth over pure HTTP (`curl_cffi`). **Turnstile uses a local browser** (system Chrome `--headless=new` by default; set `TURNSTILE_HEADLESS=0` / `TURNSTILE_INTERACTIVE=1` for headed / manual click).
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
@@ -32,7 +32,7 @@ The default path does not launch a browser. Cloudflare Turnstile is solved via a
 | **Allowed** | Your own accounts and environments; clearly authorized security research; CTF / academic protocol study; offline source reading |
 | **Prohibited** | Fraud, bulk signup for resale, unlicensed automation against unauthorized targets, intentional platform abuse |
 | **Liability** | Account bans, quota loss, civil / criminal / administrative outcomes — **all on the user** |
-| **Affiliation** | **Not** affiliated with, endorsed by, or sponsored by xAI, Grok, Cloudflare, CLIProxyAPI, captcha vendors, or mailbox vendors |
+| **Affiliation** | **Not** affiliated with, endorsed by, or sponsored by xAI, Grok, Cloudflare, CLIProxyAPI, or mailbox vendors |
 
 Full terms: [`NOTICE`](NOTICE). License is [MIT](LICENSE), but **MIT is not the entire disclaimer**.
 
@@ -53,10 +53,10 @@ A research-oriented protocol client, **not** an official SDK.
 
 Highlights:
 
-- **Protocol-first** pure HTTP (`curl_cffi`) by default  
+- **Protocol-first** pure HTTP (`curl_cffi`) for signup / OAuth  
+- **Turnstile**: system Chrome headless by default (`TURNSTILE_SOLVER=browser`); headed / interactive via env  
 - **SSO reuse** can skip a second Turnstile on OAuth  
-- **Interop export** for `cli-chat-proxy.grok.com` + grok-cli headers — **not** the paid `api.x.ai` credits API path  
-- Concurrent signup workers; OAuth serialized by default  
+- **Lean outputs**: default writes only `sso_output/` + `cliproxyapi_auth/`  
 
 SSO **alone cannot** become a CPA auth file; OAuth tokens are required.
 
@@ -78,8 +78,8 @@ flowchart LR
 ## Requirements
 
 - Python 3.9+
-- YesCaptcha (or createTask-compatible) API key for Turnstile  
-- Tempmail.lol API key **or** your own Cloudflare D1 alias mailbox  
+- Turnstile: local Google Chrome (default headless; optional headed/manual)  
+- Mailbox: Tempmail.lol **free tier (no API key)** by default; optional Plus/Ultra key or your Cloudflare D1 alias mailbox  
 - Optional HTTP(S) proxy  
 - Optional local CLIProxyAPI install to load exported auth files  
 
@@ -105,18 +105,54 @@ cp .env.example .env
 
 See [`.env.example`](.env.example). Never commit `.env` or runtime token directories. See [`SECURITY.md`](SECURITY.md).
 
+| Variable | Required | Notes |
+|---|---|---|
+| `TURNSTILE_SOLVER` | no | `browser` only (system Chrome / Playwright Chromium) |
+| `TURNSTILE_HEADLESS` | no | default `1` = Chrome `--headless=new`; `0` = headed window |
+| `TURNSTILE_BROWSER_CHANNEL` | no | auto-selects `chrome` when headless + Chrome installed |
+| `TURNSTILE_INTERACTIVE` | no | `1` = manual Turnstile click (forces headed) |
+| `TURNSTILE_BROWSER_REUSE` | no | `1` = warm per-thread browser (default 1) |
+| `TURNSTILE_TIMEOUT` | no | per-solve timeout seconds (default 60) |
+| `TEMPMAIL_API_KEY` | no | Tempmail.lol Plus/Ultra (**free tier needs no key**) |
+| `MAIL_CODE_TIMEOUT` | no | seconds to wait for code before rotating inbox (default 30) |
+| `MAIL_MAX_ATTEMPTS` | no | max fresh inboxes when mail is silent (default 3) |
+| `CLOUDFLARE_API_TOKEN` | for `-e cloudflare` | CF API token |
+| `CLOUDFLARE_ACCOUNT_ID` | same | CF account |
+| `CLOUDFLARE_D1_DB_ID` | same | D1 database ID |
+| `ALIAS_MAIL_DOMAINS` | same | domains you control (comma-separated) |
+| `CLIPROXYAPI_AUTH_DIR` | no | default `./cliproxyapi_auth` |
+| `HTTPS_PROXY` / `HTTP_PROXY` | no | proxy |
+
 ### Run (research / accounts you own)
 
 ```bash
+# Full pipeline: signup + SSO + Build OAuth → cliproxyapi_auth/
+# Signup + protocol OAuth concurrent; Turnstile / browser OAuth fallback serialized
 python run.py -n 1
 python run.py -n 5 -t 3
 python run.py -n 1 -e cloudflare
 python run.py -n 1 --no-oauth
 python run.py -n 1 --cliproxyapi-auth-dir /path/to/CLIProxyAPI/data/auth
+python run.py -n 1 --accounts-output-dir ./accounts_output   # optional ledger
 python run.py -n 1 --oauth-debug
+# After OAuth, probe Build quota (off by default): keep only usable files
+python run.py -n 1 --check-quota
+python run.py -n 5 -t 4 --check-quota --failed-auth-dir ./cliproxyapi_auth_failed
 ```
 
-Helpers: `xai_oauth_login.py`, `xai_oauth_export_cliproxyapi.py`, `xai_build_quota_probe.py`.
+### Runtime outputs
+
+| Dir | Default | Purpose |
+|---|---|---|
+| `sso_output/` | **on** | email + password + SSO JWT |
+| `cliproxyapi_auth/` | **on** (unless `--no-oauth`) | CLIProxyAPI-ready auth JSON |
+| `cliproxyapi_auth_failed/` | only with `--check-quota` | zero-quota auth (override with `--failed-auth-dir`) |
+| `oauth_output/` | off | raw OAuth archive (standalone tools / explicit `output_dir`) |
+| `accounts_output/` | off | pipeline ledger (`--accounts-output-dir`) |
+
+Helpers:
+- `check_accounts.py` — **only** auth usability / Build quota checker
+- `xai_oauth_login.py`, `xai_oauth_export_cliproxyapi.py` — standalone OAuth helpers
 
 ---
 
@@ -140,7 +176,6 @@ Security: private channel only — [`SECURITY.md`](SECURITY.md).
 | Channel | Purpose |
 |---|---|
 | [**LINUX DO**](https://linux.do/) | Technical discussion, protocol research feedback, long-term notes |
-| QQ group **`1058789350`** | Real-time Chinese community chat |
 | GitHub Issues | Bug reports and PRs (primary entry) |
 
 ---
