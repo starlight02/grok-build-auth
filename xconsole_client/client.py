@@ -196,11 +196,13 @@ class XConsoleAuthClient:
         # ---- scrape Next.js build-specific values from the live page ----
         try:
             self._scrape_rsc_payload(html)
+        except RuntimeError:
+            # Already a clear, user-facing scrape error — do not re-wrap.
+            raise
         except Exception as exc:
             raise RuntimeError(
-                "Failed to extract next-action / next-router-state-tree from the "
-                "live sign-up page.  The x.ai deployment may have changed its "
-                "page structure.  Details: %s" % exc
+                "Could not scrape signup page metadata "
+                f"(next-action / router-state-tree). {exc}"
             ) from exc
 
         if self.debug:
@@ -209,6 +211,41 @@ class XConsoleAuthClient:
             print(f"  [scrape] router-state-tree len={len(self._next_router_state_tree or '')}")
 
         return status
+
+
+    @staticmethod
+    def _signup_html_problem(html: str) -> str:
+        """Explain why the signup HTML is not a usable Next.js document."""
+        raw = html or ""
+        text = re.sub(r"\s+", " ", raw).strip()
+        low = text.lower()
+        html_len = len(raw)
+
+        if "just a moment" in low or "cf-browser-verification" in low or "cf-challenge" in low:
+            kind = "Cloudflare challenge / interstitial page"
+            hint = "IP or proxy is likely blocked; try another network/proxy."
+        elif "attention required" in low or "sorry, you have been blocked" in low:
+            kind = "Cloudflare block page"
+            hint = "IP or proxy is blocked; rotate IP/proxy and retry."
+        elif "enable javascript" in low and "cloudflare" in low:
+            kind = "Cloudflare JS challenge shell"
+            hint = "protocol scrape cannot pass this; use a clean IP/proxy."
+        elif html_len < 800:
+            kind = "too-short non-app HTML"
+            hint = "not the Next.js signup document (often a block/redirect body)."
+        else:
+            kind = "HTML without Next.js chunk scripts"
+            hint = (
+                "page markup may have changed, or a WAF returned a full-page "
+                "substitute without /_next/static/chunks/*.js."
+            )
+
+        head = text[:160]
+        return (
+            f"Signup page scrape failed: got {kind} (html_len={html_len}). "
+            f"{hint} Expected a Next.js document with "
+            f"/_next/static/chunks/*.js. html_head={head!r}"
+        )
 
     # ----------------------------------------------------------------- dynamic action scraper
     _RSC_PUSH_RE = re.compile(r'self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)')
@@ -327,6 +364,10 @@ class XConsoleAuthClient:
         js_urls = list(set(re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', html)))
         if self.debug:
             print(f"  [scrape] searching {len(js_urls)} JS chunks...")
+        if not js_urls:
+            # Common when CF interstitial / challenge HTML is returned instead of
+            # the Next.js sign-up document (no /_next/static/chunks/*.js at all).
+            raise RuntimeError(self._signup_html_problem(html))
 
         # 2. sort: priority chunks first, then the rest
         priority: List[str] = []
@@ -337,7 +378,6 @@ class XConsoleAuthClient:
             else:
                 rest.append(url)
         ordered = priority + rest
-
         # 3. fetch chunks in parallel and search for action hashes.
         # We collect ALL results and pick the best one (sign-up chunk > any).
         signup_hash: Optional[str] = None
@@ -364,7 +404,7 @@ class XConsoleAuthClient:
             except Exception:
                 return (None, False)
 
-        with ThreadPoolExecutor(max_workers=min(8, len(ordered))) as ex:
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(ordered)))) as ex:
             futures = {ex.submit(_fetch_and_search, url): url for url in ordered}
             for f in as_completed(futures):
                 h, is_signup = f.result()
@@ -378,9 +418,10 @@ class XConsoleAuthClient:
         action_hash = signup_hash or fallback_hash
         if action_hash is None:
             raise RuntimeError(
-                "Could not find the server action ID in any JS chunk.  "
-                "The page structure may have changed.  "
-                "As a workaround, manually set NEXT_ACTION_SIGNUP in config.py."
+                f"Signup page loaded ({len(ordered)} JS chunks) but no server "
+                "action ID was found in those chunks. The action module name or "
+                "hash format may have changed. Workaround: set "
+                "NEXT_ACTION_SIGNUP in config.py if you have a known-good value."
             )
 
         # 4. The 42-char hex string IS the complete action ID.
