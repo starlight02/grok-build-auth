@@ -8,7 +8,7 @@ A **protocol-research client** for publicly observable **x.ai / Grok web authent
 
 for protocol analysis, interoperability research, and **authorized** local integration testing.
 
-Default path: signup/OAuth over pure HTTP (`curl_cffi`). **Turnstile uses a local browser** (system Chrome `--headless=new` by default; set `TURNSTILE_HEADLESS=0` / `TURNSTILE_INTERACTIVE=1` for headed / manual click).
+Default path: signup/OAuth over pure HTTP (`curl_cffi`). **Turnstile only mints a token** via a local browser backend (`auto`→Drission+turnstilePatch; optional Camoufox / Playwright).
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
@@ -54,7 +54,7 @@ A research-oriented protocol client, **not** an official SDK.
 Highlights:
 
 - **Protocol-first** pure HTTP (`curl_cffi`) for signup / OAuth  
-- **Turnstile**: system Chrome headless by default (`TURNSTILE_SOLVER=browser`); headed / interactive via env  
+- **Turnstile**: three local backends (see [Turnstile backends](#turnstile-backends)); default `auto`→Drission  
 - **SSO reuse** can skip a second Turnstile on OAuth  
 - **Lean outputs**: default writes only `sso_output/` + `cliproxyapi_auth/`  
 
@@ -78,7 +78,7 @@ flowchart LR
 ## Requirements
 
 - Python 3.9+
-- Turnstile: local Google Chrome (default headless; optional headed/manual)  
+- Turnstile: local browser backend (default Drission + headed Chrome; optional Camoufox / Playwright)  
 - Mailbox: Tempmail.lol **free tier (no API key)** by default; optional Plus/Ultra key or your Cloudflare D1 alias mailbox  
 - Optional HTTP(S) proxy  
 - Optional local CLIProxyAPI install to load exported auth files  
@@ -97,6 +97,8 @@ cd grok-build-auth
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+# optional Camoufox backend:
+# pip install camoufox && camoufox fetch
 cp .env.example .env
 # put only your own secrets in .env — never commit it
 ```
@@ -107,12 +109,15 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 
 | Variable | Required | Notes |
 |---|---|---|
-| `TURNSTILE_SOLVER` | no | `browser` only (system Chrome / Playwright Chromium) |
-| `TURNSTILE_HEADLESS` | no | default `1` = Chrome `--headless=new`; `0` = headed window |
-| `TURNSTILE_BROWSER_CHANNEL` | no | auto-selects `chrome` when headless + Chrome installed |
-| `TURNSTILE_INTERACTIVE` | no | `1` = manual Turnstile click (forces headed) |
-| `TURNSTILE_BROWSER_REUSE` | no | `1` = warm per-thread browser (default 1) |
-| `TURNSTILE_TIMEOUT` | no | per-solve timeout seconds (default 60) |
+| `TURNSTILE_SOLVER` | no | `auto` (default) / `drission` / `camoufox` / `browser` — see [Turnstile backends](#turnstile-backends) |
+| `TURNSTILE_HEADLESS` | no | drission/camoufox default `0` (headed); playwright default `1`; camoufox may use `virtual` |
+| `TURNSTILE_TIMEOUT` | no | hard wall-clock seconds per mint (**drission default 30**; camoufox/browser default 60) |
+| `TURNSTILE_PARALLEL` | no | concurrent Turnstile mint slots (default **2**; one thread-local Chrome per slot) |
+| `TURNSTILE_MINIMIZED` | no | drission headed default `1`: minimize via Drission/CDP |
+| `TURNSTILE_OFFSCREEN` | no | drission headed default `1`: off-screen `--window-position` backup |
+| `TURNSTILE_BROWSER_CHANNEL` | no | playwright only; auto-selects system `chrome` when available |
+| `TURNSTILE_INTERACTIVE` | no | playwright only: `1` = manual click (forces headed) |
+| `TURNSTILE_BROWSER_REUSE` | no | `1` = warm browser reuse (default 1; drission is thread-local) |
 | `TEMPMAIL_API_KEY` | no | Tempmail.lol Plus/Ultra (**free tier needs no key**) |
 | `MAIL_CODE_TIMEOUT` | no | seconds to wait for code before rotating inbox (default 30) |
 | `MAIL_MAX_ATTEMPTS` | no | max fresh inboxes when mail is silent (default 3) |
@@ -127,9 +132,17 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 
 ```bash
 # Full pipeline: signup + SSO + Build OAuth → cliproxyapi_auth/
-# Signup + protocol OAuth concurrent; Turnstile / browser OAuth fallback serialized
+# Default Turnstile: auto → drission when DrissionPage is installed
 python run.py -n 1
+
+# Pick a Turnstile backend (see section below)
+TURNSTILE_SOLVER=drission python run.py -n 1
+TURNSTILE_SOLVER=camoufox python run.py -n 1
+TURNSTILE_SOLVER=browser  python run.py -n 1
+
+# Multi-account (signup + protocol OAuth concurrent; Turnstile default 2 parallel mints)
 python run.py -n 5 -t 3
+TURNSTILE_PARALLEL=2 TURNSTILE_SOLVER=drission python run.py -n 4 -t 4
 python run.py -n 1 -e cloudflare
 python run.py -n 1 --no-oauth
 python run.py -n 1 --cliproxyapi-auth-dir /path/to/CLIProxyAPI/data/auth
@@ -144,7 +157,7 @@ python run.py -n 5 -t 4 --check-quota --failed-auth-dir ./cliproxyapi_auth_faile
 
 | Dir | Default | Purpose |
 |---|---|---|
-| `sso_output/` | **on** | email + password + SSO JWT |
+| `sso_output/` | **on** | per-account `sso_*.json` (email/password/SSO) + append-only `sso_tokens.txt` (one JWT per line) |
 | `cliproxyapi_auth/` | **on** (unless `--no-oauth`) | CLIProxyAPI-ready auth JSON |
 | `cliproxyapi_auth_failed/` | only with `--check-quota` | zero-quota auth (override with `--failed-auth-dir`) |
 | `oauth_output/` | off | raw OAuth archive (standalone tools / explicit `output_dir`) |
@@ -153,6 +166,92 @@ python run.py -n 5 -t 4 --check-quota --failed-auth-dir ./cliproxyapi_auth_faile
 Helpers:
 - `check_accounts.py` — **only** auth usability / Build quota checker
 - `xai_oauth_login.py`, `xai_oauth_export_cliproxyapi.py` — standalone OAuth helpers
+
+---
+
+## Turnstile backends
+
+Signup is pure HTTP; **only the Cloudflare Turnstile token must be minted by a local browser**.  
+Select a backend with `TURNSTILE_SOLVER` (or `resolve_turnstile_solver(backend=...)`).
+
+### Which one?
+
+| `TURNSTILE_SOLVER` | Stack | Headed by default? | When to use |
+|---|---|---|---|
+| **`auto` (default)** | DrissionPage installed → **drission**; else → **browser** | follows backend | daily default |
+| **`drission`** | DrissionPage + system **Chrome** + `turnstilePatch/` | **yes** (`0`) | **recommended** for batch runs |
+| **`camoufox`** | **Camoufox** anti-detect Firefox (launched via Playwright) | **yes** (`0`) | Firefox / anti-detect path; needs `camoufox fetch` |
+| **`browser`** | Playwright Chromium/Chrome | **no** (`1`) | fallback when Drission is missing; often weaker on residential IPs |
+
+Aliases:
+
+- drission: `dp` / `clean` / `drissionpage`
+- camoufox: `camou` / `camoufox-firefox`
+- browser: `local` / `playwright` / `chromium` / `chrome` / `free`
+
+Remote captcha APIs (YesCaptcha / CapSolver / 2Captcha, …) are **not** implemented.  
+Legacy `obscura` backend is removed.
+
+### Dependencies
+
+```bash
+pip install -r requirements.txt
+
+# drission (default path): system Google Chrome required
+# turnstilePatch/ ships in-repo
+
+# camoufox extra:
+pip install camoufox
+camoufox fetch          # download Camoufox binary once
+```
+
+### Commands
+
+```bash
+# default = auto → drission
+python run.py -n 1
+
+# explicit Drission (recommended for batches)
+TURNSTILE_SOLVER=drission TURNSTILE_HEADLESS=0 python run.py -n 10 -t 4
+
+# Camoufox (headed is more reliable; try virtual without a display)
+TURNSTILE_SOLVER=camoufox python run.py -n 1
+TURNSTILE_SOLVER=camoufox TURNSTILE_HEADLESS=virtual python run.py -n 1
+
+# Playwright fallback
+TURNSTILE_SOLVER=browser python run.py -n 1
+TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
+```
+
+### Related env vars
+
+| Variable | Default | Notes |
+|---|---|---|
+| `TURNSTILE_SOLVER` | `auto` | backend picker |
+| `TURNSTILE_HEADLESS` | drission/camoufox=`0`; browser=`1` | `0` headed; `1` headless; camoufox also accepts `virtual` |
+| `TURNSTILE_TIMEOUT` | drission=`30`; others=`60` | hard timeout per token mint (seconds); empty token fails ~12s |
+| `TURNSTILE_PARALLEL` | `2` | concurrent mint slots (Semaphore); drission uses thread-local Chrome |
+| `TURNSTILE_MINIMIZED` | `1` (headed) | minimize window via Drission/CDP |
+| `TURNSTILE_OFFSCREEN` | `1` (headed) | off-screen `--window-position` backup |
+| `TURNSTILE_BROWSER_REUSE` | `1` | warm browser reuse |
+| `TURNSTILE_DEBUG` | off | `1` = verbose solver logs |
+| `TURNSTILE_BROWSER_CHANNEL` | auto | browser only: prefer system Chrome |
+| `TURNSTILE_INTERACTIVE` | off | browser only: manual click |
+| `HTTPS_PROXY` / `HTTP_PROXY` | empty | proxy for browser + protocol HTTP |
+
+Notes:
+
+1. **Signup / mail code / SSO / OAuth stay pure HTTP**; the browser only mints `turnstileToken`.  
+2. `run.py` bounds Turnstile with **`TURNSTILE_PARALLEL` (default 2)**; drission uses **thread-local Chrome** + empty-token fail-fast and `-t N` still speeds mail + protocol stages.  
+3. With SSO, the OAuth fast path usually **skips** a second Turnstile.  
+4. Headless is blocked more often; prefer **headed + minimized/off-screen + warm reuse** for batches.
+
+### How to tell which backend ran
+
+```text
+[#1] Turnstile 730 chars via DrissionTurnstileSolver
+# or CamoufoxTurnstileSolver / LocalBrowserTurnstileSolver
+```
 
 ---
 

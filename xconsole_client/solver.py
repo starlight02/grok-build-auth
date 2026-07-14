@@ -944,6 +944,7 @@ class LocalBrowserTurnstileSolver:
         self._click_turnstile_widget(page)
         return self._wait_token(page, timeout_ms)
 
+
 # --------------------------------------------------------------------------- #
 # Factory
 # --------------------------------------------------------------------------- #
@@ -959,27 +960,64 @@ def resolve_turnstile_solver(
     interactive: Optional[bool] = None,
     **_ignored: Any,
 ) -> TurnstileSolver:
-    """Return a local browser Turnstile solver (Playwright Chromium/Chrome).
+    """Return a Turnstile solver.
 
     ``backend`` / ``TURNSTILE_SOLVER``:
-      - browser|local|playwright|free|auto|chromium|chrome → Playwright Chromium
+      - auto (default) → DrissionPage+turnstilePatch if installed, else Playwright
+      - drission|dp|clean → DrissionPage + turnstilePatch (terminal CLI; bulk path)
+      - camoufox|camou → Camoufox anti-detect Firefox (optional)
+      - browser|local|playwright|free|chromium|chrome → Playwright
 
-    Legacy remote SaaS names and the removed Obscura path are rejected.
+    The bulk registrations that produced sso_output/ used **drission** (or auto→drission).
+    Playwright ``browser`` is kept as fallback; CF may reject it when bot-score is high.
     """
-    mode = (backend or os.environ.get("TURNSTILE_SOLVER") or "browser").strip().lower()
+    mode = (backend or os.environ.get("TURNSTILE_SOLVER") or "auto").strip().lower()
+
     if mode in {"yescaptcha", "yes", "paid", "capsolver", "2captcha", "anticaptcha"}:
         raise ValueError(
-            f"TURNSTILE_SOLVER={mode!r} is not supported; use browser "
-            "(local Playwright Chrome/Chromium)."
+            f"TURNSTILE_SOLVER={mode!r} is not supported; use auto/drission/browser "
+            "(local solvers only)."
         )
     if mode in {"obscura", "obscura-cdp", "cdp"}:
         raise ValueError(
-            "TURNSTILE_SOLVER=obscura has been removed; use browser "
-            "(Chrome headless=new, or TURNSTILE_HEADLESS=0 / TURNSTILE_INTERACTIVE=1)."
+            "TURNSTILE_SOLVER=obscura has been removed; use auto/drission/browser."
         )
+
+    def _drission() -> TurnstileSolver:
+        from xconsole_client.drission_solver import DrissionTurnstileSolver
+
+        return DrissionTurnstileSolver(
+            proxy=proxy,
+            debug=debug,
+            headless=headless,
+            timeout=timeout,
+        )
+
+    def _camoufox() -> TurnstileSolver:
+        from xconsole_client.camoufox_solver import CamoufoxTurnstileSolver
+
+        return CamoufoxTurnstileSolver(
+            proxy=proxy,
+            debug=debug,
+            headless=headless,
+            timeout=timeout,
+        )
+
+    def _playwright() -> TurnstileSolver:
+        return LocalBrowserTurnstileSolver(
+            engine="chromium",
+            headless=headless,
+            timeout=timeout,
+            proxy=proxy,
+            debug=debug,
+            interactive=interactive,
+        )
+
+    if mode in {"drission", "dp", "clean", "drissionpage"}:
+        return _drission()
+    if mode in {"camoufox", "camou", "camoufox-firefox"}:
+        return _camoufox()
     if mode in {
-        "",
-        "auto",
         "browser",
         "local",
         "playwright",
@@ -987,24 +1025,22 @@ def resolve_turnstile_solver(
         "chromium",
         "chrome",
     }:
-        engine = "chromium"
-    else:
-        raise ValueError(
-            f"Unknown TURNSTILE_SOLVER={mode!r}; use browser "
-            "(local Playwright Chrome/Chromium)."
-        )
-    return LocalBrowserTurnstileSolver(
-        engine=engine,
-        headless=headless,
-        timeout=timeout,
-        proxy=proxy,
-        debug=debug,
-        interactive=interactive,
+        return _playwright()
+    if mode in {"", "auto"}:
+        # Prefer Drission when available — this is the path that bulk-registered.
+        try:
+            import DrissionPage  # noqa: F401
+
+            return _drission()
+        except Exception:
+            return _playwright()
+    raise ValueError(
+        f"Unknown TURNSTILE_SOLVER={mode!r}; use auto | drission | camoufox | browser"
     )
 
 
 def create_solver(*_args: Any, **kwargs: Any) -> TurnstileSolver:
-    """Factory for the local browser Turnstile solver."""
+    """Factory for Turnstile solvers (multi-backend)."""
     debug = bool(kwargs.pop("debug", False))
     timeout = kwargs.pop("timeout", None)
     proxy = kwargs.pop("proxy", "") or ""

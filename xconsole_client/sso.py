@@ -37,6 +37,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import threading
+
 from . import config as C
 
 
@@ -287,6 +289,11 @@ def _default_output_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "sso_output"
 
 
+# Serialize appends to sso_tokens.txt under concurrent -t N workers.
+_sso_list_lock = threading.Lock()
+_SSO_LIST_NAME = "sso_tokens.txt"
+
+
 def save_sso(
     token: str,
     *,
@@ -294,9 +301,9 @@ def save_sso(
     password: str = "",
     output_dir: Optional[str | Path] = None,
 ) -> Path:
-    """Save an extracted SSO token to a JSON file.
+    """Save an extracted SSO token to a JSON file and append to a plain list.
 
-    Each file is named ``sso_<timestamp>.json`` and contains::
+    Each JSON file is named ``sso_<timestamp>.json`` and contains::
 
         {
             "email": "...",
@@ -305,6 +312,10 @@ def save_sso(
             "created_at": "2026-06-29T14:30:00Z"
         }
 
+    Additionally appends **only** the JWT (one token per line, nothing else)
+    to ``sso_tokens.txt`` in the same directory. Concurrent writers are
+    serialized with a process-level lock.
+
     Args:
         token: The ``sso`` cookie value (JWT string).
         email: Associated email address (optional, for bookkeeping).
@@ -312,8 +323,12 @@ def save_sso(
         output_dir: Target directory.  Defaults to ``<xconsole>/sso_output/``.
 
     Returns:
-        The path to the written file.
+        The path to the written JSON file.
     """
+    token = (token or "").strip()
+    if not token:
+        raise ValueError("SSO token is empty")
+
     target = Path(output_dir) if output_dir else _default_output_dir()
     target.mkdir(parents=True, exist_ok=True)
 
@@ -338,6 +353,13 @@ def save_sso(
     filepath.write_text(
         json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    # Pure SSO list: one JWT per line, no email/password/metadata.
+    list_path = target / _SSO_LIST_NAME
+    with _sso_list_lock:
+        with list_path.open("a", encoding="utf-8") as fh:
+            fh.write(token + "\n")
+
     return filepath
 
 

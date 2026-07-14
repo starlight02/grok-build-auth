@@ -6,7 +6,7 @@
 `注册 → SSO → OAuth PKCE（Grok Build / CLI scope）→ 导出本地 auth JSON`  
 整条链路，便于协议分析、互操作性研究与本地集成测试。
 
-默认：注册/OAuth 走纯 HTTP（`curl_cffi`）；**Turnstile 本机浏览器**（默认系统 Chrome `--headless=new`；`TURNSTILE_HEADLESS=0` / `TURNSTILE_INTERACTIVE=1` 可有头/手动点选）。
+默认：注册/OAuth 走纯 HTTP（`curl_cffi`）；**Turnstile 只负责 mint token**，用本机浏览器后端（默认 `auto`→Drission+turnstilePatch；可选 Camoufox / Playwright）。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
@@ -52,7 +52,7 @@
 值得看的点：
 
 - **协议优先**：注册 / OAuth 默认纯 HTTP（`curl_cffi` 指纹会话）
-- **Turnstile**：默认系统 Chrome headless（`TURNSTILE_SOLVER=browser`）；`TURNSTILE_HEADLESS=0` 有头，`TURNSTILE_INTERACTIVE=1` 可手动点选
+- **Turnstile**：三种本机后端可选（见 [Turnstile 后端](#turnstile-后端)）；默认 `auto`→Drission
 - **SSO 复用**：注册 session 可跳过 OAuth 二次 Turnstile（快路径）
 - **精简落盘**：默认只写 `sso_output/` + `cliproxyapi_auth/`（CPA 可加载）
 
@@ -78,7 +78,7 @@ SSO **不能**单独变成 CPA auth 文件；必须完成 OAuth 拿到 `access_t
 这不是「零配置即用」的产品。至少需要：
 
 - Python 3.9+
-- Turnstile：本机 Google Chrome（默认 headless；可切有头/手动）
+- Turnstile：本机浏览器后端（默认 Drission + Chrome 有头；可选 Camoufox / Playwright）
 - 临时邮箱：默认 Tempmail.lol **免费层（无需 API key）**；可选 Plus/Ultra key 或自建 Cloudflare D1 别名邮箱
 - （可选）HTTP(S) 代理
 - （可选）本地已安装的 CLIProxyAPI，用于加载导出的 auth 目录
@@ -102,6 +102,8 @@ python -m venv .venv
 # source .venv/bin/activate
 
 pip install -r requirements.txt
+# 可选：Camoufox 后端还要拉浏览器二进制
+# pip install camoufox && camoufox fetch
 cp .env.example .env
 # 可选编辑 .env；通常只需代理，无需 TEMPMAIL key
 ```
@@ -110,12 +112,15 @@ cp .env.example .env
 
 | 变量 | 必须 | 说明 |
 |---|---|---|
-| `TURNSTILE_SOLVER` | 否 | 仅 `browser`（系统 Chrome / Playwright Chromium） |
-| `TURNSTILE_HEADLESS` | 否 | 默认 `1`：Chrome `--headless=new`；`0` 有头窗口 |
-| `TURNSTILE_BROWSER_CHANNEL` | 否 | 默认 headless 时自动选 `chrome`（需本机安装 Google Chrome） |
-| `TURNSTILE_INTERACTIVE` | 否 | `1` 时允许手动点选 Turnstile（强制有头） |
-| `TURNSTILE_BROWSER_REUSE` | 否 | `1` 线程内热复用浏览器（默认 1） |
-| `TURNSTILE_TIMEOUT` | 否 | 单次 Turnstile 超时秒数（默认 60） |
+| `TURNSTILE_SOLVER` | 否 | `auto`（默认）/ `drission` / `camoufox` / `browser` — 详见 [Turnstile 后端](#turnstile-后端) |
+| `TURNSTILE_HEADLESS` | 否 | drission/camoufox 默认 `0`（有头）；playwright 默认 `1`；camoufox 可 `virtual` |
+| `TURNSTILE_TIMEOUT` | 否 | 单次 mint 硬超时秒数（**drission 默认 30**；camoufox/browser 默认 60） |
+| `TURNSTILE_PARALLEL` | 否 | 同时 mint 的 Turnstile 槽位数（默认 **2**；每槽线程本地 Chrome） |
+| `TURNSTILE_MINIMIZED` | 否 | drission 有头时默认 `1`：CDP/Drission 最小化窗口 |
+| `TURNSTILE_OFFSCREEN` | 否 | drission 有头时默认 `1`：`--window-position` 离屏备份 |
+| `TURNSTILE_BROWSER_CHANNEL` | 否 | 仅 playwright；有系统 Chrome 时自动选 `chrome` |
+| `TURNSTILE_INTERACTIVE` | 否 | 仅 playwright：`1` = 手动点选（强制有头） |
+| `TURNSTILE_BROWSER_REUSE` | 否 | `1` = 热复用浏览器（默认 1；drission 为线程本地复用） |
 | `TEMPMAIL_API_KEY` | 否 | Tempmail.lol Plus/Ultra（**免费层无需 key**；`-e tempmail` 默认即可） |
 | `MAIL_CODE_TIMEOUT` | 否 | 等验证码秒数，超时换箱（默认 30） |
 | `MAIL_MAX_ATTEMPTS` | 否 | 静默邮箱最多换几次（默认 3） |
@@ -132,11 +137,17 @@ cp .env.example .env
 
 ```bash
 # 单次完整链路：注册 + SSO + Build OAuth → cliproxyapi_auth/
-# 默认邮箱 tempmail（免费无需 key）；Turnstile 本机浏览器
+# 默认邮箱 tempmail（免费无需 key）；Turnstile 默认 auto→drission
 python run.py -n 1
 
-# 多账号（注册 + 协议 OAuth 并发；Turnstile / 浏览器 OAuth 回退串行）
+# 指定 Turnstile 后端（三选一，见下方专节）
+TURNSTILE_SOLVER=drission python run.py -n 1
+TURNSTILE_SOLVER=camoufox python run.py -n 1
+TURNSTILE_SOLVER=browser  python run.py -n 1
+
+# 多账号（注册 + 协议 OAuth 并发；Turnstile 默认 2 并行 mint）
 python run.py -n 5 -t 3
+TURNSTILE_PARALLEL=2 TURNSTILE_SOLVER=drission python run.py -n 4 -t 4
 
 # 自建 Cloudflare 邮箱后端
 python run.py -n 1 -e cloudflare
@@ -162,7 +173,7 @@ python run.py -n 5 -t 4 --check-quota --failed-auth-dir ./cliproxyapi_auth_faile
 
 | 目录 | 默认 | 内容 |
 |---|---|---|
-| `sso_output/` | **写** | 邮箱 + 密码 + SSO JWT |
+| `sso_output/` | **写** | 每号 `sso_*.json`（邮箱/密码/SSO）；另追加纯 SSO 列表 `sso_tokens.txt`（每行一个 JWT） |
 | `cliproxyapi_auth/` | **写**（未 `--no-oauth`） | CLIProxyAPI `type=xai` auth |
 | `cliproxyapi_auth_failed/` | 仅 `--check-quota` | 探测无额度的 auth（可用 `--failed-auth-dir` 改路径） |
 | `oauth_output/` | 不写 | 原始 OAuth 归档（独立 `xai_oauth_login` 或显式 `output_dir`） |
@@ -202,14 +213,106 @@ python xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyapi_auth
 
 ---
 
+## Turnstile 后端
+
+注册主链路是纯 HTTP；**只有 Cloudflare Turnstile token 必须靠本机浏览器 mint**。  
+用环境变量 `TURNSTILE_SOLVER` 选后端（也可用 `resolve_turnstile_solver(backend=...)`）。
+
+### 怎么选
+
+| `TURNSTILE_SOLVER` | 栈 | 默认有头？ | 何时用 |
+|---|---|---|---|
+| **`auto`（默认）** | 有 DrissionPage → **drission**；否则 → **browser** | 随所选后端 | 日常默认，不用改 |
+| **`drission`** | DrissionPage + 本机 **Chrome** + `turnstilePatch/` | **是**（`0`） | **推荐主力**；终端批量最稳 |
+| **`camoufox`** | **Camoufox** 反检测 Firefox（经 Playwright 启动） | **是**（`0`） | 想换 Firefox / 反检测；需额外 `camoufox fetch` |
+| **`browser`** | Playwright Chromium/Chrome | **否**（`1`） | 没装 Drission 时的回退；本机 IP 上往往不如前两者稳 |
+
+别名：
+
+- drission：`dp` / `clean` / `drissionpage`
+- camoufox：`camou` / `camoufox-firefox`
+- browser：`local` / `playwright` / `chromium` / `chrome` / `free`
+
+**没有**远程打码（YesCaptcha / CapSolver / 2Captcha 等）；设了会直接报错。  
+旧 `obscura` 后端已移除。
+
+### 依赖
+
+```bash
+# 三种后端共用
+pip install -r requirements.txt
+
+# drission（默认路径）额外需要：本机已装 Google Chrome
+# turnstilePatch/ 扩展已随仓库提供，无需手装
+
+# camoufox 额外：
+pip install camoufox
+camoufox fetch          # 下载 Camoufox 浏览器二进制（约数百 MB，一次即可）
+```
+
+### 常用命令
+
+```bash
+# 默认 = auto → drission（装了 DrissionPage 时）
+python run.py -n 1
+
+# 显式 Drission（推荐批量）
+TURNSTILE_SOLVER=drission TURNSTILE_HEADLESS=0 python run.py -n 10 -t 4
+
+# Camoufox（有头更稳；无显示器可试 virtual）
+TURNSTILE_SOLVER=camoufox python run.py -n 1
+TURNSTILE_SOLVER=camoufox TURNSTILE_HEADLESS=virtual python run.py -n 1
+
+# Playwright 回退（默认 headless）
+TURNSTILE_SOLVER=browser python run.py -n 1
+TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
+```
+
+### 相关环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `TURNSTILE_SOLVER` | `auto` | 后端选择，见上表 |
+| `TURNSTILE_HEADLESS` | drission/camoufox=`0`；browser=`1` | `0` 有头窗口；`1` headless；camoufox 还可 `virtual` |
+| `TURNSTILE_TIMEOUT` | drission=`30`；其它=`60` | 单次 mint token 硬超时（秒）；空 token 约 12s 即 fail-fast |
+| `TURNSTILE_PARALLEL` | `2` | 并发 mint 槽位（Semaphore）；drission 每槽线程本地 Chrome |
+| `TURNSTILE_MINIMIZED` | `1`（有头） | 最小化窗口（Drission/CDP 最小化） |
+| `TURNSTILE_OFFSCREEN` | `1`（有头） | 离屏 `--window-position` 备份 |
+| `TURNSTILE_BROWSER_REUSE` | `1` | 热复用浏览器，避免每号冷启动 |
+| `TURNSTILE_DEBUG` | 关 | `1` 打印 solver 详细日志 |
+| `TURNSTILE_BROWSER_CHANNEL` | 自动 | 仅 browser：优先系统 Chrome |
+| `TURNSTILE_INTERACTIVE` | 关 | 仅 browser：`1` 允许手动点选 |
+| `HTTPS_PROXY` / `HTTP_PROXY` | 空 | 浏览器与协议请求代理 |
+
+说明：
+
+1. **注册 / 验码 / SSO / OAuth 仍是协议 HTTP**；浏览器只 mint `turnstileToken`。  
+2. `run.py` 对 Turnstile 用 **`TURNSTILE_PARALLEL`（默认 2）** 限流；drission 每槽 **线程本地 Chrome** + 空 token fail-fast，`-t N` 仍加速邮箱与协议段。  
+3. 有 SSO 时 OAuth 快路径通常**不再**二次解 Turnstile。  
+4. headless 更容易被 CF 拦；批量优先 **有头 + 最小化/离屏 + 热复用**。
+
+### 日志里怎么认后端
+
+成功时会看到类似：
+
+```text
+[#1] Turnstile 730 chars via DrissionTurnstileSolver
+# 或
+[#1] Turnstile 730 chars via CamoufoxTurnstileSolver
+# 或
+[#1] Turnstile … via LocalBrowserTurnstileSolver
+```
+
+---
+
 ## 协议概要
 
 **注册**
 
 1. Warm-up + 动态抓取 Next.js action  
 2. 临时邮箱创建 + 验证码（gRPC-web）  
-3. Turnstile（本机 Playwright 浏览器）  
-4. `create_account` + 提取 SSO → `sso_output/`  
+3. Turnstile（本机浏览器后端 mint token，见 [Turnstile 后端](#turnstile-后端)）  
+4. `create_account` + 提取 SSO → `sso_output/sso_*.json` + 追加 `sso_tokens.txt`  
 
 **Build OAuth**
 
@@ -241,11 +344,15 @@ python xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyapi_auth
 │   ├── oauth_protocol.py          # 纯协议 OAuth
 │   ├── xai_oauth.py               # PKCE / 导出 / 回退
 │   ├── tempmail_transport.py      # Tempmail.lol（免费默认）
-│   └── sso.py / solver.py / ...
+│   ├── solver.py                  # Turnstile 工厂（auto/drission/camoufox/browser）
+│   ├── drission_solver.py         # Drission + turnstilePatch
+│   ├── camoufox_solver.py         # Camoufox 可选后端
+│   └── sso.py / ...
+├── turnstilePatch/                # Chrome 扩展（Drission 用）
 └── alias_mail/                    # 可选：Cloudflare 邮箱助手
 
 # 运行时（gitignore）
-# sso_output/               默认写
+# sso_output/               默认写（sso_*.json + sso_tokens.txt）
 # cliproxyapi_auth/         默认写（OAuth 成功）
 # cliproxyapi_auth_failed/  仅 --check-quota 时
 # oauth_output/             可选
@@ -259,11 +366,12 @@ python xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyapi_auth
 ## 已知限制
 
 - 依赖第三方公开接口，**随时可能因部署变更而失效**
-- Turnstile 耗时是主瓶颈（本机 Chrome headless 通常约 6–15s；`run.py` 全局串行解 widget 以避开 CF 限流）
+- Turnstile 是主瓶颈（有头热复用约 8–20s/次；默认 `TURNSTILE_PARALLEL=2` 并行 mint）
+- headless / 脏 IP 更容易空 token；优先 `drission` 或 `camoufox` 有头
 - 邮箱 / 代理 SSL 抖动会影响成功率；Tempmail 默认 30s 无码即换箱
 - 并发过高可能触发平台风控；研究用途请保持克制
 - SSO alone ≠ CPA auth；必须完成 OAuth
-- Playwright 仅用于 **Turnstile** 与可选 OAuth 浏览器回退；协议 OAuth 本身不启浏览器
+- 浏览器只用于 **Turnstile**（及可选 OAuth 浏览器回退）；协议 OAuth 本身不启浏览器
 
 ---
 
@@ -294,6 +402,7 @@ python xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyapi_auth
 ## 致谢
 
 - [curl_cffi](https://github.com/lexiforest/curl_cffi) — TLS / HTTP2 指纹会话  
+- [DrissionPage](https://github.com/g1879/DrissionPage) / [Camoufox](https://github.com/daijro/camoufox) — 可选 Turnstile 浏览器后端  
 - 相关公开 Web 标准：OAuth 2.0、PKCE、gRPC-web  
 
 ---

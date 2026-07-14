@@ -9,12 +9,13 @@
      → 可直接用 grok-4.5 走 Build/CLI 编码通道
 
 环境变量（按需设置）:
-    TURNSTILE_SOLVER       browser (default; Playwright Chrome/Chromium)
-    TURNSTILE_HEADLESS     1=headless (default 1; Chrome headless=new); 0=有头窗口
-    TURNSTILE_BROWSER_CHANNEL  e.g. chrome (auto when headless + Chrome installed)
-    TURNSTILE_INTERACTIVE  1=手动点 Turnstile（强制有头）
+    TURNSTILE_SOLVER       auto|drission|browser (default auto → DrissionPage+turnstilePatch)
+    TURNSTILE_HEADLESS     drission 默认 0（有头自动点）；browser/playwright 默认 1
+    TURNSTILE_BROWSER_CHANNEL  playwright only (chrome auto when available)
+    TURNSTILE_INTERACTIVE  1=手动点 Turnstile（仅 playwright；强制有头）
     TURNSTILE_BROWSER_REUSE    1=keep per-thread browser warm (default 1)
-    TURNSTILE_TIMEOUT      单次 Turnstile 超时秒数（default 60）
+    TURNSTILE_TIMEOUT      hard wall-clock seconds per Turnstile solve (default 30)
+    TURNSTILE_PARALLEL     concurrent Turnstile mints (default 2; Drission thread-local Chrome)
     TEMPMAIL_API_KEY       Optional Tempmail.lol Plus/Ultra key (free tier works without)
     MAIL_CODE_TIMEOUT     Seconds to wait for verification code before rotating inbox (default 30)
     MAIL_MAX_ATTEMPTS     Fresh inboxes to try when mail is silent (default 3)
@@ -23,7 +24,7 @@
     HTTPS_PROXY / HTTP_PROXY  代理（OAuth 换 token / browser）
 
 CLI 常用:
-    -n / -t                账号数 / 并发（注册+协议 OAuth 并发；Turnstile 全局串行）
+    -n / -t                账号数 / 并发（注册+协议 OAuth 并发；Turnstile 默认 2 并行）
     --check-quota          OAuth 后探测额度，无额度移到 failed 目录（默认关）
     --failed-auth-dir      无额度 auth 目录（默认 <auth-dir>_failed）
     --check-quota-timeout  单号探测超时秒数
@@ -91,9 +92,17 @@ _cf_lock = threading.Lock()
 # Only Playwright/browser OAuth needs serialization (Playwright sync is TLS-bound
 # and multi-headed Chrome is heavy). Pure HTTP protocol OAuth is concurrent-safe.
 _oauth_browser_lock = threading.Lock()
-# Concurrent Chrome headless Turnstile is rate-limited/slow on CF (4× ~180s);
-# serialize minting so each token is ~5–20s and overall throughput is higher.
-_turnstile_lock = threading.Lock()
+# Turnstile mint concurrency. Default 2: Drission uses thread-local Chrome so
+# two slots do not share cookies/session. Higher values open more Chromes.
+def _turnstile_parallel() -> int:
+    raw = (os.environ.get("TURNSTILE_PARALLEL") or "2").strip()
+    try:
+        return max(1, min(int(raw), 8))
+    except ValueError:
+        return 2
+
+
+_turnstile_lock = threading.Semaphore(_turnstile_parallel())
 _results: list[dict] = []
 _done = 0
 _total = 0
@@ -163,13 +172,38 @@ def _check_and_gate_auth(
 ) -> dict:
     """Probe Build quota; keep usable files, move unusable ones to failed_dir.
 
+    Uses the same ``check_accounts.check_one`` as the CLI. Fresh OAuth tokens
+    sometimes return a transient 401/403 on the first /responses hit; wait briefly
+    and retry those statuses before moving the file to failed_dir.
+
     Returns a small dict for the result record:
       usable, remaining_tokens, status, reasons, path (final location), error?
     """
     # Lazy import so --check-quota-off path never pays the cost.
     from check_accounts import check_one
 
-    probe = check_one(auth_path, timeout=timeout, check_models=False)
+    # Propagation delay after OAuth write (observed: immediate probe → 403,
+    # re-check a few seconds later → 200 + full free quota).
+    time.sleep(2.0)
+
+    probe: dict = {}
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        probe = check_one(auth_path, timeout=timeout, check_models=False)
+        if probe.get("usable"):
+            break
+        status = probe.get("status")
+        # Only retry auth-rejection / network flakiness — not real 429 exhaustion.
+        if status not in (401, 403, None) or attempt >= attempts:
+            break
+        wait_s = 2.0 * attempt  # 2s, 4s
+        _log(
+            index,
+            f"quota probe attempt {attempt}/{attempts} status={status}; "
+            f"retry in {wait_s:.0f}s",
+        )
+        time.sleep(wait_s)
+
     usable = bool(probe.get("usable"))
     rem = probe.get("remaining_tokens")
     status = probe.get("status")
@@ -310,8 +344,7 @@ def register_one(
 
         ts_t0 = time.time()
         try:
-            # Serialize Turnstile: parallel Chrome headless is CF-slow (~180s each);
-            # serial mint is ~6s and overall faster for -t N.
+            # Bound concurrent Turnstile mints (default 2; see TURNSTILE_PARALLEL).
             with _turnstile_lock:
                 turnstile = turnstile_solver.solve_turnstile(
                     website_url=SIGNUP_URL,

@@ -2,5 +2,10 @@ curl_cffi>=0.7.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 
-# Local Turnstile via Playwright (Chromium/Chrome).
+# Turnstile: prefer DrissionPage + turnstilePatch/ (terminal CLI, like grok_reg_clean).
+DrissionPage>=4.1
+# Fallback: Playwright Chromium/Chrome (TURNSTILE_SOLVER=browser).
 playwright>=1.40.0
+# Optional: Camoufox anti-detect Firefox (TURNSTILE_SOLVER=camoufox)
+# After install: camoufox fetch
+camoufox>=0.4.11
