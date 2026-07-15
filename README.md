@@ -6,7 +6,7 @@
 `注册 → SSO → OAuth PKCE（Grok Build / CLI scope）→ 导出本地 auth JSON`  
 整条链路，便于协议分析、互操作性研究与本地集成测试。
 
-默认：注册/OAuth 走纯 HTTP（`curl_cffi`）；**Turnstile 只负责 mint token**，用本机浏览器后端（默认 `auto`→Drission+turnstilePatch；可选 Camoufox / Playwright）。
+默认：注册/OAuth 走纯 HTTP（`curl_cffi`）；注册阶段 Turnstile 用本机浏览器后端（默认 `auto`→Drission+turnstilePatch；可选 Camoufox / Playwright）。OAuth：协议 session-reuse，失败时回退 Device Flow。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
@@ -46,15 +46,15 @@
 |---|---|
 | **注册** | `accounts.x.ai` 邮箱验证码（gRPC-web）+ Turnstile + Next.js Server Action 建号 |
 | **SSO** | 从建号响应 / set-cookie 链提取 session JWT，供 OAuth 复用 |
-| **OAuth** | `auth.x.ai` PKCE + CookieSetter + consent；失败时再走 CreateSession |
+| **OAuth** | 快路径：`oauth_protocol` SSO session-reuse（PKCE + CookieSetter + consent）；失败回退 `sso2auth` Device Flow；全程纯 HTTP |
 | **导出** | 写出与 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 兼容的本地 `type=xai` auth 文件（Grok Build 通道） |
 
 值得看的点：
 
 - **协议优先**：注册 / OAuth 默认纯 HTTP（`curl_cffi` 指纹会话）
-- **Turnstile**：三种本机后端可选（见 [Turnstile 后端](#turnstile-后端)）；默认 `auto`→Drission
-- **SSO 复用**：注册 session 可跳过 OAuth 二次 Turnstile（快路径）
-- **精简落盘**：默认只写 `sso_output/` + `cliproxyapi_auth/`（CPA 可加载）
+- **Turnstile**：注册建号 mint token；三种本机后端（见 [Turnstile 后端](#turnstile-后端)）；默认 `auto`→Drission
+- **OAuth 双路径**：快路径 SSO session-reuse（`oauth_protocol`）；回退 Device Flow（`sso2auth`）
+- **精简落盘**：默认写 `sso_output/` + `cliproxyapi_auth/`（CPA 可加载）
 
 ---
 
@@ -64,12 +64,14 @@
 flowchart LR
     A[run.py] --> B[注册 client.py<br/>邮箱码 + Turnstile]
     B --> C[SSO sso.py<br/>sso_output]
-    C --> D[OAuth oauth_protocol.py<br/>PKCE + consent]
-    D --> E[token 交换]
-    E --> F[cliproxyapi_auth/*.json<br/>CLIProxyAPI]
+    C --> D{OAuth 快路径<br/>oauth_protocol<br/>SSO session-reuse}
+    D -->|OK| E[token 交换]
+    D -->|失败| F[sso2auth<br/>Device Flow]
+    F --> E
+    E --> G[cliproxyapi_auth/*.json<br/>CLIProxyAPI]
 ```
 
-SSO **不能**单独变成 CPA auth 文件；必须完成 OAuth 拿到 `access_token` / `refresh_token` 后才能导出。
+导出 CPA auth 需要 OAuth 拿到的 `access_token` / `refresh_token`（协议路径或 Device Flow）。
 
 ---
 
@@ -145,15 +147,18 @@ TURNSTILE_SOLVER=drission python run.py -n 1
 TURNSTILE_SOLVER=camoufox python run.py -n 1
 TURNSTILE_SOLVER=browser  python run.py -n 1
 
-# 多账号（注册 + 协议 OAuth 并发；Turnstile 默认 2 并行 mint）
+# 多账号（注册 + OAuth 全程可并发；Turnstile 默认 2 并行 mint）
 python run.py -n 5 -t 3
 TURNSTILE_PARALLEL=2 TURNSTILE_SOLVER=drission python run.py -n 4 -t 4
 
 # 自建 Cloudflare 邮箱后端
 python run.py -n 1 -e cloudflare
 
-# 仅注册 + SSO（不写 CPA auth）
+# 仅注册 + SSO
 python run.py -n 1 --no-oauth
+
+# 只用 Device Flow 做 OAuth
+python run.py -n 1 --no-oauth-protocol
 
 # 指定 CLIProxyAPI auth 目录
 python run.py -n 1 --cliproxyapi-auth-dir /path/to/CLIProxyAPI/data/auth
@@ -176,19 +181,23 @@ python run.py -n 5 -t 4 --check-quota --failed-auth-dir ./cliproxyapi_auth_faile
 | `sso_output/` | **写** | 每号 `sso_*.json`（邮箱/密码/SSO）；另追加纯 SSO 列表 `sso_tokens.txt`（每行一个 JWT） |
 | `cliproxyapi_auth/` | **写**（未 `--no-oauth`） | CLIProxyAPI `type=xai` auth |
 | `cliproxyapi_auth_failed/` | 仅 `--check-quota` | 探测无额度的 auth（可用 `--failed-auth-dir` 改路径） |
-| `oauth_output/` | 不写 | 原始 OAuth 归档（独立 `xai_oauth_login` 或显式 `output_dir`） |
-| `accounts_output/` | 不写 | 流水线台账（`--accounts-output-dir` 开启） |
+| `oauth_output/` | 可选 | 原始 OAuth 归档（`xai_oauth_login` 或显式 `output_dir`） |
+| `accounts_output/` | 可选 | 流水线台账（`--accounts-output-dir`） |
 
 ### 辅助脚本
 
 ```bash
-# 检查 cliproxyapi_auth 是否可用 / 有无 Build 额度（唯一检测入口）
+# 检查 cliproxyapi_auth 可用性 / Build 额度
 python check_accounts.py cliproxyapi_auth/
 
-# 已有账号：单独走 OAuth（会写 oauth_output/；可再导出 CPA）
+# SSO → CPA（Device Flow）
+python retry_oauth_from_sso.py
+# SSO2AUTH_WORKERS=4 python retry_oauth_from_sso.py
+
+# 交互式浏览器 OAuth
 python xai_oauth_login.py
 
-# 把 oauth_output 记录导出为 CPA auth
+# oauth_output → CPA auth
 python xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyapi_auth
 ```
 
@@ -286,9 +295,9 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 
 说明：
 
-1. **注册 / 验码 / SSO / OAuth 仍是协议 HTTP**；浏览器只 mint `turnstileToken`。  
-2. `run.py` 对 Turnstile 用 **`TURNSTILE_PARALLEL`（默认 2）** 限流；drission 每槽 **线程本地 Chrome** + 空 token fail-fast，`-t N` 仍加速邮箱与协议段。  
-3. 有 SSO 时 OAuth 快路径通常**不再**二次解 Turnstile。  
+1. 注册 / 验码 / SSO / OAuth 走协议 HTTP；Turnstile mint 在注册阶段由本机浏览器后端完成。  
+2. `run.py` 用 **`TURNSTILE_PARALLEL`（默认 2）** 限制 Turnstile 并发；drission 每槽 **线程本地 Chrome** + 空 token fail-fast；`-t N` 覆盖邮箱与 OAuth。  
+3. OAuth：优先 SSO session-reuse（`oauth_protocol`），失败走 Device Flow（`sso2auth`）。  
 4. headless 更容易被 CF 拦；批量优先 **有头 + 最小化/离屏 + 热复用**。
 
 ### 日志里怎么认后端
@@ -314,12 +323,12 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 3. Turnstile（本机浏览器后端 mint token，见 [Turnstile 后端](#turnstile-后端)）  
 4. `create_account` + 提取 SSO → `sso_output/sso_*.json` + 追加 `sso_tokens.txt`  
 
-**Build OAuth**
+**Build OAuth**（`run.py` 注册后）
 
-1. PKCE authorize  
-2. 有 SSO：CookieSetter + consent（通常无需二次 Turnstile）  
-3. 无 SSO / session-reuse 失败：Turnstile + CreateSession，再 consent  
-4. code → token → **默认只写** `cliproxyapi_auth/`（不写 `oauth_output/`）  
+1. **快路径** `oauth_protocol`：注册 SSO → CookieSetter + consent → code → token  
+2. **回退** `sso2auth`：SSO cookie → Device Flow（device/code → verify/approve → poll token）→ 写 CPA JSON  
+3. 默认写出 `cliproxyapi_auth/`  
+4. `--no-oauth-protocol`：只走 Device Flow  
 
 接口与额度策略以平台实时行为为准，文档数值仅供研究参考。
 
@@ -334,19 +343,21 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 ├── README.md / README.en.md
 ├── SECURITY.md
 ├── run.py                         # 主入口
-├── check_accounts.py              # 检测 auth 可用性 / Build 额度
-├── xai_oauth_login.py
+├── check_accounts.py              # auth 可用性 / Build 额度
+├── retry_oauth_from_sso.py        # SSO → CPA Device Flow
+├── xai_oauth_login.py             # 交互式浏览器 OAuth
 ├── xai_oauth_export_cliproxyapi.py
 ├── requirements.txt
 ├── .env.example
 ├── xconsole_client/               # 协议库（Python 包名，历史命名）
 │   ├── client.py                  # 注册
-│   ├── oauth_protocol.py          # 纯协议 OAuth
-│   ├── xai_oauth.py               # PKCE / 导出 / 回退
-│   ├── tempmail_transport.py      # Tempmail.lol（免费默认）
-│   ├── solver.py                  # Turnstile 工厂（auto/drission/camoufox/browser）
+│   ├── oauth_protocol.py          # 协议 OAuth（SSO session-reuse）
+│   ├── sso2auth.py                # SSO Device Flow → CPA
+│   ├── xai_oauth.py               # PKCE / 导出 / 浏览器登录
+│   ├── tempmail_transport.py      # Tempmail.lol
+│   ├── solver.py                  # Turnstile 工厂
 │   ├── drission_solver.py         # Drission + turnstilePatch
-│   ├── camoufox_solver.py         # Camoufox 可选后端
+│   ├── camoufox_solver.py         # Camoufox
 │   └── sso.py / ...
 ├── turnstilePatch/                # Chrome 扩展（Drission 用）
 └── alias_mail/                    # 可选：Cloudflare 邮箱助手
@@ -365,13 +376,13 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 
 ## 已知限制
 
-- 依赖第三方公开接口，**随时可能因部署变更而失效**
-- Turnstile 是主瓶颈（有头热复用约 8–20s/次；默认 `TURNSTILE_PARALLEL=2` 并行 mint）
+- 依赖第三方公开接口，部署变更可能导致链路失效
+- Turnstile 是主瓶颈（有头热复用约 8–20s/次；默认 `TURNSTILE_PARALLEL=2`）
 - headless / 脏 IP 更容易空 token；优先 `drission` 或 `camoufox` 有头
 - 邮箱 / 代理 SSL 抖动会影响成功率；Tempmail 默认 30s 无码即换箱
 - 并发过高可能触发平台风控；研究用途请保持克制
-- SSO alone ≠ CPA auth；必须完成 OAuth
-- 浏览器只用于 **Turnstile**（及可选 OAuth 浏览器回退）；协议 OAuth 本身不启浏览器
+- 导出 CPA auth 需要完成 OAuth（协议或 Device Flow）
+- 注册 Turnstile 使用本机浏览器后端；OAuth 使用协议 session-reuse 与 Device Flow
 
 ---
 

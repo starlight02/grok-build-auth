@@ -8,7 +8,7 @@ A **protocol-research client** for publicly observable **x.ai / Grok web authent
 
 for protocol analysis, interoperability research, and **authorized** local integration testing.
 
-Default path: signup/OAuth over pure HTTP (`curl_cffi`). **Turnstile only mints a token** via a local browser backend (`auto`→Drission+turnstilePatch; optional Camoufox / Playwright).
+Default path: signup/OAuth over pure HTTP (`curl_cffi`). Signup Turnstile uses a local browser backend (`auto`→Drission+turnstilePatch; optional Camoufox / Playwright). OAuth: protocol session-reuse, with Device Flow fallback.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
@@ -48,17 +48,17 @@ A research-oriented protocol client, **not** an official SDK.
 |---|---|
 | **Signup** | Email code (gRPC-web) + Turnstile + Next.js Server Action on `accounts.x.ai` |
 | **SSO** | Session JWT extraction for OAuth session reuse |
-| **OAuth** | `auth.x.ai` PKCE + cookie-setter + consent; CreateSession fallback |
+| **OAuth** | Fast path: `oauth_protocol` SSO session-reuse (PKCE + cookie-setter + consent); fallback: `sso2auth` Device Flow; pure HTTP end-to-end |
 | **Export** | Local `type=xai` auth files compatible with [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (Grok Build channel) |
 
 Highlights:
 
 - **Protocol-first** pure HTTP (`curl_cffi`) for signup / OAuth  
-- **Turnstile**: three local backends (see [Turnstile backends](#turnstile-backends)); default `auto`→Drission  
-- **SSO reuse** can skip a second Turnstile on OAuth  
-- **Lean outputs**: default writes only `sso_output/` + `cliproxyapi_auth/`  
+- **Turnstile**: signup mint; three local backends (see [Turnstile backends](#turnstile-backends)); default `auto`→Drission  
+- **OAuth dual path**: SSO session-reuse (`oauth_protocol`); Device Flow fallback (`sso2auth`)  
+- **Lean outputs**: default writes `sso_output/` + `cliproxyapi_auth/`  
 
-SSO **alone cannot** become a CPA auth file; OAuth tokens are required.
+CPA export needs OAuth `access_token` / `refresh_token` (protocol path or Device Flow).
 
 ---
 
@@ -68,9 +68,11 @@ SSO **alone cannot** become a CPA auth file; OAuth tokens are required.
 flowchart LR
     A[run.py] --> B[signup client.py]
     B --> C[SSO sso.py]
-    C --> D[OAuth oauth_protocol.py]
-    D --> E[token exchange]
-    E --> F[cliproxyapi_auth/*.json]
+    C --> D{OAuth fast path<br/>oauth_protocol<br/>SSO session-reuse}
+    D -->|OK| E[token exchange]
+    D -->|fail| F[sso2auth<br/>Device Flow]
+    F --> E
+    E --> G[cliproxyapi_auth/*.json]
 ```
 
 ---
@@ -140,11 +142,13 @@ TURNSTILE_SOLVER=drission python run.py -n 1
 TURNSTILE_SOLVER=camoufox python run.py -n 1
 TURNSTILE_SOLVER=browser  python run.py -n 1
 
-# Multi-account (signup + protocol OAuth concurrent; Turnstile default 2 parallel mints)
+# Multi-account (signup + OAuth concurrent; Turnstile default 2 parallel mints)
 python run.py -n 5 -t 3
 TURNSTILE_PARALLEL=2 TURNSTILE_SOLVER=drission python run.py -n 4 -t 4
 python run.py -n 1 -e cloudflare
 python run.py -n 1 --no-oauth
+# OAuth via Device Flow only
+python run.py -n 1 --no-oauth-protocol
 python run.py -n 1 --cliproxyapi-auth-dir /path/to/CLIProxyAPI/data/auth
 python run.py -n 1 --accounts-output-dir ./accounts_output   # optional ledger
 python run.py -n 1 --oauth-debug
@@ -164,8 +168,10 @@ python run.py -n 5 -t 4 --check-quota --failed-auth-dir ./cliproxyapi_auth_faile
 | `accounts_output/` | off | pipeline ledger (`--accounts-output-dir`) |
 
 Helpers:
-- `check_accounts.py` — **only** auth usability / Build quota checker
-- `xai_oauth_login.py`, `xai_oauth_export_cliproxyapi.py` — standalone OAuth helpers
+- `check_accounts.py` — auth usability / Build quota
+- `retry_oauth_from_sso.py` — SSO → CPA Device Flow
+- `xai_oauth_login.py` — interactive browser OAuth
+- `xai_oauth_export_cliproxyapi.py` — export oauth_output → CPA auth
 
 ---
 
@@ -241,9 +247,9 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 
 Notes:
 
-1. **Signup / mail code / SSO / OAuth stay pure HTTP**; the browser only mints `turnstileToken`.  
-2. `run.py` bounds Turnstile with **`TURNSTILE_PARALLEL` (default 2)**; drission uses **thread-local Chrome** + empty-token fail-fast and `-t N` still speeds mail + protocol stages.  
-3. With SSO, the OAuth fast path usually **skips** a second Turnstile.  
+1. Signup / mail code / SSO / OAuth use protocol HTTP; Turnstile mint runs at signup via a local browser backend.  
+2. `run.py` bounds Turnstile with **`TURNSTILE_PARALLEL` (default 2)**; drission uses **thread-local Chrome** + empty-token fail-fast; `-t N` covers mail + OAuth.  
+3. OAuth: SSO session-reuse (`oauth_protocol`) first, Device Flow (`sso2auth`) on failure.  
 4. Headless is blocked more often; prefer **headed + minimized/off-screen + warm reuse** for batches.
 
 ### How to tell which backend ran

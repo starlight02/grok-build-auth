@@ -20,6 +20,7 @@ CreateSessionRequest wire layout (reverse-engineered 2026-07):
       field 2  castleRequestToken (optional, may be empty)
   }
 """
+
 from __future__ import annotations
 
 import re
@@ -30,12 +31,10 @@ from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 from . import grpcweb
 from .solver import resolve_turnstile_solver
 from .xai_oauth import (
-    AUTHORIZATION_ENDPOINT,
     CLIPROXYAPI_GROK_BASE_URL,
     DEFAULT_CLIENT_ID,
     DEFAULT_SCOPES,
     OAuthLoginResult,
-    TOKEN_ENDPOINT,
     _finalize_oauth_code,
     build_authorization_url,
     code_challenge_s256,
@@ -44,7 +43,9 @@ from .xai_oauth import (
 
 TURNSTILE_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 CREATE_SESSION_RPC = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateSession"
-CREATE_COOKIE_SETTER_RPC = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateCookieSetterLink"
+CREATE_COOKIE_SETTER_RPC = (
+    "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateCookieSetterLink"
+)
 ACCOUNTS_ORIGIN = "https://accounts.x.ai"
 # Observed Next.js server action for the consent Allow button (may change on deploy).
 SUBMIT_OAUTH2_CONSENT_ACTION = "4005315a1d7e426de592990bb54bb37471f39dd6d2"
@@ -108,7 +109,9 @@ def _extract_urls_from_fields(fields: List[Dict[str, Any]]) -> List[str]:
     return urls
 
 
-def _parse_grpc_error(headers: Dict[str, str], body: bytes) -> Tuple[Optional[int], str]:
+def _parse_grpc_error(
+    headers: Dict[str, str], body: bytes
+) -> Tuple[Optional[int], str]:
     # Trailers may be in body frames or HTTP headers (connect/grpc-web).
     status = headers.get("grpc-status")
     message = unquote(headers.get("grpc-message") or "")
@@ -208,7 +211,13 @@ class ProtocolOAuthClient:
         if self.debug:
             print(f"  [oauth-protocol] {msg}")
 
-    def _get(self, url: str, *, allow_redirects: bool = True, headers: Optional[Dict[str, str]] = None):
+    def _get(
+        self,
+        url: str,
+        *,
+        allow_redirects: bool = True,
+        headers: Optional[Dict[str, str]] = None,
+    ):
         h = {
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "upgrade-insecure-requests": "1",
@@ -237,7 +246,9 @@ class ProtocolOAuthClient:
         referer: str = f"{ACCOUNTS_ORIGIN}/sign-in",
     ) -> Dict[str, Any]:
         """Call CreateCookieSetterLink; returns cookie_setter_url for the multi-domain hop."""
-        msg = grpcweb.encode_string(1, success_url) + grpcweb.encode_string(2, error_url)
+        msg = grpcweb.encode_string(1, success_url) + grpcweb.encode_string(
+            2, error_url
+        )
         resp = self._s.post(
             CREATE_COOKIE_SETTER_RPC,
             headers=_grpc_headers(referer),
@@ -253,10 +264,14 @@ class ProtocolOAuthClient:
         grpc_status = parsed.get("grpc_status")
         if grpc_status is None:
             grpc_status = header_status
-        grpc_msg = header_msg or unquote(str((parsed.get("trailers") or {}).get("grpc-message") or ""))
+        grpc_msg = header_msg or unquote(
+            str((parsed.get("trailers") or {}).get("grpc-message") or "")
+        )
         fields = parsed["messages"][0] if parsed.get("messages") else []
         urls = _extract_urls_from_fields(fields)
-        cookie_setter = next((u for u in urls if "set-cookie" in u), None) or (urls[0] if urls else None)
+        cookie_setter = next((u for u in urls if "set-cookie" in u), None) or (
+            urls[0] if urls else None
+        )
         ok = grpc_status in (None, 0) and bool(cookie_setter)
         return {
             "ok": ok,
@@ -266,7 +281,9 @@ class ProtocolOAuthClient:
             "raw_fields": fields,
         }
 
-    def create_session(self, email: str, password: str, *, referer: str) -> Dict[str, Any]:
+    def create_session(
+        self, email: str, password: str, *, referer: str
+    ) -> Dict[str, Any]:
         """Call CreateSession; on success stores sso JWT on the session.
 
         CreateSession field 2 is a session JWT (not the cookie-setter URL).
@@ -327,7 +344,8 @@ class ProtocolOAuthClient:
         if grpc_status not in (None, 0) or not session_jwt:
             return {
                 "ok": False,
-                "error": grpc_msg or (
+                "error": grpc_msg
+                or (
                     f"CreateSession failed (status={grpc_status}, fields={len(fields)})"
                 ),
                 "grpc_status": grpc_status,
@@ -422,7 +440,7 @@ class ProtocolOAuthClient:
             # HTML page: try meta-refresh / JS location / form action
             html = resp.text or ""
             m2 = re.search(
-                r'https?://127\.0\.0\.1[^\"\'\s<>]*code=[^\"\'\s<>]+',
+                r"https?://127\.0\.0\.1[^\"\'\s<>]*code=[^\"\'\s<>]+",
                 html,
             )
             if m2:
@@ -452,7 +470,11 @@ class ProtocolOAuthClient:
             else:
                 # If consent URL itself is the current page and already logged in,
                 # try POST approve is unknown; last resort: re-hit return_to once.
-                if pending_return_to and current != pending_return_to and pending_return_to not in visited:
+                if (
+                    pending_return_to
+                    and current != pending_return_to
+                    and pending_return_to not in visited
+                ):
                     current = pending_return_to
                     continue
                 raise RuntimeError(
@@ -493,6 +515,7 @@ class ProtocolOAuthClient:
         cliproxyapi_disabled: bool = False,
         proxy: str = "",
         session_cookies: Optional[Dict[str, str]] = None,
+        allow_create_session: bool = True,
     ) -> OAuthLoginResult:
         scopes = scopes or list(DEFAULT_SCOPES)
         if session_cookies:
@@ -513,20 +536,17 @@ class ProtocolOAuthClient:
             scopes=scopes,
         )
         # Consent URL is on the CreateCookieSetterLink allowlist (authorize URL is not).
-        consent_url = (
-            f"{ACCOUNTS_ORIGIN}/oauth2/consent?"
-            + urlencode(
-                {
-                    "response_type": "code",
-                    "client_id": client_id,
-                    "redirect_uri": redirect_uri,
-                    "scope": " ".join(scopes),
-                    "state": state,
-                    "code_challenge": challenge,
-                    "code_challenge_method": "S256",
-                    "nonce": nonce,
-                }
-            )
+        consent_url = f"{ACCOUNTS_ORIGIN}/oauth2/consent?" + urlencode(
+            {
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "scope": " ".join(scopes),
+                "state": state,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "nonce": nonce,
+            }
         )
 
         def _apply_set_cookie_url(setter_url: str) -> str:
@@ -561,32 +581,40 @@ class ProtocolOAuthClient:
 
             action_id = SUBMIT_OAUTH2_CONSENT_ACTION
             # Prefer live action id from page chunks if present.
-            m = re.search(r'createServerReference\)\("([a-f0-9]{40,44})"[^)]*submitOAuth2Consent', page_html)
+            m = re.search(
+                r'createServerReference\)\("([a-f0-9]{40,44})"[^)]*submitOAuth2Consent',
+                page_html,
+            )
             if not m:
-                m = re.search(r'createServerReference\)\("([a-f0-9]{40,44})"', page_html)
+                m = re.search(
+                    r'createServerReference\)\("([a-f0-9]{40,44})"', page_html
+                )
             if m:
                 action_id = m.group(1)
 
             # Router state tree for consent page (URL-encoded JSON).
             from urllib.parse import quote as _quote
+
             router_tree = (
                 '["",{"children":["(app)",{"children":["(auth)",{"children":["oauth2",'
                 '{"children":["consent",{"children":["__PAGE__",{}]}]}]}]}]},'
                 '"$undefined","$undefined",16]'
             )
-            payload = [{
-                "action": "allow",
-                "clientId": client_id,
-                "redirectUri": redirect_uri,
-                "scope": " ".join(scopes),
-                "state": state,
-                "codeChallenge": challenge,
-                "codeChallengeMethod": "S256",
-                "nonce": nonce,
-                "principalType": "User",
-                "principalId": "",
-                "referrer": "",
-            }]
+            payload = [
+                {
+                    "action": "allow",
+                    "clientId": client_id,
+                    "redirectUri": redirect_uri,
+                    "scope": " ".join(scopes),
+                    "state": state,
+                    "codeChallenge": challenge,
+                    "codeChallengeMethod": "S256",
+                    "nonce": nonce,
+                    "principalType": "User",
+                    "principalId": "",
+                    "referrer": "",
+                }
+            ]
             body = _json.dumps(payload, separators=(",", ":")).encode("utf-8")
             headers = {
                 "accept": "text/x-component",
@@ -600,10 +628,18 @@ class ProtocolOAuthClient:
                 "sec-fetch-dest": "empty",
             }
             self._log(f"submitOAuth2Consent action={action_id[:16]}...")
-            resp = self._s.post(page_url.split("?")[0] if "consent" in page_url else page_url,
-                                headers=headers, data=body, timeout=45)
+            resp = self._s.post(
+                page_url.split("?")[0] if "consent" in page_url else page_url,
+                headers=headers,
+                data=body,
+                timeout=45,
+            )
             # Some deployments post to the consent path with query string:
-            if resp.status_code >= 400 or (resp.text and "error" in resp.text[:200].lower() and "code" not in resp.text):
+            if resp.status_code >= 400 or (
+                resp.text
+                and "error" in resp.text[:200].lower()
+                and "code" not in resp.text
+            ):
                 resp = self._s.post(page_url, headers=headers, data=body, timeout=45)
             text = resp.text or ""
             self._log(f"consent action HTTP {resp.status_code} body={text[:180]!r}")
@@ -611,14 +647,16 @@ class ProtocolOAuthClient:
             m = re.search(r'"code"\s*:\s*"([^"]+)"', text)
             if m:
                 return m.group(1)
-            m = re.search(r'code=([A-Za-z0-9._~\-]+)', text)
+            m = re.search(r"code=([A-Za-z0-9._~\-]+)", text)
             if m and "error" not in m.group(0):
                 return m.group(1)
             # Or redirect header
             loc = resp.headers.get("location") or resp.headers.get("Location") or ""
             if "code=" in loc:
                 return self._code_from_url(urljoin(page_url, loc), state)
-            raise RuntimeError(f"submitOAuth2Consent failed HTTP {resp.status_code}: {text[:300]}")
+            raise RuntimeError(
+                f"submitOAuth2Consent failed HTTP {resp.status_code}: {text[:300]}"
+            )
 
         def _complete_via_cookie_setter(label: str) -> str:
             """Mint set-cookie chain with consent as success_url, then Allow consent."""
@@ -630,7 +668,9 @@ class ProtocolOAuthClient:
                 referer=f"{ACCOUNTS_ORIGIN}/sign-in?redirect=oauth2-provider",
             )
             if not csl.get("ok"):
-                raise RuntimeError(f"{label}: CreateCookieSetterLink failed: {csl.get('error')}")
+                raise RuntimeError(
+                    f"{label}: CreateCookieSetterLink failed: {csl.get('error')}"
+                )
             setter = str(csl.get("cookie_setter_url") or "")
             self._log(f"{label}: cookie_setter={setter[:100]}...")
 
@@ -644,8 +684,14 @@ class ProtocolOAuthClient:
                 if "set-cookie" in current:
                     # Only GET set-cookie; use response Set-Cookie (do not clobber sso with config.token).
                     resp = self._get(current, allow_redirects=False)
-                    loc = resp.headers.get("location") or resp.headers.get("Location") or ""
-                    self._log(f"set-cookie HTTP {resp.status_code} loc={(loc or '')[:120]}")
+                    loc = (
+                        resp.headers.get("location")
+                        or resp.headers.get("Location")
+                        or ""
+                    )
+                    self._log(
+                        f"set-cookie HTTP {resp.status_code} loc={(loc or '')[:120]}"
+                    )
                     if loc:
                         current = urljoin(current, loc)
                         continue
@@ -661,7 +707,9 @@ class ProtocolOAuthClient:
                     return self._code_from_url(urljoin(current, loc), state)
                 if page.status_code == 200 and "Authorize" in (page.text or ""):
                     return _submit_oauth2_consent(current, page.text or "")
-            return self._follow_for_code(current, redirect_uri=redirect_uri, state=state)
+            return self._follow_for_code(
+                current, redirect_uri=redirect_uri, state=state
+            )
 
         self._log("OAuth PKCE start...")
         try:
@@ -670,6 +718,10 @@ class ProtocolOAuthClient:
             code = _complete_via_cookie_setter("session-reuse")
             self._log("authorization code obtained via session cookie-setter")
         except Exception as session_err:
+            if not allow_create_session:
+                raise RuntimeError(
+                    f"session-reuse OAuth failed (no CreateSession): {session_err}"
+                ) from session_err
             self._log(f"session-reuse failed ({session_err}); password CreateSession")
             if not email or not password:
                 raise RuntimeError(
@@ -689,8 +741,12 @@ class ProtocolOAuthClient:
             try:
                 code = _complete_via_cookie_setter("password-login")
             except Exception as csl_err:
-                self._log(f"cookie-setter path failed ({csl_err}); raw authorize follow")
-                code = self._follow_for_code(auth_url, redirect_uri=redirect_uri, state=state)
+                self._log(
+                    f"cookie-setter path failed ({csl_err}); raw authorize follow"
+                )
+                code = self._follow_for_code(
+                    auth_url, redirect_uri=redirect_uri, state=state
+                )
 
         self._log("exchanging authorization code...")
         return _finalize_oauth_code(
@@ -720,11 +776,16 @@ def login_with_protocol(
     redirect_port: int = 56121,
     session_cookies: Optional[Dict[str, str]] = None,
     auth_client: Any = None,
+    allow_create_session: bool = True,
 ) -> OAuthLoginResult:
     """Convenience wrapper: protocol OAuth + optional CLIProxyAPI Build export.
 
     If *auth_client* (XConsoleAuthClient) is provided after signup, its live
     curl_cffi session is reused so accounts.x.ai cookies stay attached.
+
+    When *allow_create_session* is False (post-signup path), only SSO session
+    reuse is attempted; password CreateSession + Turnstile is skipped so the
+    caller can fall back to pure HTTP Device Flow instead.
     """
     client = ProtocolOAuthClient(
         proxy=proxy,
@@ -752,4 +813,5 @@ def login_with_protocol(
         redirect_port=redirect_port,
         proxy=proxy,
         session_cookies=session_cookies,
+        allow_create_session=allow_create_session,
     )

@@ -4,7 +4,7 @@
 流程:
   1) 协议注册（邮箱验证 + Turnstile + create_account）
   2) 提取 SSO
-  3) xAI OAuth PKCE（含 grok-cli:access）
+  3) Build OAuth（快路径：协议 SSO session-reuse；失败回退 sso2auth Device Flow）
   4) 导出 CLIProxyAPI auth：cli-chat-proxy.grok.com + grok-cli headers
      → 可直接用 grok-4.5 走 Build/CLI 编码通道
 
@@ -21,14 +21,16 @@
     MAIL_MAX_ATTEMPTS     Fresh inboxes to try when mail is silent (default 3)
     CLOUDFLARE_API_TOKEN   Cloudflare API token (alias_mail 邮箱后端)
     CLIPROXYAPI_AUTH_DIR   CLIProxyAPI data/auth 目录（可选）
-    HTTPS_PROXY / HTTP_PROXY  代理（OAuth 换 token / browser）
+    HTTPS_PROXY / HTTP_PROXY  代理
 
 CLI 常用:
-    -n / -t                账号数 / 并发（注册+协议 OAuth 并发；Turnstile 默认 2 并行）
+    -n / -t                账号数 / 并发（注册 + OAuth 全程并发）
+    --no-oauth-protocol    跳过协议 OAuth，直接 sso2auth Device Flow
     --check-quota          OAuth 后探测额度，无额度移到 failed 目录（默认关）
     --failed-auth-dir      无额度 auth 目录（默认 <auth-dir>_failed）
     --check-quota-timeout  单号探测超时秒数
 """
+
 from __future__ import annotations
 
 import sys
@@ -59,10 +61,11 @@ from xconsole_client import XConsoleAuthClient, config as C
 from xconsole_client.solver import resolve_turnstile_solver
 from xconsole_client.xai_oauth import (
     CLIPROXYAPI_GROK_BASE_URL,
-    complete_build_oauth,
+    OAuthLoginResult,
     default_cliproxyapi_auth_dir,
 )
 from xconsole_client.oauth_protocol import extract_cookies_from_auth_client
+from xconsole_client.sso2auth import mint_cpa_from_sso
 
 # -- secrets from environment only ---------------------------------------
 TEMPMAIL_KEY = os.environ.get("TEMPMAIL_API_KEY", "")
@@ -87,11 +90,11 @@ def _mail_max_attempts() -> int:
     except ValueError:
         return 3
 
+
 _results_lock = threading.Lock()
 _cf_lock = threading.Lock()
-# Only Playwright/browser OAuth needs serialization (Playwright sync is TLS-bound
-# and multi-headed Chrome is heavy). Pure HTTP protocol OAuth is concurrent-safe.
-_oauth_browser_lock = threading.Lock()
+
+
 # Turnstile mint concurrency. Default 2: Drission uses thread-local Chrome so
 # two slots do not share cookies/session. Higher values open more Chromes.
 def _turnstile_parallel() -> int:
@@ -119,17 +122,21 @@ def _make_email_provider(backend: str):
     """Return (email, receiver) — receiver has .wait_for_code(timeout)."""
     if backend == "tempmail":
         from xconsole_client.tempmail_transport import TempmailInbox
+
         # Free tier: no API key. Optional TEMPMAIL_API_KEY for Plus/Ultra rate limits.
         inbox = TempmailInbox(api_key=TEMPMAIL_KEY or "", prefix="xai", debug=False)
         email = inbox.create()
         return email, inbox
     elif backend == "cloudflare":
         from xconsole_client.mailbox import AliasMailAccount, AliasMailCodeReceiver
+
         with _cf_lock:
             cf = AliasMailAccount.ensure_cf()
             alloc = AliasMailAccount(cf)
             address = alloc.create(prefix="xai")
-        receiver = AliasMailCodeReceiver(cf, address=address, timeout=120, interval=3, since_now=True)
+        receiver = AliasMailCodeReceiver(
+            cf, address=address, timeout=120, interval=3, since_now=True
+        )
         return address, receiver
     else:
         raise ValueError(f"unknown email backend: {backend}")
@@ -139,7 +146,10 @@ def _save_account_bundle(result: dict, output_dir: Path) -> Path:
     """Persist a combined signup+oauth record for later tooling (opt-in)."""
     output_dir.mkdir(parents=True, exist_ok=True)
     email = str(result.get("email") or "unknown")
-    safe = "".join(ch if ch.isalnum() or ch in "._-@" else "_" for ch in email) or "unknown"
+    safe = (
+        "".join(ch if ch.isalnum() or ch in "._-@" else "_" for ch in email)
+        or "unknown"
+    )
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     path = output_dir / f"account_{safe}_{ts}.json"
     path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -242,9 +252,6 @@ def register_one(
     email_backend: str = "tempmail",
     *,
     do_oauth: bool = True,
-    oauth_headless: bool = True,
-    oauth_timeout: float = 180.0,
-    oauth_interactive_fallback: bool = False,
     oauth_protocol: bool = True,
     oauth_debug: bool = False,
     cliproxyapi_auth_dir: Optional[str | Path] = None,
@@ -402,9 +409,13 @@ def register_one(
 
         # 4. create account
         res = c.create_account(
-            email=email, given_name="Test", family_name="User",
-            password=password, email_validation_code=code,
-            turnstile_token=turnstile, castle_request_token="",
+            email=email,
+            given_name="Test",
+            family_name="User",
+            password=password,
+            email_validation_code=code,
+            turnstile_token=turnstile,
+            castle_request_token="",
             conversion_id=str(uuid.uuid4()),
         )
         if not res.ok:
@@ -417,9 +428,13 @@ def register_one(
                     premium=True,
                 )
             res = c.create_account(
-                email=email, given_name="Test", family_name="User",
-                password=password, email_validation_code=code,
-                turnstile_token=turnstile, castle_request_token="",
+                email=email,
+                given_name="Test",
+                family_name="User",
+                password=password,
+                email_validation_code=code,
+                turnstile_token=turnstile,
+                castle_request_token="",
                 conversion_id=str(uuid.uuid4()),
             )
         if not res.ok:
@@ -462,22 +477,30 @@ def register_one(
         }
 
         # 6. OAuth → CLIProxyAPI Grok Build path (coding-ready)
+        # Fast: protocol session-reuse (pure HTTP). Fallback: sso2auth Device Flow.
+        # No Playwright / system-browser OAuth in the register path.
         if do_oauth:
-            auth_dir = Path(cliproxyapi_auth_dir) if cliproxyapi_auth_dir else default_cliproxyapi_auth_dir()
-            # Reuse signup session cookies so OAuth can skip password login when possible.
+            auth_dir = (
+                Path(cliproxyapi_auth_dir)
+                if cliproxyapi_auth_dir
+                else default_cliproxyapi_auth_dir()
+            )
             session_cookies = extract_cookies_from_auth_client(c)
-            # Grok SSO JWT (from fetch_sso_token) also works as accounts.x.ai `sso` cookie.
             if sso:
                 session_cookies = dict(session_cookies or {})
                 session_cookies.setdefault("sso", sso)
-            _log(index, f"OAuth Build path → {auth_dir}  (cookies={len(session_cookies)})")
-            # Protocol OAuth is pure HTTP → concurrent. Only serialize Playwright
-            # browser fallback (Playwright sync + multi-Chrome is heavy/TLS-bound).
-            oauth = None
+            _log(
+                index,
+                f"OAuth Build path → {auth_dir}  (cookies={len(session_cookies)})",
+            )
+
+            oauth: Optional[OAuthLoginResult] = None
             protocol_err: Optional[BaseException] = None
+
             if oauth_protocol:
                 try:
                     from xconsole_client.oauth_protocol import login_with_protocol
+
                     oauth = login_with_protocol(
                         email,
                         password,
@@ -487,31 +510,60 @@ def register_one(
                         cliproxyapi_base_url=cliproxyapi_base_url,
                         session_cookies=session_cookies,
                         auth_client=c,
+                        allow_create_session=False,
                     )
                 except Exception as exc:  # noqa: BLE001
                     protocol_err = exc
-                    _log(index, f"protocol OAuth failed ({exc}); browser fallback")
+                    _log(index, f"protocol OAuth failed ({exc}); sso2auth device flow")
+
             if oauth is None:
-                with _oauth_browser_lock:
-                    oauth = complete_build_oauth(
-                        email,
-                        password,
-                        cliproxyapi_auth_dir=auth_dir,
-                        cliproxyapi_base_url=cliproxyapi_base_url,
-                        headless=oauth_headless,
-                        timeout=oauth_timeout,
-                        proxy=PROXY,
-                        interactive_fallback=oauth_interactive_fallback,
-                        # Skip re-trying protocol under the lock if it already failed.
-                        protocol=False if protocol_err is not None else oauth_protocol,
-                        debug=oauth_debug,
-                        session_cookies=session_cookies,
-                        auth_client=c,
+                if not sso:
+                    raise RuntimeError(
+                        "OAuth needs SSO for device flow"
+                        + (f"; protocol: {protocol_err}" if protocol_err else "")
                     )
+                mint = mint_cpa_from_sso(
+                    sso,
+                    email=email,
+                    auth_dir=auth_dir,
+                    proxy=PROXY,
+                    base_url=cliproxyapi_base_url,
+                    skip_existing=False,
+                    log=lambda m, i=index: _log(i, m),
+                )
+                if not mint.get("ok"):
+                    raise RuntimeError(
+                        f"sso2auth failed: {mint.get('error')}"
+                        + (f"; protocol: {protocol_err}" if protocol_err else "")
+                    )
+                token = (
+                    mint.get("token")
+                    if isinstance(mint.get("token"), dict)
+                    else {
+                        "access_token": mint.get("access_token") or "",
+                        "refresh_token": mint.get("refresh_token") or "",
+                    }
+                )
+                userinfo = (
+                    mint.get("userinfo")
+                    if isinstance(mint.get("userinfo"), dict)
+                    else {}
+                )
+                cpa_path = Path(str(mint["path"])) if mint.get("path") else None
+                oauth = OAuthLoginResult(
+                    token=token,
+                    userinfo=userinfo,
+                    id_token_payload=None,
+                    path=None,
+                    cliproxyapi_path=cpa_path,
+                )
+
             result["oauth_access_token"] = oauth.access_token
             result["oauth_refresh_token"] = oauth.refresh_token
             result["oauth_record"] = str(oauth.path) if oauth.path else None
-            result["cliproxyapi_auth"] = str(oauth.cliproxyapi_path) if oauth.cliproxyapi_path else None
+            result["cliproxyapi_auth"] = (
+                str(oauth.cliproxyapi_path) if oauth.cliproxyapi_path else None
+            )
             _log(
                 index,
                 f"Build OAuth OK  access={oauth.access_token[:20]}...  "
@@ -575,9 +627,16 @@ def main():
         description="grok-build-auth: x.ai register + SSO + Grok Build OAuth (CLIProxyAPI-ready)",
     )
     p.add_argument("-n", "--count", type=int, default=1, help="账号数量")
-    p.add_argument("-t", "--threads", type=int, default=1, help="并发线程数（注册+协议 OAuth 并发；浏览器 OAuth 回退串行）")
     p.add_argument(
-        "-e", "--email",
+        "-t",
+        "--threads",
+        type=int,
+        default=1,
+        help="并发线程数（注册 + OAuth 全程并发）",
+    )
+    p.add_argument(
+        "-e",
+        "--email",
         choices=["tempmail", "cloudflare"],
         default="tempmail",
         help="邮箱后端: tempmail | cloudflare",
@@ -598,25 +657,9 @@ def main():
         help="Build 上游 base_url（默认 cli-chat-proxy.grok.com/v1）",
     )
     p.add_argument(
-        "--oauth-headed",
-        action="store_true",
-        help="Playwright 有头模式（仅非协议回退时使用）",
-    )
-    p.add_argument(
-        "--oauth-timeout",
-        type=float,
-        default=180.0,
-        help="OAuth 等待超时秒数",
-    )
-    p.add_argument(
         "--no-oauth-protocol",
         action="store_true",
-        help="禁用纯协议 OAuth（改走 Playwright 登录回退）",
-    )
-    p.add_argument(
-        "--oauth-interactive-fallback",
-        action="store_true",
-        help="协议/Playwright 失败时回退到系统浏览器手动登录",
+        help="禁用协议 session-reuse OAuth，直接走 sso2auth Device Flow",
     )
     p.add_argument(
         "--oauth-debug",
@@ -676,9 +719,6 @@ def main():
     accounts_dir = (args.accounts_output_dir or "").strip() or None
     common_kwargs = dict(
         do_oauth=do_oauth,
-        oauth_headless=not args.oauth_headed,
-        oauth_timeout=args.oauth_timeout,
-        oauth_interactive_fallback=args.oauth_interactive_fallback,
         oauth_protocol=not args.no_oauth_protocol,
         oauth_debug=args.oauth_debug,
         cliproxyapi_auth_dir=args.cliproxyapi_auth_dir,

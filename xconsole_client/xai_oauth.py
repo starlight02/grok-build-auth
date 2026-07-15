@@ -14,6 +14,7 @@ It is intentionally separate from the older account-signup + grok.com SSO cookie
 flow in client.py/sso.py.  OAuth tokens authenticate with Bearer tokens; SSO
 cookies authenticate browser-style grok.com requests.
 """
+
 from __future__ import annotations
 
 import base64
@@ -28,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
@@ -216,7 +217,9 @@ def exchange_code_for_token(
         proxies=proxies,
     )
     if resp.status_code != 200:
-        raise RuntimeError(f"token exchange failed: HTTP {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(
+            f"token exchange failed: HTTP {resp.status_code}: {resp.text[:500]}"
+        )
     token = resp.json()
     now = int(time.time())
     if "expires_in" in token and "expires_at" not in token:
@@ -248,7 +251,9 @@ def refresh_access_token(
         proxies=proxies,
     )
     if resp.status_code != 200:
-        raise RuntimeError(f"refresh failed: HTTP {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(
+            f"refresh failed: HTTP {resp.status_code}: {resp.text[:500]}"
+        )
     token = resp.json()
     now = int(time.time())
     if "expires_in" in token and "expires_at" not in token:
@@ -261,7 +266,9 @@ def refresh_access_token(
     return token
 
 
-def fetch_userinfo(access_token: str, *, timeout: float = 30.0, proxy: str = "") -> Dict[str, Any]:
+def fetch_userinfo(
+    access_token: str, *, timeout: float = 30.0, proxy: str = ""
+) -> Dict[str, Any]:
     if not access_token:
         return {}
     proxies = {"http": proxy, "https": proxy} if proxy else None
@@ -292,7 +299,9 @@ def save_oauth_record(
         email = str(userinfo.get("email") or "")
     if not email and id_payload:
         email = str(id_payload.get("email") or "")
-    safe_email = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in email) or "unknown"
+    safe_email = (
+        "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in email) or "unknown"
+    )
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = target / f"xai_oauth_{safe_email}_{ts}.json"
@@ -322,7 +331,9 @@ def _safe_email_for_filename(email: str) -> str:
 
 def _iso_utc_from_unix(ts: Any) -> str:
     try:
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
     except Exception:
         return ""
 
@@ -360,13 +371,23 @@ def build_cliproxyapi_auth_record(
 
     merged_headers = dict(CLIPROXYAPI_GROK_HEADERS)
     if headers:
-        merged_headers.update({str(k): str(v) for k, v in headers.items() if str(k).strip() and str(v).strip()})
+        merged_headers.update(
+            {
+                str(k): str(v)
+                for k, v in headers.items()
+                if str(k).strip() and str(v).strip()
+            }
+        )
 
     record = {
         "type": "xai",
         "auth_kind": "oauth",
         "email": email,
-        "sub": str(id_payload.get("sub") or userinfo.get("sub") if userinfo else id_payload.get("sub") or ""),
+        "sub": str(
+            id_payload.get("sub") or userinfo.get("sub")
+            if userinfo
+            else id_payload.get("sub") or ""
+        ),
         "access_token": token.get("access_token", ""),
         "refresh_token": token.get("refresh_token", ""),
         "id_token": token.get("id_token", ""),
@@ -442,7 +463,9 @@ def _start_pkce_callback_server(
         code_challenge=challenge,
         scopes=scopes,
     )
-    thread = threading.Thread(target=server.serve_forever, name="xai-oauth-callback", daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever, name="xai-oauth-callback", daemon=True
+    )
     thread.start()
     return server, sink, auth_url, redirect_uri, state, verifier
 
@@ -496,7 +519,9 @@ def _finalize_oauth_code(
     )
 
 
-def _wait_oauth_code(sink: _CallbackState, state: str, redirect_uri: str, timeout: float) -> str:
+def _wait_oauth_code(
+    sink: _CallbackState, state: str, redirect_uri: str, timeout: float
+) -> str:
     if not sink.event.wait(timeout):
         raise TimeoutError(f"timed out waiting for OAuth callback on {redirect_uri}")
     if sink.error:
@@ -525,7 +550,10 @@ def login_with_browser(
 ) -> OAuthLoginResult:
     scopes = scopes or list(DEFAULT_SCOPES)
     server, sink, auth_url, redirect_uri, state, verifier = _start_pkce_callback_server(
-        client_id=client_id, scopes=scopes, host=host, port=port,
+        client_id=client_id,
+        scopes=scopes,
+        host=host,
+        port=port,
     )
     try:
         print("\nOpen this URL to authorize xAI/Grok:\n")
@@ -577,7 +605,9 @@ def _playwright_fill_first(page: Any, selectors: list[str], value: str) -> bool:
     return False
 
 
-def _playwright_drive_login(page: Any, email: str, password: str, sink: _CallbackState, deadline: float) -> None:
+def _playwright_drive_login(
+    page: Any, email: str, password: str, sink: _CallbackState, deadline: float
+) -> None:
     """Drive auth.x.ai login/consent UI until local OAuth callback fires."""
     email_selectors = [
         'input[type="email"]',
@@ -615,9 +645,13 @@ def _playwright_drive_login(page: Any, email: str, password: str, sink: _Callbac
     filled_password = False
     while time.time() < deadline and not sink.event.is_set():
         try:
-            if not filled_email and _playwright_fill_first(page, email_selectors, email):
+            if not filled_email and _playwright_fill_first(
+                page, email_selectors, email
+            ):
                 filled_email = True
-            if not filled_password and _playwright_fill_first(page, password_selectors, password):
+            if not filled_password and _playwright_fill_first(
+                page, password_selectors, password
+            ):
                 filled_password = True
                 _playwright_click_first(page, submit_selectors)
             elif filled_email and not filled_password:
@@ -666,7 +700,10 @@ def login_with_playwright(
 
     scopes = scopes or list(DEFAULT_SCOPES)
     server, sink, auth_url, redirect_uri, state, verifier = _start_pkce_callback_server(
-        client_id=client_id, scopes=scopes, host=host, port=port,
+        client_id=client_id,
+        scopes=scopes,
+        host=host,
+        port=port,
     )
     deadline = time.time() + max(30.0, float(timeout))
     try:
@@ -715,7 +752,11 @@ def login_with_playwright(
                             pass
 
                 page = context.new_page()
-                page.goto(auth_url, wait_until="domcontentloaded", timeout=int(min(timeout, 60) * 1000))
+                page.goto(
+                    auth_url,
+                    wait_until="domcontentloaded",
+                    timeout=int(min(timeout, 60) * 1000),
+                )
                 # If still on login form, fill credentials.
                 if email and password and not sink.event.is_set():
                     _playwright_drive_login(page, email, password, sink, deadline)
@@ -760,75 +801,6 @@ def login_with_playwright(
         server.server_close()
 
 
-def complete_build_oauth(
-    email: str,
-    password: str,
-    *,
-    cliproxyapi_auth_dir: Optional[str | Path] = None,
-    cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
-    headless: bool = True,
-    timeout: float = 180.0,
-    port: int = 0,
-    proxy: str = "",
-    interactive_fallback: bool = False,
-    protocol: bool = True,
-    debug: bool = False,
-    session_cookies: Optional[Dict[str, str]] = None,
-    auth_client: Any = None,
-) -> OAuthLoginResult:
-    """Obtain Grok Build/CLI OAuth tokens after protocol signup.
-
-    Preference order:
-      1) Pure HTTP protocol (reuse signup cookies, else CreateSession + local Turnstile)
-      2) Playwright auto-login (if protocol=False or protocol fails)
-      3) Interactive system-browser fallback (if interactive_fallback=True)
-    """
-    errors: list[str] = []
-
-    if protocol:
-        try:
-            from .oauth_protocol import login_with_protocol
-            return login_with_protocol(
-                email,
-                password,
-                proxy=proxy,
-                debug=debug,
-                cliproxyapi_auth_dir=str(cliproxyapi_auth_dir) if cliproxyapi_auth_dir else None,
-                cliproxyapi_base_url=cliproxyapi_base_url,
-                redirect_port=port or 56121,
-                session_cookies=session_cookies,
-                auth_client=auth_client,
-            )
-        except Exception as exc:
-            errors.append(f"protocol OAuth failed: {exc}")
-            print(f"Protocol OAuth failed ({exc})")
-
-    try:
-        return login_with_playwright(
-            email,
-            password,
-            timeout=timeout,
-            headless=headless,
-            port=port,
-            proxy=proxy,
-            cliproxyapi_auth_dir=cliproxyapi_auth_dir,
-            cliproxyapi_base_url=cliproxyapi_base_url,
-            session_cookies=session_cookies,
-        )
-    except Exception as auto_err:
-        errors.append(f"playwright OAuth failed: {auto_err}")
-        if not interactive_fallback:
-            raise RuntimeError("; ".join(errors)) from auto_err
-        print(f"Playwright OAuth failed ({auto_err}); falling back to interactive browser login...")
-        return login_with_browser(
-            timeout=max(timeout, 300.0),
-            port=port,
-            proxy=proxy,
-            cliproxyapi_auth_dir=cliproxyapi_auth_dir,
-            cliproxyapi_base_url=cliproxyapi_base_url,
-        )
-
-
 def default_cliproxyapi_auth_dir() -> Path:
     """Resolve CLIProxyAPI auth directory.
 
@@ -846,11 +818,21 @@ def main() -> None:
     import argparse
 
     p = argparse.ArgumentParser(description="xAI/Grok OAuth PKCE login")
-    p.add_argument("--port", type=int, default=0, help="Local callback port; 0 = random free port")
+    p.add_argument(
+        "--port", type=int, default=0, help="Local callback port; 0 = random free port"
+    )
     p.add_argument("--host", default="127.0.0.1", help="Local callback host")
-    p.add_argument("--no-browser", action="store_true", help="Print auth URL only; do not open browser")
-    p.add_argument("--timeout", type=float, default=300.0, help="Callback wait timeout seconds")
-    p.add_argument("--client-id", default=os.getenv("XAI_OAUTH_CLIENT_ID", DEFAULT_CLIENT_ID))
+    p.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Print auth URL only; do not open browser",
+    )
+    p.add_argument(
+        "--timeout", type=float, default=300.0, help="Callback wait timeout seconds"
+    )
+    p.add_argument(
+        "--client-id", default=os.getenv("XAI_OAUTH_CLIENT_ID", DEFAULT_CLIENT_ID)
+    )
     p.add_argument("--scope", action="append", help="Override scopes; may be repeated")
     p.add_argument("--output-dir", default=None)
     p.add_argument(
@@ -871,7 +853,9 @@ def main() -> None:
         action="store_true",
         help="Mark the optional CLIProxyAPI auth export as disabled.",
     )
-    p.add_argument("--proxy", default=os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "")
+    p.add_argument(
+        "--proxy", default=os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or ""
+    )
     args = p.parse_args()
 
     result = login_with_browser(
