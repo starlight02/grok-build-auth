@@ -9,14 +9,21 @@
      → 可直接用 grok-4.5 走 Build/CLI 编码通道
 
 环境变量（按需设置）:
-    TURNSTILE_SOLVER       auto|drission|browser (default auto → DrissionPage+turnstilePatch)
+    TURNSTILE_SOLVER       auto|drission|browser|safari (default auto → DrissionPage+turnstilePatch)
     TURNSTILE_HEADLESS     drission 默认 0（有头自动点）；browser/playwright 默认 1
     TURNSTILE_BROWSER_CHANNEL  playwright only (chrome auto when available)
     TURNSTILE_INTERACTIVE  1=手动点 Turnstile（仅 playwright；强制有头）
     TURNSTILE_BROWSER_REUSE    1=keep per-thread browser warm (default 1)
-    TURNSTILE_TIMEOUT      hard wall-clock seconds per Turnstile solve (default 30)
-    TURNSTILE_PARALLEL     concurrent Turnstile mints (default 2; Drission thread-local Chrome)
-    TEMPMAIL_API_KEY       Optional Tempmail.lol Plus/Ultra key (free tier works without)
+    TURNSTILE_TIMEOUT      hard wall-clock seconds per Turnstile solve (default 60)
+    TURNSTILE_PARALLEL     pool 关闭时 mint 并发（默认随 -t，上限 8）
+    TURNSTILE_POOL         后台 token 池（默认开；0=关）
+    TURNSTILE_POOL_SIZE    池硬上限（默认随 -t 自动；显式设置则固定）
+    TURNSTILE_POOL_TARGET  空闲预存（默认 min(2,size)；够用即停产）
+    TURNSTILE_POOL_MINTERS mint 线程（默认随 -t：1/2/3/4；Safari 固定 1）
+    TURNSTILE_TOKEN_MAX_AGE  token 最大年龄秒（默认 200）
+    TURNSTILE_PAUSE_FILE   存在则暂停 mint/HID 点击（默认 /tmp/grok-turnstile.pause）
+    TEMPMAIL_API_KEY       Optional Tempmail.lol Plus/Ultra（免费层无需；提高限额）
+    TEMPMAIL_FREE_CREATE_INTERVAL  无 key 时 create 最小间隔秒（默认 3 ≈20/min）
     MAIL_CODE_TIMEOUT     Seconds to wait for verification code before rotating inbox (default 30)
     MAIL_MAX_ATTEMPTS     Fresh inboxes to try when mail is silent (default 3)
     CLOUDFLARE_API_TOKEN   Cloudflare API token (alias_mail 邮箱后端)
@@ -24,7 +31,7 @@
     HTTPS_PROXY / HTTP_PROXY  代理
 
 CLI 常用:
-    -n / -t                账号数 / 并发（注册 + OAuth 全程并发）
+    -n / -t                账号数 / 并发（默认 -t 4；池 size/minters 随 -t 自动）
     --no-oauth-protocol    跳过协议 OAuth，直接 sso2auth Device Flow
     --check-quota          OAuth 后探测额度，无额度移到 failed 目录（默认关）
     --failed-auth-dir      无额度 auth 目录（默认 <auth-dir>_failed）
@@ -59,6 +66,11 @@ except Exception:
 
 from xconsole_client import XConsoleAuthClient, config as C
 from xconsole_client.solver import resolve_turnstile_solver
+from xconsole_client.turnstile_pool import (
+    TurnstileTokenPool,
+    pause_file_path,
+    suggest_pool_params,
+)
 from xconsole_client.xai_oauth import (
     CLIPROXYAPI_GROK_BASE_URL,
     OAuthLoginResult,
@@ -95,17 +107,20 @@ _results_lock = threading.Lock()
 _cf_lock = threading.Lock()
 
 
-# Turnstile mint concurrency. Default 2: Drission uses thread-local Chrome so
-# two slots do not share cookies/session. Higher values open more Chromes.
-def _turnstile_parallel() -> int:
-    raw = (os.environ.get("TURNSTILE_PARALLEL") or "2").strip()
-    try:
-        return max(1, min(int(raw), 8))
-    except ValueError:
-        return 2
+# Turnstile mint concurrency when pool is OFF. Env overrides; else follow -t.
+def _turnstile_parallel(reg_threads: int = 2) -> int:
+    raw = (os.environ.get("TURNSTILE_PARALLEL") or "").strip()
+    if raw:
+        try:
+            return max(1, min(int(raw), 8))
+        except ValueError:
+            pass
+    return max(1, min(8, int(reg_threads or 1)))
 
 
-_turnstile_lock = threading.Semaphore(_turnstile_parallel())
+_turnstile_lock = threading.Semaphore(2)  # re-bound in main() from -t
+_token_pool: Optional[TurnstileTokenPool] = None
+_shared_solver = None
 _results: list[dict] = []
 _done = 0
 _total = 0
@@ -116,6 +131,33 @@ def _log(i: int, msg: str):
     elapsed = time.time() - _t0
     bar = f"[{_done}/{_total}]" if _total > 1 else ""
     print(f"  {bar} [#{i}] {msg}  ({elapsed:.0f}s)")
+
+
+def _pool_enabled(solver_mode: str) -> bool:
+    raw = (os.environ.get("TURNSTILE_POOL") or "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    # Default ON for every solver — demand-driven pool matches free-tier reg pace.
+    return True
+
+
+def _acquire_turnstile(index: int, turnstile_solver) -> tuple[str, float]:
+    """Return (token, minted_at). Uses background pool when enabled."""
+    global _token_pool
+    pool = _token_pool
+    if pool is not None:
+        item = pool.acquire(timeout=max(120.0, float(os.environ.get("TURNSTILE_TIMEOUT") or 60) * 4))
+        _log(index, f"Turnstile {len(item.token)} chars from pool (age={item.age:.0f}s q={pool.qsize()})")
+        return item.token, item.minted_at
+    with _turnstile_lock:
+        token = turnstile_solver.solve_turnstile(
+            website_url=SIGNUP_URL,
+            website_key=C.TURNSTILE_SITEKEY,
+            premium=True,
+        )
+    return token, time.time()
 
 
 def _make_email_provider(backend: str):
@@ -262,9 +304,10 @@ def register_one(
     check_quota_timeout: float = 45.0,
 ) -> dict:
     """Run signup (+ optional Build OAuth export). Thread-safe."""
-    # Turnstile: local browser only.
+    # Turnstile: local browser only (shared solver when pool is on).
+    global _shared_solver
     try:
-        turnstile_solver = resolve_turnstile_solver(
+        turnstile_solver = _shared_solver or resolve_turnstile_solver(
             proxy=PROXY,
             debug=oauth_debug,
         )
@@ -278,8 +321,14 @@ def register_one(
             "error": f"Turnstile solver unavailable: {exc}",
         }
 
-    # Per-client signup_url — never mutate global C.SIGNUP_URL under concurrency.
-    c = XConsoleAuthClient(debug=False, signup_url=SIGNUP_URL)
+    # curl_cffi is often CF-blocked on residential/datacenter IPs that Safari/urllib still pass.
+    transport = (os.environ.get("XCONSOLE_TRANSPORT") or "").strip().lower()
+    if not transport:
+        solver = (os.environ.get("TURNSTILE_SOLVER") or "").strip().lower()
+        transport = "urllib" if solver in {"safari", "webkit-system", "system-safari"} else "curl_cffi"
+    if transport not in {"curl_cffi", "urllib"}:
+        transport = "curl_cffi"
+    c = XConsoleAuthClient(debug=False, signup_url=SIGNUP_URL, transport=transport)
     email = ""
     password = ""
     sso = None
@@ -351,26 +400,14 @@ def register_one(
 
         ts_t0 = time.time()
         try:
-            # Bound concurrent Turnstile mints (default 2; see TURNSTILE_PARALLEL).
-            with _turnstile_lock:
-                turnstile = turnstile_solver.solve_turnstile(
-                    website_url=SIGNUP_URL,
-                    website_key=C.TURNSTILE_SITEKEY,
-                    premium=True,
-                )
+            turnstile, ts_t0 = _acquire_turnstile(index, turnstile_solver)
         except Exception as ts_exc:
             # Let mail finish its current attempt, then surface.
             mail_thread.join(timeout=mail_timeout + 5)
             stop_mail.set()
             if code_box.get("code"):
                 _log(index, f"Turnstile first try failed ({ts_exc}); retry after mail")
-                with _turnstile_lock:
-                    turnstile = turnstile_solver.solve_turnstile(
-                        website_url=SIGNUP_URL,
-                        website_key=C.TURNSTILE_SITEKEY,
-                        premium=True,
-                    )
-                ts_t0 = time.time()
+                turnstile, ts_t0 = _acquire_turnstile(index, turnstile_solver)
             else:
                 raise
 
@@ -392,20 +429,17 @@ def register_one(
         c.validate_password(email, password)
         _log(index, "email verified")
 
-        # Token TTL safety: if mint finished long before mail, re-solve.
+        # Token TTL safety: if mint finished long before mail, re-acquire.
         age = time.time() - ts_t0
-        if age > 240:
-            _log(index, f"Turnstile token age {age:.0f}s; re-solve")
-            with _turnstile_lock:
-                turnstile = turnstile_solver.solve_turnstile(
-                    website_url=SIGNUP_URL,
-                    website_key=C.TURNSTILE_SITEKEY,
-                    premium=True,
-                )
-        _log(
-            index,
-            f"Turnstile {len(turnstile)} chars via {type(turnstile_solver).__name__}",
-        )
+        max_age = float(getattr(_token_pool, "max_age", 200.0) if _token_pool else 240.0)
+        if age > max_age:
+            _log(index, f"Turnstile token age {age:.0f}s; re-acquire")
+            turnstile, ts_t0 = _acquire_turnstile(index, turnstile_solver)
+        if _token_pool is None:
+            _log(
+                index,
+                f"Turnstile {len(turnstile)} chars via {type(turnstile_solver).__name__}",
+            )
 
         # 4. create account
         res = c.create_account(
@@ -421,12 +455,7 @@ def register_one(
         if not res.ok:
             # One free retry with a fresh token (expired / race)
             _log(index, f"create_account HTTP {res.http_status}; retry Turnstile once")
-            with _turnstile_lock:
-                turnstile = turnstile_solver.solve_turnstile(
-                    website_url=SIGNUP_URL,
-                    website_key=C.TURNSTILE_SITEKEY,
-                    premium=True,
-                )
+            turnstile, ts_t0 = _acquire_turnstile(index, turnstile_solver)
             res = c.create_account(
                 email=email,
                 given_name="Test",
@@ -631,8 +660,8 @@ def main():
         "-t",
         "--threads",
         type=int,
-        default=1,
-        help="并发线程数（注册 + OAuth 全程并发）",
+        default=4,
+        help="并发线程数（注册 + OAuth；默认 4，对齐 Tempmail free 稳态上限）",
     )
     p.add_argument(
         "-e",
@@ -701,11 +730,16 @@ def main():
     if check_quota and not failed_auth_dir:
         failed_auth_dir = str(_default_failed_auth_dir(args.cliproxyapi_auth_dir))
 
-    solver_mode = (os.environ.get("TURNSTILE_SOLVER") or "browser").strip().lower()
-    ts_label = solver_mode if solver_mode else "browser"
+    solver_mode = (os.environ.get("TURNSTILE_SOLVER") or "auto").strip().lower()
+    ts_label = solver_mode if solver_mode else "auto"
+    use_pool = _pool_enabled(solver_mode)
+    pool_size, pool_target, pool_minters = suggest_pool_params(
+        threads, solver_mode=solver_mode
+    )
     print(
         f"grok-build-auth: {args.count} accounts, {threads} threads, email={args.email}, "
         f"oauth={'on' if do_oauth else 'off'}, turnstile={ts_label}"
+        f", pool={'on' if use_pool else 'off'}"
         f", check-quota={'on' if check_quota else 'off'}"
     )
     if do_oauth:
@@ -714,32 +748,74 @@ def main():
     if check_quota:
         print(f"  failed-auth-dir:      {failed_auth_dir}")
         print(f"  check-quota-timeout:  {args.check_quota_timeout}s")
+    if use_pool:
+        print(
+            f"  turnstile-pool:       size={pool_size} target={pool_target} "
+            f"minters={pool_minters} "
+            f"max_age={os.environ.get('TURNSTILE_TOKEN_MAX_AGE') or '200'}s "
+            f"(auto from -t={threads})"
+        )
+        print(f"  pause-file:           {pause_file_path()}  (touch=pause mint/click, rm=resume)")
+    else:
+        par = _turnstile_parallel(threads)
+        print(f"  turnstile-parallel:   {par} (pool off; auto from -t={threads})")
     print()
 
-    accounts_dir = (args.accounts_output_dir or "").strip() or None
-    common_kwargs = dict(
-        do_oauth=do_oauth,
-        oauth_protocol=not args.no_oauth_protocol,
-        oauth_debug=args.oauth_debug,
-        cliproxyapi_auth_dir=args.cliproxyapi_auth_dir,
-        cliproxyapi_base_url=args.cliproxyapi_base_url,
-        accounts_output_dir=accounts_dir,
-        check_quota=check_quota,
-        failed_auth_dir=failed_auth_dir or None,
-        check_quota_timeout=args.check_quota_timeout,
-    )
+    global _token_pool, _shared_solver, _turnstile_lock
+    _token_pool = None
+    _shared_solver = None
+    if use_pool:
+        _shared_solver = resolve_turnstile_solver(
+            proxy=PROXY,
+            debug=args.oauth_debug,
+        )
 
-    if args.count == 1:
-        result = register_one(1, email_backend=args.email, **common_kwargs)
-        _results.append(result)
+        def _pool_log(msg: str) -> None:
+            print(f"  [ts-pool] {msg}", flush=True)
+
+        _token_pool = TurnstileTokenPool(
+            _shared_solver,
+            website_url=SIGNUP_URL,
+            website_key=C.TURNSTILE_SITEKEY,
+            size=pool_size,
+            target=pool_target,
+            minters=pool_minters,
+            log=_pool_log,
+        )
+        _token_pool.start()
     else:
-        with ThreadPoolExecutor(max_workers=threads) as ex:
-            futures = [
-                ex.submit(register_one, i, args.email, **common_kwargs)
-                for i in range(1, args.count + 1)
-            ]
-            for f in as_completed(futures):
-                _results.append(f.result())
+        # Non-pool path: rebind mint semaphore to match registration concurrency.
+        _turnstile_lock = threading.Semaphore(_turnstile_parallel(threads))
+
+    try:
+        accounts_dir = (args.accounts_output_dir or "").strip() or None
+        common_kwargs = dict(
+            do_oauth=do_oauth,
+            oauth_protocol=not args.no_oauth_protocol,
+            oauth_debug=args.oauth_debug,
+            cliproxyapi_auth_dir=args.cliproxyapi_auth_dir,
+            cliproxyapi_base_url=args.cliproxyapi_base_url,
+            accounts_output_dir=accounts_dir,
+            check_quota=check_quota,
+            failed_auth_dir=failed_auth_dir or None,
+            check_quota_timeout=args.check_quota_timeout,
+        )
+
+        if args.count == 1:
+            result = register_one(1, email_backend=args.email, **common_kwargs)
+            _results.append(result)
+        else:
+            with ThreadPoolExecutor(max_workers=threads) as ex:
+                futures = [
+                    ex.submit(register_one, i, args.email, **common_kwargs)
+                    for i in range(1, args.count + 1)
+                ]
+                for f in as_completed(futures):
+                    _results.append(f.result())
+    finally:
+        if _token_pool is not None:
+            _token_pool.stop(wait=2.0)
+            _token_pool = None
 
     # summary
     ok_sso = [r for r in _results if r.get("sso")]

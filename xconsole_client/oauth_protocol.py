@@ -23,8 +23,13 @@ CreateSessionRequest wire layout (reverse-engineered 2026-07):
 
 from __future__ import annotations
 
+import http.cookiejar
+import io
+import os
 import re
 import secrets
+import urllib.error
+import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 
@@ -48,7 +53,97 @@ CREATE_COOKIE_SETTER_RPC = (
 )
 ACCOUNTS_ORIGIN = "https://accounts.x.ai"
 # Observed Next.js server action for the consent Allow button (may change on deploy).
-SUBMIT_OAUTH2_CONSENT_ACTION = "4005315a1d7e426de592990bb54bb37471f39dd6d2"
+SUBMIT_OAUTH2_CONSENT_ACTION = "401b73e22a5e68737d0037e1aa449fef82cd1b35fb"
+
+
+
+def resolve_submit_oauth2_consent_action(
+    page_html: str,
+    *,
+    session: Any = None,
+    timeout: float = 20.0,
+    allow_fallback: bool = True,
+) -> str:
+    """Resolve submitOAuth2Consent next-action id from consent page chunks.
+
+    The action id is NOT embedded in the HTML document. Minified binding lives
+    in a ``/_next/static/chunks/*.js`` module that is only present on the real
+    logged-in ``/oauth2/consent`` page (not the sign-in shell).
+    """
+    html = page_html or ""
+    patterns = (
+        re.compile(
+            r'createServerReference\)\("([a-f0-9]{40,44})"[^)]{0,400}submitOAuth2Consent'
+        ),
+        re.compile(
+            r'"([a-f0-9]{40,44})"[^"]{0,80}findSourceMapURL,"submitOAuth2Consent"'
+        ),
+        re.compile(
+            r'findSourceMapURL,"submitOAuth2Consent"[^"]{0,20}"([a-f0-9]{40,44})"'
+        ),
+    )
+    for pat in patterns:
+        m = pat.search(html)
+        if m:
+            resolve_submit_oauth2_consent_action.last_source = "live"
+            return m.group(1)
+
+    paths = list(
+        dict.fromkeys(re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', html))
+    )
+    if not paths:
+        paths = list(
+            dict.fromkeys(
+                re.findall(r'(/_next/static/chunks/[^"\'\\s)]+\.js)', html)
+            )
+        )
+    if not paths or session is None:
+        if not allow_fallback:
+            raise RuntimeError(
+                "submitOAuth2Consent action id not found (no chunks/session); "
+                "refusing hardcoded fallback"
+            )
+        resolve_submit_oauth2_consent_action.last_source = "fallback"
+        return SUBMIT_OAUTH2_CONSENT_ACTION
+
+    def _score(p: str) -> int:
+        # Prefer smaller page-specific chunks over giant shared bundles.
+        name = p.rsplit("/", 1)[-1]
+        return (0 if "0n0" in name or "consent" in name.lower() else 1, len(name))
+
+    for rel in sorted(paths, key=_score)[:50]:
+        url = urljoin(ACCOUNTS_ORIGIN + "/", rel.lstrip("/"))
+        try:
+            resp = session.get(url, timeout=timeout)
+            body = getattr(resp, "text", None)
+            if body is None:
+                content = getattr(resp, "content", b"") or b""
+                body = content.decode("utf-8", "replace")
+        except Exception:
+            continue
+        body = body or ""
+        for pat in patterns:
+            mm = pat.search(body)
+            if mm:
+                resolve_submit_oauth2_consent_action.last_source = "live"
+                return mm.group(1)
+        idx = body.find("submitOAuth2Consent")
+        if idx >= 0:
+            window = body[max(0, idx - 200) : idx + 60]
+            hm = re.search(r'"([a-f0-9]{40,44})"', window)
+            if hm:
+                resolve_submit_oauth2_consent_action.last_source = "live"
+                return hm.group(1)
+    if not allow_fallback:
+        raise RuntimeError(
+            "submitOAuth2Consent action id not found in consent chunks; "
+            "refusing hardcoded fallback"
+        )
+    resolve_submit_oauth2_consent_action.last_source = "fallback"
+    return SUBMIT_OAUTH2_CONSENT_ACTION
+
+
+resolve_submit_oauth2_consent_action.last_source = "unset"
 
 
 def _enc_msg(field_no: int, raw: bytes) -> bytes:
@@ -129,6 +224,179 @@ def _parse_grpc_error(
     return None, message
 
 
+
+
+class _Resp:
+    """Minimal response object matching curl_cffi Response fields we use."""
+
+    __slots__ = ("status_code", "headers", "content", "text")
+
+    def __init__(self, status_code: int, headers: Dict[str, str], content: bytes):
+        self.status_code = status_code
+        self.headers = headers
+        self.content = content or b""
+        try:
+            self.text = self.content.decode("utf-8", "replace")
+        except Exception:
+            self.text = ""
+
+
+class _UrllibCookieJar:
+    """Tiny cookie jar with curl_cffi-like ``set`` / iteration."""
+
+    def __init__(self, jar: Optional[http.cookiejar.CookieJar] = None):
+        self._jar = jar if jar is not None else http.cookiejar.CookieJar()
+
+    def set(self, name: str, value: str, domain: str = "accounts.x.ai", path: str = "/") -> None:
+        ck = http.cookiejar.Cookie(
+            version=0,
+            name=name,
+            value=value,
+            port=None,
+            port_specified=False,
+            domain=domain.lstrip(".") if domain else "accounts.x.ai",
+            domain_specified=bool(domain),
+            domain_initial_dot=bool(domain and domain.startswith(".")),
+            path=path or "/",
+            path_specified=True,
+            secure=True,
+            expires=None,
+            discard=True,
+            comment=None,
+            comment_url=None,
+            rest={},
+            rfc2109=False,
+        )
+        self._jar.set_cookie(ck)
+
+    def get(self, name: str, default: Optional[str] = None) -> Optional[str]:
+        for ck in self._jar:
+            if ck.name == name:
+                return ck.value
+        return default
+
+    def items(self):
+        seen: Dict[str, str] = {}
+        for ck in self._jar:
+            seen[ck.name] = ck.value
+        return seen.items()
+
+    def __iter__(self):
+        return iter(self._jar)
+
+
+class _UrllibOAuthSession:
+    """urllib-backed session for protocol OAuth when curl_cffi is CF-blocked."""
+
+    def __init__(self, *, timeout: float = 45.0, proxy: str = ""):
+        self._timeout = timeout
+        self.cookies = _UrllibCookieJar()
+        handlers: list[Any] = [
+            urllib.request.HTTPCookieProcessor(self.cookies._jar),
+        ]
+        proxy = (proxy or "").strip()
+        if proxy:
+            handlers.insert(0, urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        self._opener = urllib.request.build_opener(*handlers)
+
+    def get(
+        self,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        allow_redirects: bool = True,
+        timeout: Optional[float] = None,
+    ) -> _Resp:
+        return self.request(
+            "GET",
+            url,
+            headers=headers,
+            allow_redirects=allow_redirects,
+            timeout=timeout,
+        )
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[bytes] = None,
+        timeout: Optional[float] = None,
+        allow_redirects: bool = True,
+    ) -> _Resp:
+        return self.request(
+            "POST",
+            url,
+            headers=headers,
+            data=data,
+            allow_redirects=allow_redirects,
+            timeout=timeout,
+        )
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[bytes] = None,
+        allow_redirects: bool = True,
+        timeout: Optional[float] = None,
+    ) -> _Resp:
+        current = url
+        body = data
+        meth = method.upper()
+        to = self._timeout if timeout is None else float(timeout)
+        status = 0
+        hdrs: Dict[str, str] = {}
+        raw = b""
+        for _ in range(8 if allow_redirects else 1):
+            req = urllib.request.Request(current, data=body, method=meth)
+            for k, v in (headers or {}).items():
+                req.add_header(k, v)
+            if "user-agent" not in {k.lower() for k in (headers or {})}:
+                req.add_header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15",
+                )
+            try:
+                resp = self._opener.open(req, timeout=to)
+            except urllib.error.HTTPError as e:
+                resp = e
+            status = int(resp.getcode() or 0)
+            raw = resp.read() or b""
+            if resp.headers.get("content-encoding", "").lower() == "gzip" and raw[:2] == b"\x1f\x8b":
+                try:
+                    import gzip
+
+                    raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
+                except OSError:
+                    pass
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
+            if allow_redirects and status in (301, 302, 303, 307, 308):
+                loc = hdrs.get("location") or ""
+                if not loc:
+                    return _Resp(status, hdrs, raw)
+                current = urljoin(current, loc)
+                body = None
+                meth = "GET"
+                continue
+            return _Resp(status, hdrs, raw)
+        return _Resp(status, hdrs, raw)
+
+
+def _prefer_urllib_transport() -> bool:
+    """True when this IP/path should avoid curl_cffi (CF blocks it)."""
+    raw = (os.environ.get("XCONSOLE_TRANSPORT") or "").strip().lower()
+    if raw in {"urllib", "stdlib"}:
+        return True
+    if raw in {"curl_cffi", "curl", "cffi"}:
+        return False
+    solver = (os.environ.get("TURNSTILE_SOLVER") or "").strip().lower()
+    return solver in {"safari", "webkit-system", "system-safari"}
+
+
 def extract_cookies_from_auth_client(client: Any) -> Dict[str, str]:
     """Best-effort dump of name->value cookies from XConsoleAuthClient."""
     out: Dict[str, str] = {}
@@ -160,7 +428,7 @@ def extract_cookies_from_auth_client(client: Any) -> Dict[str, str]:
 
 
 class ProtocolOAuthClient:
-    """HTTP-only OAuth client using curl_cffi fingerprint + Turnstile solver."""
+    """HTTP-only OAuth client (curl_cffi or urllib) + Turnstile solver."""
 
     def __init__(
         self,
@@ -183,28 +451,59 @@ class ProtocolOAuthClient:
             self._solver_error = str(exc)
         else:
             self._solver_error = ""
-        try:
-            from curl_cffi import requests as creq
-        except ImportError as exc:
-            raise RuntimeError("curl_cffi is required for protocol OAuth") from exc
-        kwargs: Dict[str, Any] = {"impersonate": impersonate}
-        if proxy:
-            kwargs["proxies"] = {"http": proxy, "https": proxy}
-        self._s = creq.Session(**kwargs)
+        mode = (os.environ.get("XCONSOLE_TRANSPORT") or "").strip().lower()
+        if not mode:
+            mode = "urllib" if _prefer_urllib_transport() else "curl_cffi"
+        self._transport_name = mode if mode in {"urllib", "stdlib", "curl_cffi", "curl", "cffi"} else "curl_cffi"
+        if self._transport_name in {"urllib", "stdlib"}:
+            self._s = _UrllibOAuthSession(timeout=45.0, proxy=proxy or "")
+            self._log("protocol OAuth transport=urllib")
+        else:
+            try:
+                from curl_cffi import requests as creq
+            except ImportError as exc:
+                raise RuntimeError("curl_cffi is required for protocol OAuth") from exc
+            kwargs: Dict[str, Any] = {"impersonate": impersonate}
+            if proxy:
+                kwargs["proxies"] = {"http": proxy, "https": proxy}
+            self._s = creq.Session(**kwargs)
+            self._log("protocol OAuth transport=curl_cffi")
 
     def load_cookies(self, cookies: Dict[str, str]) -> None:
-        """Inject pre-existing accounts.x.ai session cookies (e.g. post-signup)."""
+        """Inject pre-existing session cookies (e.g. post-signup).
+
+        ``sso`` / ``sso-rw`` are mirrored onto the domains used by the authorize
+        and set-cookie hops (same as sso2auth), otherwise consent falls back to
+        the signed-out sign-in shell and action-id scrape fails.
+        """
         if not cookies:
             return
+        jar = getattr(self._s, "cookies", None)
+        sso_domains = (
+            "accounts.x.ai",
+            ".x.ai",
+            "auth.x.ai",
+            "auth.grok.com",
+            ".grok.com",
+        )
         for name, value in cookies.items():
-            try:
-                # Prefer domain-scoped cookies for accounts.x.ai
-                self._s.cookies.set(name, value, domain="accounts.x.ai")
-            except Exception:
+            if not name or value is None:
+                continue
+            domains = sso_domains if name in {"sso", "sso-rw"} else ("accounts.x.ai",)
+            for domain in domains:
                 try:
-                    self._s.cookies.set(name, value)
+                    if hasattr(jar, "set"):
+                        try:
+                            jar.set(name, value, domain=domain)
+                        except TypeError:
+                            jar.set(name, value)
+                            break
                 except Exception:
-                    pass
+                    try:
+                        if hasattr(jar, "set"):
+                            jar.set(name, value)
+                    except Exception:
+                        pass
         self._log(f"loaded {len(cookies)} cookies into OAuth session")
 
     def _log(self, msg: str) -> None:
@@ -227,16 +526,28 @@ class ProtocolOAuthClient:
         return self._s.get(url, headers=h, allow_redirects=allow_redirects, timeout=45)
 
     def _set_sso_cookie(self, jwt_token: str) -> None:
-        """Attach accounts.x.ai session JWT as the ``sso`` cookie used by AuthManagement."""
+        """Attach session JWT as ``sso`` / ``sso-rw`` on authorize + accounts domains."""
         if not jwt_token:
             return
-        try:
-            self._s.cookies.set("sso", jwt_token, domain="accounts.x.ai")
-        except Exception:
-            try:
-                self._s.cookies.set("sso", jwt_token)
-            except Exception:
-                pass
+        jar = getattr(self._s, "cookies", None)
+        if not hasattr(jar, "set"):
+            return
+        for domain in (
+            "accounts.x.ai",
+            ".x.ai",
+            "auth.x.ai",
+            "auth.grok.com",
+            ".grok.com",
+        ):
+            for name in ("sso", "sso-rw"):
+                try:
+                    try:
+                        jar.set(name, jwt_token, domain=domain)
+                    except TypeError:
+                        jar.set(name, jwt_token)
+                        return
+                except Exception:
+                    pass
 
     def create_cookie_setter_link(
         self,
@@ -550,49 +861,59 @@ class ProtocolOAuthClient:
         )
 
         def _apply_set_cookie_url(setter_url: str) -> str:
-            """GET set-cookie hop, apply JWT token as sso, return next success_url."""
+            """GET set-cookie hop and return next success_url.
+
+            The JWT ``config.token`` is a short-lived hop secret for the
+            set-cookie endpoint — it is NOT the accounts ``sso`` session JWT.
+            Never write it into the ``sso`` cookie (that clobbers a valid
+            session and forces the sign-in shell).
+            """
             from .sso import parse_jwt_payload, _extract_jwt_from_url
 
             jwt = _extract_jwt_from_url(setter_url) or ""
             payload = parse_jwt_payload(jwt) if jwt else None
             cfg = (payload or {}).get("config") if isinstance(payload, dict) else None
-            token = ""
             success = ""
             if isinstance(cfg, dict):
-                token = str(cfg.get("token") or "")
                 success = str(cfg.get("success_url") or "")
-            if token:
-                self._set_sso_cookie(token)
-                self._log(f"applied set-cookie token as sso ({token[:16]}...)")
-            # Hit the set-cookie endpoint so domain cookies are written.
+            # Hit the set-cookie endpoint so domain cookies may be written.
             resp = self._get(setter_url, allow_redirects=False)
+            # Prefer any sso minted by Set-Cookie headers (do not invent one).
+            try:
+                jar = getattr(self._s, "cookies", None)
+                if jar is not None and hasattr(jar, "get"):
+                    minted = jar.get("sso")
+                    if minted and len(str(minted)) > 80:
+                        self._set_sso_cookie(str(minted))
+            except Exception:
+                pass
             loc = resp.headers.get("location") or resp.headers.get("Location") or ""
             if loc:
                 nxt = urljoin(setter_url, loc)
                 self._log(f"set-cookie Location → {nxt[:160]}")
                 return nxt
             if success:
+                self._log(f"set-cookie no Location; using JWT success_url")
                 return success
-            return str(resp.url)
+            return success or setter_url
 
         def _submit_oauth2_consent(page_url: str, page_html: str = "") -> str:
             """POST Next.js submitOAuth2Consent server action; return authorization code."""
             import json as _json
 
-            action_id = SUBMIT_OAUTH2_CONSENT_ACTION
-            # Prefer live action id from page chunks if present.
-            m = re.search(
-                r'createServerReference\)\("([a-f0-9]{40,44})"[^)]*submitOAuth2Consent',
-                page_html,
+            # Action id lives in JS chunks, not the HTML document.
+            action_id = resolve_submit_oauth2_consent_action(
+                page_html or "",
+                session=self._s,
+                timeout=20.0,
             )
-            if not m:
-                m = re.search(
-                    r'createServerReference\)\("([a-f0-9]{40,44})"', page_html
-                )
-            if m:
-                action_id = m.group(1)
+            src = getattr(
+                resolve_submit_oauth2_consent_action, "last_source", "unknown"
+            )
+            self._log(
+                f"resolved submitOAuth2Consent action={action_id} ({src})"
+            )
 
-            # Router state tree for consent page (URL-encoded JSON).
             from urllib.parse import quote as _quote
 
             router_tree = (
@@ -600,6 +921,11 @@ class ProtocolOAuthClient:
                 '{"children":["consent",{"children":["__PAGE__",{}]}]}]}]}]},'
                 '"$undefined","$undefined",16]'
             )
+            principal_id = ""
+            if page_html:
+                m_uid = re.search(r'"userId"\s*:\s*"([^"]+)"', page_html)
+                if m_uid:
+                    principal_id = m_uid.group(1)
             payload = [
                 {
                     "action": "allow",
@@ -611,7 +937,7 @@ class ProtocolOAuthClient:
                     "codeChallengeMethod": "S256",
                     "nonce": nonce,
                     "principalType": "User",
-                    "principalId": "",
+                    "principalId": principal_id,
                     "referrer": "",
                 }
             ]
@@ -643,17 +969,52 @@ class ProtocolOAuthClient:
                 resp = self._s.post(page_url, headers=headers, data=body, timeout=45)
             text = resp.text or ""
             self._log(f"consent action HTTP {resp.status_code} body={text[:180]!r}")
-            # Response may be RSC flight text containing JSON with code.
-            m = re.search(r'"code"\s*:\s*"([^"]+)"', text)
-            if m:
-                return m.group(1)
-            m = re.search(r"code=([A-Za-z0-9._~\-]+)", text)
-            if m and "error" not in m.group(0):
-                return m.group(1)
-            # Or redirect header
+
+            def _code_from_body(body: str) -> str:
+                m = re.search(r'"code"\s*:\s*"([^"]+)"', body)
+                if m:
+                    return m.group(1)
+                m = re.search(r"code=([A-Za-z0-9._~\-]+)", body)
+                if m and "error" not in m.group(0):
+                    return m.group(1)
+                return ""
+
+            code = _code_from_body(text)
+            if code:
+                return code
             loc = resp.headers.get("location") or resp.headers.get("Location") or ""
             if "code=" in loc:
                 return self._code_from_url(urljoin(page_url, loc), state)
+
+            # Full HTML means next-action was ignored — re-resolve from response and retry once.
+            if "<!DOCTYPE html>" in text[:200] or "<html" in text[:200].lower():
+                action2 = resolve_submit_oauth2_consent_action(
+                    text, session=self._s, timeout=20.0
+                )
+                if action2 and action2 != action_id:
+                    headers["next-action"] = action2
+                    self._log(f"retry consent with action={action2[:20]}...")
+                    resp = self._s.post(
+                        page_url.split("?")[0] if "consent" in page_url else page_url,
+                        headers=headers,
+                        data=body,
+                        timeout=45,
+                    )
+                    text = resp.text or ""
+                    self._log(
+                        f"consent retry HTTP {resp.status_code} body={text[:180]!r}"
+                    )
+                    code = _code_from_body(text)
+                    if code:
+                        return code
+                    loc = (
+                        resp.headers.get("location")
+                        or resp.headers.get("Location")
+                        or ""
+                    )
+                    if "code=" in loc:
+                        return self._code_from_url(urljoin(page_url, loc), state)
+
             raise RuntimeError(
                 f"submitOAuth2Consent failed HTTP {resp.status_code}: {text[:300]}"
             )
@@ -674,7 +1035,8 @@ class ProtocolOAuthClient:
             setter = str(csl.get("cookie_setter_url") or "")
             self._log(f"{label}: cookie_setter={setter[:100]}...")
 
-            # Apply set-cookie hop without overwriting sso incorrectly.
+            # Apply set-cookie hop(s): JWT payload carries success_url when
+            # Location is missing (common on urllib / some CF edges).
             current = setter
             for _ in range(6):
                 if "code=" in current and (
@@ -682,20 +1044,12 @@ class ProtocolOAuthClient:
                 ):
                     return self._code_from_url(current, state)
                 if "set-cookie" in current:
-                    # Only GET set-cookie; use response Set-Cookie (do not clobber sso with config.token).
-                    resp = self._get(current, allow_redirects=False)
-                    loc = (
-                        resp.headers.get("location")
-                        or resp.headers.get("Location")
-                        or ""
-                    )
-                    self._log(
-                        f"set-cookie HTTP {resp.status_code} loc={(loc or '')[:120]}"
-                    )
-                    if loc:
-                        current = urljoin(current, loc)
-                        continue
-                    break
+                    nxt = _apply_set_cookie_url(current)
+                    self._log(f"set-cookie next={(nxt or '')[:160]}")
+                    if not nxt or nxt == current:
+                        break
+                    current = nxt
+                    continue
                 break
 
             # Consent page (HTML) → server action Allow → code
@@ -705,8 +1059,19 @@ class ProtocolOAuthClient:
                 loc = page.headers.get("location") or page.headers.get("Location") or ""
                 if loc and "code=" in loc:
                     return self._code_from_url(urljoin(current, loc), state)
-                if page.status_code == 200 and "Authorize" in (page.text or ""):
-                    return _submit_oauth2_consent(current, page.text or "")
+                html = page.text or ""
+                # Real consent is logged-in Authorize UI. Sign-in shell also
+                # contains the word "consent" in return_to — do not POST there.
+                real = page.status_code == 200 and html and (
+                    "Authorize —" in html
+                    or '"c":["","oauth2"' in html
+                    or ("Allow" in html and "Deny" in html and "Signed in" in html)
+                )
+                if real:
+                    return _submit_oauth2_consent(current, html)
+                self._log(
+                    "consent URL returned sign-in shell; session cookie missing/invalid"
+                )
             return self._follow_for_code(
                 current, redirect_uri=redirect_uri, state=state
             )
@@ -787,18 +1152,41 @@ def login_with_protocol(
     reuse is attempted; password CreateSession + Turnstile is skipped so the
     caller can fall back to pure HTTP Device Flow instead.
     """
-    client = ProtocolOAuthClient(
-        proxy=proxy,
-        debug=debug,
-        turnstile_premium=turnstile_premium,
-    )
+    transport_mode = None
+    if auth_client is not None:
+        tname = str(getattr(auth_client, "transport_name", "") or "")
+        if "urllib" in tname:
+            transport_mode = "urllib"
+        elif "curl_cffi" in tname:
+            transport_mode = "curl_cffi"
+    # Temporarily force ProtocolOAuthClient transport via env if inferred.
+    old_env = os.environ.get("XCONSOLE_TRANSPORT")
+    if transport_mode and not (old_env or "").strip():
+        os.environ["XCONSOLE_TRANSPORT"] = transport_mode
+    try:
+        client = ProtocolOAuthClient(
+            proxy=proxy,
+            debug=debug,
+            turnstile_premium=turnstile_premium,
+        )
+    finally:
+        if transport_mode and not (old_env or "").strip():
+            if old_env is None:
+                os.environ.pop("XCONSOLE_TRANSPORT", None)
+            else:
+                os.environ["XCONSOLE_TRANSPORT"] = old_env
     if auth_client is not None:
         try:
             transport = auth_client._t
             session = getattr(transport, "_session", None)
-            if session is not None:
+            if session is not None and getattr(client, "_transport_name", "").startswith("curl"):
                 client._s = session
                 client._log("reusing XConsoleAuthClient curl_cffi session for OAuth")
+            else:
+                if not session_cookies:
+                    session_cookies = extract_cookies_from_auth_client(auth_client)
+                if session_cookies:
+                    client.load_cookies(session_cookies)
         except Exception as exc:
             client._log(f"could not reuse auth client session: {exc}")
             if not session_cookies:

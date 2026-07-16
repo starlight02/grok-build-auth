@@ -966,6 +966,7 @@ def resolve_turnstile_solver(
       - auto (default) → DrissionPage+turnstilePatch if installed, else Playwright
       - drission|dp|clean → DrissionPage + turnstilePatch (terminal CLI; bulk path)
       - camoufox|camou → Camoufox anti-detect Firefox (optional)
+      - safari|webkit-system → macOS system Safari via Apple Events
       - browser|local|playwright|free|chromium|chrome → Playwright
 
     The bulk registrations that produced sso_output/ used **drission** (or auto→drission).
@@ -1017,6 +1018,16 @@ def resolve_turnstile_solver(
         return _drission()
     if mode in {"camoufox", "camou", "camoufox-firefox"}:
         return _camoufox()
+    if mode in {"safari", "webkit-system", "system-safari"}:
+        from xconsole_client.safari_solver import SafariTurnstileSolver
+
+        return SafariTurnstileSolver(
+            proxy=proxy,
+            debug=debug,
+            headless=headless,
+            timeout=timeout,
+            interactive=interactive,
+        )
     if mode in {
         "browser",
         "local",
@@ -1035,7 +1046,8 @@ def resolve_turnstile_solver(
         except Exception:
             return _playwright()
     raise ValueError(
-        f"Unknown TURNSTILE_SOLVER={mode!r}; use auto | drission | camoufox | browser"
+        f"Unknown TURNSTILE_SOLVER={mode!r}; "
+        "use auto | drission | camoufox | safari | browser"
     )
 
 

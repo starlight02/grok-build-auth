@@ -1,29 +1,27 @@
 # -*- coding: utf-8 -*-
 """DrissionPage + turnstilePatch Turnstile solver (terminal-friendly).
 
-Mirrors grok_reg_clean's proven stack:
+Mirrors Safari's *warm page* mint model:
   - real Chrome via DrissionPage (not Playwright CDP headless shell)
-  - load ``turnstilePatch/`` MV2 extension (stealth + auto-click)
-  - prefer page-native ``cf-turnstile-response``; force-render fallback
-  - hard wall-clock timeout (default 30s; empty token fails ~12s/attempt)
+  - load ``turnstilePatch/`` MV2 extension (stealth)
+  - navigate signup URL **once** per worker; later mints only force-render
+    a fresh widget + CDP click (no full page reload / re-download)
+  - CDP ``Input.dispatchMouseEvent`` — no OS mouse/focus steal after launch
 
-Default is **headed** Chrome (no manual click). Headless is often CF-blocked;
-set ``TURNSTILE_HEADLESS=1`` only if your IP tolerates it.
+Default is **headed** Chrome (minimized + off-screen). Headless is often
+CF-blocked; set ``TURNSTILE_HEADLESS=1`` only if your IP tolerates it.
 
-Headed window control:
+Env extras:
+  TURNSTILE_MINIMIZED / TURNSTILE_OFFSCREEN — quiet window (default ON)
+  TURNSTILE_FORCE_POLL — seconds to wait after force-render (default 12)
+  TURNSTILE_RELOAD_ON_FAIL — 1=drop warm page and reload after empty token
 
-- ``TURNSTILE_MINIMIZED=1`` (default when headed): minimize via Drission/CDP.
-- ``TURNSTILE_OFFSCREEN=1``: ``--window-position`` off-screen as a backup.
-- New tabs use ``background=True`` (or reuse latest tab).
-
-Browser lifecycle: **thread-local warm Chrome** (one per concurrent
-mint slot). Cookies cleared between solves; not relaunched per account on the
-same thread. Empty-token attempts fail fast (~12s) instead of burning the full
-timeout.
+Browser lifecycle: thread-local warm Chrome + one warm mint tab.
 """
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -127,19 +125,32 @@ _FORCE_RENDER_JS = """
 const sitekey = arguments[0];
 window.__xaiTsToken = '';
 window.__xaiTsErr = null;
+window.__xaiTsPhase = 'render';
+window.__xaiTsGen = (window.__xaiTsGen || 0) + 1;
+const gen = window.__xaiTsGen;
 if (!window.turnstile || !window.turnstile.render) {
   return { ok: false, err: 'no-turnstile-api' };
 }
 const hostId = 'xai-force-ts-host';
 let host = document.getElementById(hostId);
-if (!host) {
-  host = document.createElement('div');
-  host.id = hostId;
-  host.style.cssText =
-    'width:300px;height:80px;position:fixed;top:80px;left:20px;'
-    + 'z-index:999999;background:#fff;border:1px solid #ccc;';
-  document.body.appendChild(host);
+if (host) {
+  try {
+    if (window.turnstile.remove) window.turnstile.remove(host);
+  } catch (e) {}
+  try { host.remove(); } catch (e) {}
 }
+// Drop any leftover tokens so warm-page reuse cannot re-read the previous mint.
+for (const el of document.querySelectorAll(
+  'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], input[name="g-recaptcha-response"]'
+)) {
+  try { el.value = ''; } catch (e) {}
+}
+host = document.createElement('div');
+host.id = hostId;
+host.style.cssText =
+  'width:300px;height:80px;position:fixed;top:80px;left:20px;'
+  + 'z-index:999999;background:#fff;border:1px solid #ccc;';
+document.body.appendChild(host);
 let inp = document.querySelector('input[name="cf-turnstile-response"]');
 if (!inp) {
   inp = document.createElement('input');
@@ -147,6 +158,7 @@ if (!inp) {
   inp.name = 'cf-turnstile-response';
   document.body.appendChild(inp);
 }
+inp.value = '';
 try {
   const id = window.turnstile.render(host, {
     sitekey: sitekey,
@@ -154,13 +166,22 @@ try {
     size: 'normal',
     appearance: 'always',
     callback: (tok) => {
+      if (gen !== window.__xaiTsGen) return;
       window.__xaiTsToken = tok || '';
       inp.value = tok || '';
+      window.__xaiTsPhase = 'done';
     },
-    'error-callback': (code) => { window.__xaiTsErr = String(code); },
-    'expired-callback': () => { window.__xaiTsToken = ''; },
+    'error-callback': (code) => {
+      if (gen !== window.__xaiTsGen) return;
+      window.__xaiTsErr = String(code);
+    },
+    'expired-callback': () => {
+      if (gen !== window.__xaiTsGen) return;
+      window.__xaiTsToken = '';
+      inp.value = '';
+    },
   });
-  return { ok: true, id: String(id) };
+  return { ok: true, id: String(id), gen: gen };
 } catch (e) {
   return { ok: false, err: String(e) };
 }
@@ -291,9 +312,45 @@ class DrissionTurnstileSolver:
             self._proxy or "",
         )
 
-
     def _focus_guard_enabled(self) -> bool:
         return (not self._headless) and (self._offscreen or self._minimized)
+
+    def _frontmost_app_name(self) -> str:
+        try:
+            proc = subprocess.run(
+                [
+                    "/usr/bin/osascript",
+                    "-e",
+                    'tell application "System Events" to get name of first application process whose frontmost is true',
+                ],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            return (proc.stdout or "").strip()
+        except Exception:
+            return ""
+
+    def _restore_frontmost(self, name: str) -> None:
+        """Give focus back after Chrome briefly steals it on launch."""
+        name = (name or "").strip()
+        if not name or name.lower() in {"google chrome", "chrome", "chromium"}:
+            return
+        try:
+            subprocess.run(
+                [
+                    "/usr/bin/osascript",
+                    "-e",
+                    f'tell application "System Events" to set frontmost of first process whose name is "{name}" to true',
+                ],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
 
     def _minimize_window(self, browser: Any = None, tab: Any = None) -> None:
         """Cross-platform: keep Chrome minimized via Drission/CDP only.
@@ -320,8 +377,8 @@ class DrissionTurnstileSolver:
             ):
                 try:
                     cur = obj
-                    for name in attr_path[:-1]:
-                        cur = getattr(cur, name)
+                    for n in attr_path[:-1]:
+                        cur = getattr(cur, n)
                     fn = getattr(cur, attr_path[-1])
                     fn()
                     self._log("window minimized")
@@ -350,6 +407,8 @@ class DrissionTurnstileSolver:
         browser = getattr(_tls, "browser", None)
         _tls.browser = None
         _tls.fp = None
+        _tls.mint_tab = None
+        _tls.mint_url = None
         if browser is None:
             return
         with _all_browsers_lock:
@@ -378,6 +437,7 @@ class DrissionTurnstileSolver:
                 self._log("warm browser dead; relaunch")
                 self._drop_tls_browser()
 
+        prev_front = self._frontmost_app_name() if self._focus_guard_enabled() else ""
         opts = self._build_options()
         browser = Chromium(opts)
         _tls.browser = browser
@@ -387,7 +447,10 @@ class DrissionTurnstileSolver:
         self._log("cold launch Chrome (thread-local; reuse on this worker)")
         if self._focus_guard_enabled():
             self._quiet_browser(browser=browser)
-            self._log("minimized after cold launch")
+            self._restore_frontmost(prev_front)
+            self._log(
+                f"minimized after cold launch; restored frontmost={prev_front!r}"
+            )
         return browser, True
 
     def _get_tab(self, browser: Any) -> Any:
@@ -432,6 +495,76 @@ class DrissionTurnstileSolver:
         except Exception:
             pass
         raise RuntimeError("could not open browser tab")
+
+    def _invalidate_mint_tab(self) -> None:
+        tab = getattr(_tls, "mint_tab", None)
+        _tls.mint_tab = None
+        _tls.mint_url = None
+        if tab is not None:
+            try:
+                tab.close()
+            except Exception:
+                pass
+
+    def _mint_tab_alive(self, tab: Any, url: str) -> bool:
+        """True if tab still has a live signup page with turnstile API."""
+        if tab is None:
+            return False
+        if (getattr(_tls, "mint_url", None) or "") != url:
+            return False
+        try:
+            href = self._run_js(tab, "return String(location.href || '');") or ""
+            if "accounts.x.ai" not in str(href):
+                return False
+            ok = self._run_js(
+                tab, "return !!(window.turnstile && window.turnstile.render);"
+            )
+            return bool(ok)
+        except Exception:
+            return False
+
+    def _ensure_mint_page(
+        self, browser: Any, url: str, deadline: float
+    ) -> tuple[Any, bool]:
+        """Safari-style warm page: navigate once, reuse for later force-renders.
+
+        Returns (tab, navigated).
+        """
+        tab = getattr(_tls, "mint_tab", None)
+        if self._mint_tab_alive(tab, url):
+            self._log("warm mint page reuse (no reload)")
+            self._quiet_browser(browser=browser, tab=tab)
+            return tab, False
+
+        if tab is not None:
+            self._invalidate_mint_tab()
+
+        tab = self._get_tab(browser)
+        self._quiet_browser(browser=browser, tab=tab)
+        nav_to = min(20, max(5, int(deadline - time.time())))
+        self._log(f"navigate mint page once timeout={nav_to}s")
+        tab.get(url, timeout=nav_to)
+        self._quiet_browser(browser=browser, tab=tab)
+        time.sleep(0.15)
+
+        title = ""
+        try:
+            title = tab.title or ""
+        except Exception:
+            pass
+        if "Attention Required" in title or "Just a moment" in title:
+            self._invalidate_mint_tab()
+            raise RuntimeError(f"CF block/interstitial: {title}")
+
+        self._click_email_path(tab)
+        if not self._ensure_turnstile_api(tab, min(deadline, time.time() + 8)):
+            self._invalidate_mint_tab()
+            raise RuntimeError("turnstile API not available on page")
+
+        _tls.mint_tab = tab
+        _tls.mint_url = url
+        return tab, True
+
 
     def _close_tab(self, tab: Any) -> None:
         try:
@@ -564,15 +697,126 @@ return true;
 """,
         )
 
-    def _poll_token(self, tab: Any, deadline: float) -> str:
+    def _widget_box(self, tab: Any) -> Optional[dict[str, float]]:
+        box = self._run_js(
+            tab,
+            """
+const host = document.getElementById('xai-force-ts-host');
+const pick = (el) => {
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  if (r.width < 10 || r.height < 10) return null;
+  return {x: r.x, y: r.y, w: r.width, h: r.height};
+};
+let box = pick(host && host.querySelector('iframe')) || pick(host);
+if (box) return box;
+const nodes = [
+  ...document.querySelectorAll('iframe[src*="challenges.cloudflare"]'),
+  ...document.querySelectorAll('iframe[src*="turnstile"]'),
+  ...document.querySelectorAll('.cf-turnstile'),
+];
+for (const n of nodes) {
+  box = pick(n);
+  if (box) return box;
+}
+return null;
+""",
+        )
+        if isinstance(box, dict) and "x" in box:
+            try:
+                return {k: float(box[k]) for k in ("x", "y", "w", "h")}
+            except Exception:
+                return None
+        return None
+
+    def _cdp_click_xy(self, tab: Any, x: float, y: float) -> bool:
+        """Browser-internal mouse click via CDP — does not move OS cursor."""
+        try:
+            tab.run_cdp(
+                "Input.dispatchMouseEvent",
+                type="mouseMoved",
+                x=float(x),
+                y=float(y),
+            )
+            tab.run_cdp(
+                "Input.dispatchMouseEvent",
+                type="mousePressed",
+                x=float(x),
+                y=float(y),
+                button="left",
+                clickCount=1,
+                buttons=1,
+            )
+            time.sleep(0.04)
+            tab.run_cdp(
+                "Input.dispatchMouseEvent",
+                type="mouseReleased",
+                x=float(x),
+                y=float(y),
+                button="left",
+                clickCount=1,
+                buttons=0,
+            )
+            return True
+        except Exception as exc:
+            self._log(f"cdp click failed: {exc}")
+            return False
+
+    def _cdp_click_widget(self, tab: Any) -> str:
+        """Click Turnstile checkbox inside Chrome (no OS focus / mouse steal)."""
+        box = self._widget_box(tab) or {
+            "x": 20.0,
+            "y": 80.0,
+            "w": 300.0,
+            "h": 80.0,
+        }
+        offsets = (
+            (0.0, 0.0),
+            (0.0, 2.0),
+            (-2.0, 0.0),
+            (3.0, 0.0),
+            (5.0, 1.0),
+            (-4.0, 2.0),
+        )
+        last = ""
+        for dx, dy in offsets:
+            cx = box["x"] + min(28.0, max(18.0, box["w"] * 0.10)) + dx
+            cy = box["y"] + max(14.0, box["h"] * 0.50) + dy
+            if self._cdp_click_xy(tab, cx, cy):
+                last = f"cdp:{cx:.0f},{cy:.0f}"
+                self._log(
+                    f"cdp click ({cx:.0f},{cy:.0f}) box=({box['w']:.0f}x{box['h']:.0f})"
+                )
+                time.sleep(0.35)
+                token = self._run_js(tab, _READ_TOKEN_JS) or ""
+                if isinstance(token, str) and len(token) >= 80:
+                    return last
+        return last
+
+    def _poll_token(
+        self,
+        tab: Any,
+        deadline: float,
+        *,
+        allow_cdp: bool = False,
+        reject: str = "",
+    ) -> str:
         nudged = False
+        cdp_clicked = False
+        reject = reject if isinstance(reject, str) and len(reject) >= 80 else ""
         while time.time() < deadline:
             token = self._run_js(tab, _READ_TOKEN_JS) or ""
-            if isinstance(token, str) and len(token) >= 80:
+            if (
+                isinstance(token, str)
+                and len(token) >= 80
+                and token != reject
+            ):
                 return token
-            # one mid-wait nudge
             remaining = deadline - time.time()
-            if not nudged and remaining < self._timeout / 2 and remaining > 3:
+            if allow_cdp and not cdp_clicked and remaining > 1.0:
+                cdp_clicked = True
+                self._cdp_click_widget(tab)
+            elif not nudged and remaining < self._timeout / 2 and remaining > 3:
                 nudged = True
                 self._nudge_click(tab)
             time.sleep(0.25)
@@ -593,99 +837,106 @@ return true;
         deadline = time.time() + self._timeout
         self._log(
             f"open {url} sitekey={key[:16]}... headless={self._headless} "
-            f"offscreen={self._offscreen and not self._headless} minimized={self._minimized and not self._headless} "
+            f"offscreen={self._offscreen and not self._headless} "
+            f"minimized={self._minimized and not self._headless} "
             f"hard_timeout={self._timeout:.0f}s proxy={'yes' if self._proxy else 'no'}"
         )
 
         last_err: Optional[BaseException] = None
-        # Fail-fast: each attempt only waits a short window after force-render.
-        # Full 60s empty polls were the main batch killer (#4 burned 60s).
-        try:
-            early_s = float(os.environ.get("TURNSTILE_EARLY_POLL") or "5")
-        except ValueError:
-            early_s = 5.0
         try:
             force_s = float(os.environ.get("TURNSTILE_FORCE_POLL") or "12")
         except ValueError:
             force_s = 12.0
-        early_s = max(2.0, min(early_s, 15.0))
-        force_s = max(6.0, min(force_s, 25.0))
+        force_s = max(4.0, min(force_s, 25.0))
+        reload_on_fail = _env_truthy("TURNSTILE_RELOAD_ON_FAIL", True)
 
         for attempt in range(2):
             if time.time() >= deadline - 2:
                 break
-            tab = None
             try:
                 browser, cold = self._ensure_browser()
-                if not cold:
-                    self._reset_browser_session(browser)
-                    self._log("warm reuse Chrome (no relaunch)")
-                tab = self._get_tab(browser)
-                # Minimize only (Drission/CDP).
-                self._quiet_browser(browser=browser, tab=tab)
-                nav_to = min(20, max(5, int(deadline - time.time())))
-                tab.get(url, timeout=nav_to)
-                self._quiet_browser(browser=browser, tab=tab)
-                time.sleep(0.15)
+                if cold:
+                    self._log("cold Chrome — first mint will load page once")
+                else:
+                    self._log("warm Chrome process")
 
-                title = ""
-                try:
-                    title = tab.title or ""
-                except Exception:
-                    pass
-                if "Attention Required" in title or "Just a moment" in title:
-                    raise RuntimeError(f"CF block/interstitial: {title}")
+                # Safari-like: one warm mint tab; force-render widgets in place.
+                tab, navigated = self._ensure_mint_page(browser, url, deadline)
+                mode = "nav" if navigated else "reuse"
 
-                self._click_email_path(tab)
-                if not self._ensure_turnstile_api(tab, min(deadline, time.time() + 8)):
-                    raise RuntimeError("turnstile API not available on page")
-
-                # Prefer any native token first (extension may already solve).
-                token = self._poll_token(tab, min(deadline, time.time() + early_s))
-                if token:
-                    with _solve_count_lock:
-                        global _solve_count
-                        _solve_count += 1
-                        n = _solve_count
-                    self._log(
-                        f"token ok len={len(token)} (native/early, "
-                        f"solve#{n}, {'cold' if cold else 'warm'})"
+                if navigated:
+                    try:
+                        early_s = float(os.environ.get("TURNSTILE_EARLY_POLL") or "3")
+                    except ValueError:
+                        early_s = 3.0
+                    early_s = max(1.0, min(early_s, 8.0))
+                    token = self._poll_token(
+                        tab, min(deadline, time.time() + early_s), allow_cdp=False
                     )
-                    self._close_tab(tab)
-                    return token
+                    if token:
+                        with _solve_count_lock:
+                            global _solve_count
+                            _solve_count += 1
+                            n = _solve_count
+                        self._log(
+                            f"token ok len={len(token)} (native/early, "
+                            f"solve#{n}, {mode})"
+                        )
+                        return token
+
+                # Snapshot pre-render token (should be empty after force clear).
+                prev = self._run_js(tab, _READ_TOKEN_JS) or ""
+                if not (isinstance(prev, str) and len(prev) >= 80):
+                    prev = ""
 
                 meta = self._run_js(tab, _FORCE_RENDER_JS, key)
-                self._log(f"force render: {meta}")
-                time.sleep(0.35)
-                self._nudge_click(tab)
-                token = self._poll_token(tab, min(deadline, time.time() + force_s))
+                self._log(f"force render ({mode}): {meta}")
+                # Never accept the pre-render token on warm reuse.
+                still = self._run_js(tab, _READ_TOKEN_JS) or ""
+                if isinstance(still, str) and len(still) >= 80:
+                    prev = still
+                    self._run_js(
+                        tab,
+                        """
+window.__xaiTsToken = '';
+for (const el of document.querySelectorAll(
+  'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+)) { try { el.value = ''; } catch (e) {} }
+return true;
+""",
+                    )
+                time.sleep(0.25 if mode == "reuse" else 0.35)
+                self._cdp_click_widget(tab)
+                token = self._poll_token(
+                    tab,
+                    min(deadline, time.time() + force_s),
+                    allow_cdp=True,
+                    reject=prev if isinstance(prev, str) else "",
+                )
                 if token:
                     with _solve_count_lock:
                         _solve_count += 1
                         n = _solve_count
                     self._log(
                         f"token ok len={len(token)} (force-render, "
-                        f"solve#{n}, {'cold' if cold else 'warm'})"
+                        f"solve#{n}, {mode})"
                     )
-                    self._close_tab(tab)
                     return token
+
                 last_err = RuntimeError(
-                    f"empty token after force-render ({force_s:.0f}s)"
+                    f"empty token after force-render ({force_s:.0f}s, {mode})"
                 )
                 self._log(f"attempt {attempt + 1}: {last_err}")
-                self._close_tab(tab)
+                if reload_on_fail:
+                    self._invalidate_mint_tab()
             except Exception as exc:
                 last_err = exc
                 self._log(f"attempt {attempt + 1} failed: {exc}")
-                try:
-                    if tab is not None:
-                        self._close_tab(tab)
-                except Exception:
-                    pass
+                self._invalidate_mint_tab()
                 msg = str(exc).lower()
                 if "cf block" in msg or "interstitial" in msg:
                     self._drop_tls_browser()
-            if time.time() + 4 >= deadline:
+            if time.time() + 3 >= deadline:
                 break
 
         if time.time() >= deadline:
@@ -701,6 +952,7 @@ return true;
         ) from last_err
 
 
+
 def _close_all_drission_browsers() -> None:
     with _all_browsers_lock:
         browsers = list(_all_browsers)
@@ -710,10 +962,11 @@ def _close_all_drission_browsers() -> None:
             browser.quit()
         except Exception:
             pass
-    # Drop TLS refs so a re-import / long process does not reuse dead handles.
     try:
         _tls.browser = None
         _tls.fp = None
+        _tls.mint_tab = None
+        _tls.mint_url = None
     except Exception:
         pass
 

@@ -13,6 +13,9 @@ An Email object: { from, to, subject, body, html, date (unix ms) }.
 Free tier needs no API key (https://github.com/tempmail-lol/api-python README).
 TEMPMAIL_API_KEY is only for Plus/Ultra / higher rate limits.
 
+Without a key, create() is process-wide paced (TEMPMAIL_FREE_CREATE_INTERVAL,
+default 3s ≈ 20/min) so bulk -t N stays near free-tier max without 429 storms.
+
 Usage:
     from xconsole_client.tempmail_transport import TempmailInbox
     inbox = TempmailInbox(prefix="xai")  # free tier
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -32,6 +36,35 @@ import requests
 
 
 BASE_URL = "https://api.tempmail.lol"
+
+# Free-tier create pacing (no API key). Plus/Ultra skip this.
+_free_create_lock = threading.Lock()
+_free_create_next = 0.0
+
+
+def _free_create_interval() -> float:
+    raw = (os.environ.get("TEMPMAIL_FREE_CREATE_INTERVAL") or "").strip()
+    if not raw:
+        return 3.0
+    try:
+        return max(0.0, min(float(raw), 60.0))
+    except ValueError:
+        return 3.0
+
+
+def _pace_free_create() -> None:
+    """Serialize free-tier inbox creates to free max steady rate."""
+    global _free_create_next
+    interval = _free_create_interval()
+    if interval <= 0:
+        return
+    with _free_create_lock:
+        now = time.time()
+        wait = _free_create_next - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.time()
+        _free_create_next = now + interval
 
 
 @dataclass
@@ -86,6 +119,10 @@ class TempmailInbox:
         """Create a new inbox. Returns the email address."""
         if self._created:
             raise RuntimeError("Inbox already created")
+
+        # Free tier: pace creates process-wide so -t N ≈ free max without 429.
+        if not (self.api_key or "").strip():
+            _pace_free_create()
 
         payload: dict = {}
         if self.prefix:
