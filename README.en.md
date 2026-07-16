@@ -141,7 +141,13 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 | `CLOUDFLARE_D1_DB_ID` | same | D1 database ID |
 | `ALIAS_MAIL_DOMAINS` | same | domains you control (comma-separated) |
 | `CLIPROXYAPI_AUTH_DIR` | no | default `./cliproxyapi_auth` |
-| `HTTPS_PROXY` / `HTTP_PROXY` | no | proxy |
+| `HTTPS_PROXY` / `HTTP_PROXY` | no | single proxy (when no pool file) |
+| `PROXY_POOL_FILE` | no | proxy list file, **one URL per line**; exit-IP geo probe on start |
+| `PROXY_POOL` | no | small inline list; use FILE for large pools |
+| `PROXY_REGION` | no | target country code (`us`/`jp`/`hk`…); rotate only matches |
+| `PROXY_POOL_SCOPE` | no | `same_region` (**default**) / `all` |
+| `PROXY_GEO_WORKERS` | no | concurrent probes (default 16) |
+| `PROXY_GEO_CACHE` | no | probe cache (default `./.proxy_geo_cache.json`) |
 
 ### Run (research / accounts you own)
 
@@ -166,6 +172,9 @@ TURNSTILE_POOL=0 python run.py -n 4 -t 2
 TURNSTILE_SOLVER=drission python run.py -n 10 -t 4
 TURNSTILE_SOLVER=camoufox python run.py -n 1
 TURNSTILE_SOLVER=browser  python run.py -n 1
+
+# Proxy pool file: one URL per line → probe exit country → rotate in PROXY_REGION
+PROXY_POOL_FILE=./proxies.txt PROXY_REGION=us python run.py -n 10 -t 4
 
 # Pause mint / HID clicks while you use the machine
 touch /tmp/grok-turnstile.pause   # pause
@@ -319,7 +328,12 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 | `TURNSTILE_DEBUG` | off | `1` = verbose solver logs |
 | `TURNSTILE_BROWSER_CHANNEL` | auto | browser only: prefer system Chrome |
 | `TURNSTILE_INTERACTIVE` | off | browser only: manual click |
-| `HTTPS_PROXY` / `HTTP_PROXY` | empty | proxy for browser + protocol HTTP |
+| `HTTPS_PROXY` / `HTTP_PROXY` | empty | single proxy |
+| `PROXY_POOL_FILE` | empty | one proxy URL per line; geo-probe on start |
+| `PROXY_REGION` | auto/set | if set, rotate only that country after probe |
+| `PROXY_POOL_SCOPE` | `same_region` | `same_region` or `all` |
+| `PROXY_GEO_WORKERS` | `16` | concurrent geo probes |
+| `PROXY_GEO_CACHE` | `./.proxy_geo_cache.json` | region cache |
 
 Notes:
 

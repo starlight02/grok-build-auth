@@ -66,6 +66,8 @@ class FingerprintTransport:
         self._http_version = http_version
         self._timeout = timeout
         self._debug = debug
+        proxy = (proxy or "").strip() or None
+        self._proxy = proxy
         # A new Session per client. The browser-equivalent fingerprint is
         # established by `impersonate=`; it is fixed for the session's life.
         self._session = cc_requests.Session(
@@ -75,7 +77,6 @@ class FingerprintTransport:
         )
         # Make sure default Accept-Encoding is exactly the Chrome order.
         self._session.headers["accept-encoding"] = accept_encoding
-
     # ----------------------------------------------------------------- transport
     def request(
         self, method: str, url: str, *, headers: Dict[str, str], body: Optional[bytes] = None
@@ -95,8 +96,7 @@ class FingerprintTransport:
         for k, v in headers.items():
             if k not in merged:
                 merged[k] = v
-
-        resp = self._session.request(
+        req_kwargs = dict(
             method=method,
             url=url,
             headers=merged,
@@ -104,6 +104,10 @@ class FingerprintTransport:
             timeout=self._timeout,
             allow_redirects=False,  # we want to see 3xx, like the real browser
         )
+        if self._proxy:
+            # curl_cffi accepts proxies= like requests
+            req_kwargs["proxies"] = {"http": self._proxy, "https": self._proxy}
+        resp = self._session.request(**req_kwargs)
         status = resp.status_code
         raw = resp.content
         # Defensive: if server sent gzip but curl didn't decode, do it here.

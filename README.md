@@ -142,7 +142,13 @@ cp .env.example .env
 | `CLOUDFLARE_D1_DB_ID` | 同上 | D1 库 ID |
 | `ALIAS_MAIL_DOMAINS` | 同上 | 你控制的邮箱域名（逗号分隔） |
 | `CLIPROXYAPI_AUTH_DIR` | 否 | 默认 `./cliproxyapi_auth` |
-| `HTTPS_PROXY` / `HTTP_PROXY` | 否 | 代理 |
+| `HTTPS_PROXY` / `HTTP_PROXY` | 否 | 单代理（无池文件时） |
+| `PROXY_POOL_FILE` | 否 | 代理池文件，**每行一个 URL**；启动时探测出口地区 |
+| `PROXY_POOL` | 否 | 内联小列表（逗号/换行）；大池用 FILE |
+| `PROXY_REGION` | 否 | 目标地区码（`us`/`jp`/`hk`…）；探测后**只保留该地区轮换** |
+| `PROXY_POOL_SCOPE` | 否 | `same_region`（**默认**）/ `all` |
+| `PROXY_GEO_WORKERS` | 否 | 并发探测数（默认 16） |
+| `PROXY_GEO_CACHE` | 否 | 探测缓存（默认 `./.proxy_geo_cache.json`） |
 
 **永远不要**把 `.env`、token 目录提交进 Git。详见 [`SECURITY.md`](SECURITY.md)。
 
@@ -169,6 +175,12 @@ TURNSTILE_POOL=0 python run.py -n 4 -t 2
 TURNSTILE_SOLVER=drission python run.py -n 10 -t 4
 TURNSTILE_SOLVER=camoufox python run.py -n 1
 TURNSTILE_SOLVER=browser  python run.py -n 1
+
+# 代理池文件：每行一个代理 → 探测出口地区 → 只轮换指定地区
+# proxies.txt 示例：
+#   http://user:pass@1.2.3.4:8080
+#   http://user:pass@5.6.7.8:8080
+PROXY_POOL_FILE=./proxies.txt PROXY_REGION=us python run.py -n 10 -t 4
 
 # 临时暂停 mint / HID 点击（边干活边跑）
 touch /tmp/grok-turnstile.pause   # 暂停
@@ -364,7 +376,12 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 | `TURNSTILE_DEBUG` | 关 | `1` 打印 solver 详细日志 |
 | `TURNSTILE_BROWSER_CHANNEL` | 自动 | 仅 browser：优先系统 Chrome |
 | `TURNSTILE_INTERACTIVE` | 关 | 仅 browser：手动点选 |
-| `HTTPS_PROXY` / `HTTP_PROXY` | 空 | 浏览器与协议请求代理 |
+| `HTTPS_PROXY` / `HTTP_PROXY` | 空 | 单代理 |
+| `PROXY_POOL_FILE` | 空 | 每行一个代理；启动探测出口国 |
+| `PROXY_REGION` | 自动/指定 | 指定后只轮换该国；未指定则取探测结果中最多的国家 |
+| `PROXY_POOL_SCOPE` | `same_region` | `same_region` / `all` |
+| `PROXY_GEO_WORKERS` | `16` | 并发探测 |
+| `PROXY_GEO_CACHE` | `./.proxy_geo_cache.json` | 地区缓存（可提交忽略） |
 
 说明：
 

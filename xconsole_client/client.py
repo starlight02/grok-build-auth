@@ -45,7 +45,7 @@ import re
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from . import config as C
@@ -63,14 +63,18 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class _UrllibTransport:
-    def __init__(self, *, timeout: float, debug: bool):
+    def __init__(self, *, timeout: float, debug: bool, proxy: Optional[str] = None):
         self._timeout = timeout
         self._debug = debug
         self.cookies = http.cookiejar.CookieJar()
-        self._opener = urllib.request.build_opener(
+        handlers: List[Any] = [
             urllib.request.HTTPCookieProcessor(self.cookies),
             _NoRedirect(),
-        )
+        ]
+        proxy = (proxy or "").strip()
+        if proxy:
+            handlers.insert(0, urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        self._opener = urllib.request.build_opener(*handlers)
 
     def request(self, method, url, *, headers, body=None):
         req = urllib.request.Request(url, data=body, method=method)
@@ -114,10 +118,9 @@ class XConsoleAuthClient:
     ):
         if transport not in ("curl_cffi", "urllib"):
             raise ValueError("transport must be 'curl_cffi' or 'urllib'")
-        self.debug = debug
-        self.timeout = timeout
-        # Per-instance signup URL avoids concurrent clobber of global C.SIGNUP_URL.
-        self.signup_url = signup_url or C.SIGNUP_URL
+        self.debug = bool(debug)
+        self.timeout = float(timeout)
+        self.proxy = (proxy or "").strip() or None
         if transport == "curl_cffi":
             # imported lazily so the package still loads without it
             from .fingerprint import FingerprintTransport
@@ -126,10 +129,11 @@ class XConsoleAuthClient:
             )
             self.transport_name = f"curl_cffi(impersonate={impersonate})"
         else:
-            self._t = _UrllibTransport(timeout=timeout, debug=debug)
+            self._t = _UrllibTransport(timeout=timeout, debug=debug, proxy=proxy)
             self.transport_name = "urllib"
 
         # Dynamically scraped per-session — populated by load_signup_page().
+        self.signup_url = (signup_url or "").strip() or "https://accounts.x.ai/sign-up"
         self._next_action_id: Optional[str] = None
         self._next_router_state_tree: Optional[str] = None
         self._last_rsc_body: str = ""

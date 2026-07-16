@@ -28,7 +28,18 @@
     MAIL_MAX_ATTEMPTS     Fresh inboxes to try when mail is silent (default 3)
     CLOUDFLARE_API_TOKEN   Cloudflare API token (alias_mail 邮箱后端)
     CLIPROXYAPI_AUTH_DIR   CLIProxyAPI data/auth 目录（可选）
-    HTTPS_PROXY / HTTP_PROXY  代理
+    HTTPS_PROXY / HTTP_PROXY  单代理（无池文件时）
+    PROXY_POOL_FILE          代理池文件（每行一个 URL；启动时探测出口地区）
+    PROXY_POOL               内联列表（逗号/换行；大池请用 FILE）
+    PROXY_REGION             目标地区码（如 us/jp/hk；探测后只保留该地区轮换）
+    PROXY_POOL_SCOPE         same_region（默认）| all
+    PROXY_GEO_WORKERS        并发探测数（默认 16）
+    PROXY_GEO_CACHE          地区缓存 JSON（默认 ./.proxy_geo_cache.json）
+    PROXY_PREFLIGHT          多代理默认开：启动 TCP+CONNECT 预检，剔除死代理
+    PROXY_PREFLIGHT_WORKERS  预检并发（默认 32）
+    PROXY_PREFLIGHT_TIMEOUT  单代理预检秒（默认 6）
+    PROXY_RETRY              单号遇代理传输失败时换代理重试次数（默认 8）
+
 
 CLI 常用:
     -n / -t                账号数 / 并发（默认 -t 4；池 size/minters 随 -t 自动）
@@ -71,6 +82,12 @@ from xconsole_client.turnstile_pool import (
     pause_file_path,
     suggest_pool_params,
 )
+from xconsole_client.proxy_pool import (
+    ProxyPool,
+    is_proxy_transport_error,
+    proxy_retry_limit,
+    single_proxy_from_env,
+)
 from xconsole_client.xai_oauth import (
     CLIPROXYAPI_GROK_BASE_URL,
     OAuthLoginResult,
@@ -82,7 +99,8 @@ from xconsole_client.sso2auth import mint_cpa_from_sso
 # -- secrets from environment only ---------------------------------------
 TEMPMAIL_KEY = os.environ.get("TEMPMAIL_API_KEY", "")
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
-PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""
+# Legacy single-proxy fallback (pool prefers PROXY_POOL / PROXY_POOL_FILE).
+PROXY = single_proxy_from_env()
 
 
 def _mail_code_timeout() -> float:
@@ -118,13 +136,35 @@ def _turnstile_parallel(reg_threads: int = 2) -> int:
     return max(1, min(8, int(reg_threads or 1)))
 
 
-_turnstile_lock = threading.Semaphore(2)  # re-bound in main() from -t
+_turnstile_lock = threading.Semaphore(2)
 _token_pool: Optional[TurnstileTokenPool] = None
 _shared_solver = None
+_proxy_pool: Optional[ProxyPool] = None
 _results: list[dict] = []
 _done = 0
 _total = 0
 _t0 = 0.0
+
+
+def _acquire_proxy() -> str:
+    """Next proxy URL for this registration (pool) or legacy single PROXY."""
+    pool = _proxy_pool
+    if pool is not None:
+        return pool.acquire().url
+    return PROXY
+
+
+def _mark_proxy_bad(proxy: str, reason: str) -> None:
+    pool = _proxy_pool
+    if pool is None or not proxy:
+        return
+    if pool.mark_bad(proxy, reason):
+        print(
+            f"  [proxy-pool] disabled ({pool.disabled_count} dead, live={pool.size}): "
+            f"{reason[:120]}",
+            flush=True,
+        )
+
 
 
 def _log(i: int, msg: str):
@@ -303,12 +343,91 @@ def register_one(
     failed_auth_dir: Optional[str | Path] = None,
     check_quota_timeout: float = 45.0,
 ) -> dict:
-    """Run signup (+ optional Build OAuth export). Thread-safe."""
+    """Run signup (+ optional Build OAuth export). Thread-safe.
+
+    On proxy transport failures (timeout / CONNECT abort), mark the proxy bad
+    and rotate to another from the pool (PROXY_RETRY times).
+    """
+    max_attempts = proxy_retry_limit() if _proxy_pool is not None else 1
+    last: dict = {
+        "email": "",
+        "password": "",
+        "sso": None,
+        "oauth_access_token": None,
+        "cliproxyapi_auth": None,
+        "error": "proxy retries exhausted",
+    }
+    try:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                proxy = _acquire_proxy()
+            except Exception as exc:
+                last = {
+                    "email": "",
+                    "password": "",
+                    "sso": None,
+                    "oauth_access_token": None,
+                    "cliproxyapi_auth": None,
+                    "error": str(exc),
+                }
+                _log(index, f"ERROR: {exc}")
+                break
+
+            if attempt > 1:
+                _log(index, f"retry with new proxy ({attempt}/{max_attempts})")
+
+            result = _register_one_attempt(
+                index,
+                email_backend,
+                proxy=proxy,
+                do_oauth=do_oauth,
+                oauth_protocol=oauth_protocol,
+                oauth_debug=oauth_debug,
+                cliproxyapi_auth_dir=cliproxyapi_auth_dir,
+                cliproxyapi_base_url=cliproxyapi_base_url,
+                accounts_output_dir=accounts_output_dir,
+                check_quota=check_quota,
+                failed_auth_dir=failed_auth_dir,
+                check_quota_timeout=check_quota_timeout,
+            )
+            err = result.get("error")
+            if not err:
+                return result
+
+            if _proxy_pool is not None and is_proxy_transport_error(Exception(str(err))):
+                _mark_proxy_bad(proxy, str(err))
+                last = result
+                if attempt < max_attempts and _proxy_pool.size > 0:
+                    continue
+            return result
+        return last
+    finally:
+        with _results_lock:
+            global _done
+            _done += 1
+
+
+def _register_one_attempt(
+    index: int,
+    email_backend: str,
+    *,
+    proxy: str,
+    do_oauth: bool = True,
+    oauth_protocol: bool = True,
+    oauth_debug: bool = False,
+    cliproxyapi_auth_dir: Optional[str | Path] = None,
+    cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
+    accounts_output_dir: Optional[str | Path] = None,
+    check_quota: bool = False,
+    failed_auth_dir: Optional[str | Path] = None,
+    check_quota_timeout: float = 45.0,
+) -> dict:
+    """Single registration attempt on a fixed proxy."""
     # Turnstile: local browser only (shared solver when pool is on).
     global _shared_solver
     try:
         turnstile_solver = _shared_solver or resolve_turnstile_solver(
-            proxy=PROXY,
+            proxy=proxy,
             debug=oauth_debug,
         )
     except Exception as exc:
@@ -328,7 +447,12 @@ def register_one(
         transport = "urllib" if solver in {"safari", "webkit-system", "system-safari"} else "curl_cffi"
     if transport not in {"curl_cffi", "urllib"}:
         transport = "curl_cffi"
-    c = XConsoleAuthClient(debug=False, signup_url=SIGNUP_URL, transport=transport)
+    c = XConsoleAuthClient(
+        debug=False,
+        signup_url=SIGNUP_URL,
+        transport=transport,
+        proxy=proxy or None,
+    )
     email = ""
     password = ""
     sso = None
@@ -533,7 +657,7 @@ def register_one(
                     oauth = login_with_protocol(
                         email,
                         password,
-                        proxy=PROXY,
+                        proxy=proxy,
                         debug=oauth_debug,
                         cliproxyapi_auth_dir=str(auth_dir),
                         cliproxyapi_base_url=cliproxyapi_base_url,
@@ -555,7 +679,7 @@ def register_one(
                     sso,
                     email=email,
                     auth_dir=auth_dir,
-                    proxy=PROXY,
+                    proxy=proxy,
                     base_url=cliproxyapi_base_url,
                     skip_existing=False,
                     log=lambda m, i=index: _log(i, m),
@@ -644,9 +768,6 @@ def register_one(
         }
     finally:
         c.close()
-        with _results_lock:
-            global _done
-            _done += 1
 
 
 def main():
@@ -759,14 +880,31 @@ def main():
     else:
         par = _turnstile_parallel(threads)
         print(f"  turnstile-parallel:   {par} (pool off; auto from -t={threads})")
+
+    global _token_pool, _shared_solver, _turnstile_lock, _proxy_pool
+    def _proxy_log(msg: str) -> None:
+        print(f"  [proxy-pool] {msg}", flush=True)
+
+    try:
+        _proxy_pool = ProxyPool.from_env(log=_proxy_log)
+    except Exception as exc:
+        print(f"error: proxy pool failed: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if _proxy_pool is not None:
+        print(f"  proxy-pool:           {_proxy_pool.summary()}")
+    elif PROXY:
+        print(f"  proxy:                single (HTTPS_PROXY/HTTP_PROXY)")
     print()
 
-    global _token_pool, _shared_solver, _turnstile_lock
     _token_pool = None
     _shared_solver = None
+    # Shared turnstile minters stick to one proxy from the active region.
+    mint_proxy = PROXY
+    if _proxy_pool is not None:
+        mint_proxy = _proxy_pool.acquire().url
     if use_pool:
         _shared_solver = resolve_turnstile_solver(
-            proxy=PROXY,
+            proxy=mint_proxy,
             debug=args.oauth_debug,
         )
 
