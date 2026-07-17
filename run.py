@@ -268,11 +268,14 @@ def _check_and_gate_auth(
     sometimes return a transient 401/403 on the first /responses hit; wait briefly
     and retry those statuses before moving the file to failed_dir.
 
+    Permanent ``chat_endpoint_denied`` (403 + denied text) is NOT retried — the
+    account cannot use chat and should be moved out immediately.
+
     Returns a small dict for the result record:
       usable, remaining_tokens, status, reasons, path (final location), error?
     """
     # Lazy import so --check-quota-off path never pays the cost.
-    from check_accounts import check_one
+    from check_accounts import CHAT_ENDPOINT_DENIED, check_one
 
     # Propagation delay after OAuth write (observed: immediate probe → 403,
     # re-check a few seconds later → 200 + full free quota).
@@ -285,6 +288,15 @@ def _check_and_gate_auth(
         if probe.get("usable"):
             break
         status = probe.get("status")
+        reasons_list = list(probe.get("reasons") or [])
+        permanent_denied = bool(
+            probe.get("chat_endpoint_denied")
+            or probe.get("code") == CHAT_ENDPOINT_DENIED
+            or CHAT_ENDPOINT_DENIED in reasons_list
+        )
+        # Permanent chat denial: do not treat as transient 403.
+        if permanent_denied:
+            break
         # Only retry auth-rejection / network flakiness — not real 429 exhaustion.
         if status not in (401, 403, None) or attempt >= attempts:
             break
@@ -299,7 +311,13 @@ def _check_and_gate_auth(
     usable = bool(probe.get("usable"))
     rem = probe.get("remaining_tokens")
     status = probe.get("status")
-    reasons = ",".join(probe.get("reasons") or []) or "?"
+    reasons_list = list(probe.get("reasons") or [])
+    reasons = ",".join(reasons_list) or "?"
+    permanent_denied = bool(
+        probe.get("chat_endpoint_denied")
+        or probe.get("code") == CHAT_ENDPOINT_DENIED
+        or CHAT_ENDPOINT_DENIED in reasons_list
+    )
 
     if usable:
         _log(
@@ -312,21 +330,29 @@ def _check_and_gate_auth(
             "remaining_tokens": rem,
             "status": status,
             "reasons": reasons,
+            "chat_endpoint_denied": False,
             "path": str(auth_path),
             "error": None,
         }
 
     dest = _move_auth_to_failed(auth_path, failed_dir)
-    err = f"quota unusable: status={status} reasons={reasons}"
-    _log(index, f"quota FAIL → moved to {dest.name}  ({err})")
+    if permanent_denied:
+        err = f"chat_endpoint_denied: status={status} reasons={reasons}"
+        tag = "DENIED"
+    else:
+        err = f"quota unusable: status={status} reasons={reasons}"
+        tag = "FAIL"
+    _log(index, f"quota {tag} → moved to {dest.name}  ({err})")
     return {
         "usable": False,
         "remaining_tokens": rem,
         "status": status,
         "reasons": reasons,
+        "chat_endpoint_denied": permanent_denied,
         "path": str(dest),
         "error": err,
     }
+
 
 
 def register_one(
@@ -740,6 +766,7 @@ def _register_one_attempt(
                 result["quota_remaining_tokens"] = gate.get("remaining_tokens")
                 result["quota_status"] = gate.get("status")
                 result["quota_reasons"] = gate.get("reasons")
+                result["chat_endpoint_denied"] = bool(gate.get("chat_endpoint_denied"))
                 if gate["usable"]:
                     result["cliproxyapi_auth"] = gate["path"]
                 else:
@@ -958,7 +985,12 @@ def main():
     # summary
     ok_sso = [r for r in _results if r.get("sso")]
     ok_build = [r for r in _results if r.get("cliproxyapi_auth")]
-    quota_fail = [r for r in _results if r.get("cliproxyapi_auth_failed")]
+    denied = [r for r in _results if r.get("chat_endpoint_denied")]
+    quota_fail = [
+        r
+        for r in _results
+        if r.get("cliproxyapi_auth_failed") and not r.get("chat_endpoint_denied")
+    ]
     fail = [r for r in _results if r.get("error") and not r.get("cliproxyapi_auth")]
     print(f"\n{'=' * 50}")
     parts = [
@@ -967,6 +999,7 @@ def main():
         f"BUILD OK: {len(ok_build)}",
     ]
     if check_quota:
+        parts.append(f"DENIED: {len(denied)}")
         parts.append(f"QUOTA FAIL: {len(quota_fail)}")
     parts.append(f"FAIL: {len(fail)}")
     print("  |  ".join(parts))
@@ -977,6 +1010,11 @@ def main():
             rem = r.get("quota_remaining_tokens")
             extra = f"  tokens={rem}" if rem is not None else ""
             print(f"  {email:40s}  BUILD  {r['cliproxyapi_auth']}{extra}")
+        elif r.get("chat_endpoint_denied"):
+            print(
+                f"  {email:40s}  DENIED  {r.get('cliproxyapi_auth_failed') or '-'}  "
+                f"({r.get('error', '?')})"
+            )
         elif r.get("cliproxyapi_auth_failed"):
             print(
                 f"  {email:40s}  QUOTA-FAIL  {r['cliproxyapi_auth_failed']}  "

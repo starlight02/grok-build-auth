@@ -21,6 +21,8 @@ from urllib.parse import urljoin
 
 import requests
 
+from check_accounts import CHAT_ENDPOINT_DENIED, is_chat_endpoint_denied
+
 
 DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 DEFAULT_HEADERS = {
@@ -115,13 +117,20 @@ def summarize_response(resp: requests.Response) -> dict[str, Any]:
             out["error"] = body_text[:300]
         return out
 
+    data: Any = None
     try:
         data = resp.json()
     except Exception:
         if body_text:
             out["body"] = body_text[:300]
+            out["error"] = body_text[:300]
+        if is_chat_endpoint_denied(resp.status_code, body=body_text, error=out.get("error")):
+            out["code"] = CHAT_ENDPOINT_DENIED
+            out["chat_endpoint_denied"] = True
         return out
 
+    err_obj: Any = None
+    top_code: str | None = None
     if isinstance(data, dict):
         if model := data.get("model"):
             out["model"] = model
@@ -131,6 +140,24 @@ def summarize_response(resp: requests.Response) -> dict[str, Any]:
                 out["probe_total_tokens"] = total
             elif total := usage.get("totalTokens"):
                 out["probe_total_tokens"] = total
+        err_obj = data.get("error")
+        if err_obj is not None and resp.status_code >= 400:
+            if isinstance(err_obj, dict):
+                out["error"] = str(err_obj.get("message") or err_obj.get("code") or err_obj)[:300]
+            else:
+                out["error"] = str(err_obj)[:300]
+        raw_code = data.get("code")
+        if isinstance(raw_code, str) and raw_code.strip():
+            top_code = raw_code.strip()
+
+    if is_chat_endpoint_denied(
+        resp.status_code,
+        body=body_text,
+        error=err_obj if err_obj is not None else out.get("error"),
+        code=top_code,
+    ):
+        out["code"] = CHAT_ENDPOINT_DENIED
+        out["chat_endpoint_denied"] = True
     return out
 
 
@@ -213,6 +240,13 @@ def main() -> None:
         print(f"\n{label} [{item.get('file')}] status={status}{disabled}")
         if item.get("error"):
             print(f"  error: {item['error']}")
+            if item.get("chat_endpoint_denied") or item.get("code") == CHAT_ENDPOINT_DENIED:
+                print(f"  code: {CHAT_ENDPOINT_DENIED}")
+            continue
+        if item.get("chat_endpoint_denied") or item.get("code") == CHAT_ENDPOINT_DENIED:
+            print(f"  code: {CHAT_ENDPOINT_DENIED}")
+            if item.get("error"):
+                print(f"  error: {item['error']}")
             continue
         if "actual_tokens" in item:
             print(
