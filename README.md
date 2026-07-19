@@ -6,7 +6,7 @@
 `注册 → SSO → OAuth PKCE（Grok Build / CLI scope）→ 导出本地 auth JSON`  
 整条链路，便于协议分析、互操作性研究与本地集成测试。
 
-默认：注册/OAuth 走纯 HTTP（`curl_cffi`）；注册阶段 Turnstile 用本机浏览器后端（默认 `auto`→Drission+turnstilePatch；可选 Camoufox / Playwright），**后台 token 池默认开启**，深度/mint 并发随 `-t` 自动；邮箱默认 Tempmail free（约 `-t 4` 稳态）。OAuth：协议 session-reuse，失败回退 Device Flow。
+默认：注册/OAuth 走纯 HTTP（`curl_cffi`）；Turnstile **后台 token 池默认开**；邮箱 **多渠道 registry + 后台邮箱池默认开**（`-e auto` 用上所有已配置渠道：优先高吞吐、限速溢出补量；单渠道自动 solo）。OAuth：协议 session-reuse，失败回退 Device Flow。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
@@ -53,7 +53,8 @@
 
 - **协议优先**：注册 / OAuth 默认纯 HTTP（`curl_cffi` 指纹会话）
 - **Turnstile 池**：后台 mint、注册线程只消费；**默认开启**；按需产 token（够用即停）
-- **随 `-t` 自动调参**：池深度 / mint 并发随注册并发缩放（也可 env 固定）
+- **邮箱池 + 多渠道**：`mail_channels` 可插拔 registry；后台预建 inbox；**prefer + overflow**（tempmail 按 RPM 持续产，yyds/CF 补量，不是一限速就全切）
+- **随 `-t` 自动调参**：token/mail 池深度与 minter 随注册并发缩放（也可 env 固定）
 - **OAuth 双路径**：快路径 SSO session-reuse（`oauth_protocol`）；回退 Device Flow（`sso2auth`）
 - **精简落盘**：默认写 `sso_output/` + `cliproxyapi_auth/`（CPA 可加载）
 
@@ -62,17 +63,38 @@
 ## 架构
 
 ```mermaid
-flowchart LR
-    A[run.py<br/>-n / -t] --> P[Turnstile 后台池<br/>turnstile_pool]
-    P -->|mint| S[浏览器后端<br/>drission / camoufox / browser]
-    A --> B[注册 client.py<br/>邮箱码 + 消费 token]
-    P -->|token| B
-    B --> C[SSO sso.py<br/>sso_output]
-    C --> D{OAuth 快路径<br/>oauth_protocol<br/>SSO session-reuse}
+flowchart TB
+    subgraph entry [run.py]
+      A["-n / -t / -e auto|渠道"]
+    end
+
+    subgraph pools [后台池 默认 on]
+      TP[TurnstileTokenPool<br/>turnstile_pool]
+      MP[MailboxPool<br/>mailbox_pool]
+      R[ChannelRouter<br/>mail_channels]
+      MP --> R
+      R -->|prefer| TM[tempmail]
+      R -->|overflow| YY[yyds]
+      R -->|overflow| CF[cloudflare]
+      R -.->|register_channel| X[未来渠道…]
+    end
+
+    subgraph browser [Turnstile 浏览器后端]
+      S[drission / camoufox / browser]
+    end
+
+    A --> TP
+    A --> MP
+    TP -->|mint| S
+    A --> B[注册 client.py]
+    TP -->|token| B
+    MP -->|Mailbox email+receiver+channel| B
+    B --> C[SSO sso_output]
+    C --> D{OAuth 快路径<br/>oauth_protocol}
     D -->|OK| E[token 交换]
-    D -->|失败| F[sso2auth<br/>Device Flow]
+    D -->|失败| F[sso2auth Device Flow]
     F --> E
-    E --> G[cliproxyapi_auth/*.json<br/>CLIProxyAPI]
+    E --> G[cliproxyapi_auth/*.json]
 ```
 
 导出 CPA auth 需要 OAuth 拿到的 `access_token` / `refresh_token`（协议路径或 Device Flow）。
@@ -85,7 +107,7 @@ flowchart LR
 
 - Python 3.9+
 - Turnstile：本机浏览器后端（默认 Drission + Chrome 有头；可选 Camoufox / Playwright）
-- 临时邮箱：默认 Tempmail.lol **免费层（无需 API key）**；可选 Plus/Ultra key 或自建 Cloudflare D1 别名邮箱
+- 邮箱：默认 `-e auto` —— 启用**所有已配置**渠道（tempmail 始终可用；yyds / cloudflare 有凭证才进池）；也可 `-e tempmail|yyds|cloudflare` 强制单渠道
 - （可选）HTTP(S) 代理
 - （可选）本地已安装的 CLIProxyAPI，用于加载导出的 auth 目录
 
@@ -134,10 +156,19 @@ cp .env.example .env
 | `TURNSTILE_INTERACTIVE` | 否 | 仅 playwright：`1` = 手动点选（强制有头） |
 | `TURNSTILE_BROWSER_REUSE` | 否 | `1` = 热复用浏览器（默认 1；drission 暖页复用） |
 | `TEMPMAIL_API_KEY` | 否 | Tempmail.lol Plus/Ultra（**免费层无需 key**） |
-| `TEMPMAIL_FREE_CREATE_INTERVAL` | 否 | 无 key 时 create 最小间隔秒（默认 **3 ≈ 20/min**，贴 free 上限） |
+| `TEMPMAIL_FREE_CREATE_INTERVAL` | 否 | 无 key 时 create 最小间隔秒（默认 **3 ≈ 20/min**） |
+| `YYDS_API_KEY` / `YYDS_JWT` | 否 | YYDS 邮箱（二选一；有则 `-e auto` 自动纳入） |
+| `YYDS_API_BASE` | 否 | 默认 `https://maliapi.215.im/v1` |
+| `YYDS_DOMAINS` | 否 | 域名白名单（空 = **全部已验证域名**，域名侧负载均衡） |
+| `MAIL_BACKENDS` | 否 | 显式渠道列表，覆盖 `-e auto`（如 `tempmail,yyds`） |
+| `MAIL_CHANNEL_WEIGHTS` | 否 | 优先级，如 `tempmail:100,yyds:40,cloudflare:60` |
+| `MAIL_CHANNEL_CAPACITY` | 否 | 每渠道并发 create 容量，满则溢出 |
+| `MAIL_POOL` | 否 | 后台邮箱预创建池（**默认开**；`0` 关） |
+| `MAIL_POOL_SIZE` / `_TARGET` / `_MINTERS` | 否 | 同 turnstile 池语义（默认随 `-t`） |
+| `MAIL_POOL_MAX_AGE` | 否 | 池内邮箱最大年龄秒（默认 600） |
 | `MAIL_CODE_TIMEOUT` | 否 | 等验证码秒数，超时换箱（默认 30） |
 | `MAIL_MAX_ATTEMPTS` | 否 | 静默邮箱最多换几次（默认 3） |
-| `CLOUDFLARE_API_TOKEN` | `-e cloudflare` 时 | CF API token |
+| `CLOUDFLARE_API_TOKEN` | `-e cloudflare` / auto 检测 | CF API token |
 | `CLOUDFLARE_ACCOUNT_ID` | 同上 | CF 账户 |
 | `CLOUDFLARE_D1_DB_ID` | 同上 | D1 库 ID |
 | `ALIAS_MAIL_DOMAINS` | 同上 | 你控制的邮箱域名（逗号分隔） |
@@ -155,20 +186,34 @@ cp .env.example .env
 ### 运行（研究 / 自有账号场景）
 
 ```bash
-# 零配置批量：默认 -t 4 + token 池 on + Tempmail free 节流
-# 池 size/minters 自动跟 -t；够用即停产
+# 零配置批量：默认 -t 4 + token 池 + mail 池 + -e auto（已配置渠道 prefer+overflow）
 python run.py -n 20
 
 # 单号冒烟
 python run.py -n 1
 
-# 改并发（池参数自动跟着变；-t 8 → size=8 minters=2）
+# 改并发（token/mail 池参数自动跟着变；-t 8 → size=8 minters=2）
 python run.py -n 20 -t 8
 
-# 固定池参数（覆盖自动）
+# 强制单渠道（solo：可阻塞 wait/retry，无多渠溢出）
+python run.py -n 10 -e yyds
+python run.py -n 10 -e tempmail
+python run.py -n 1 -e cloudflare
+
+# 显式多渠道列表（覆盖 auto 检测）
+MAIL_BACKENDS=tempmail,yyds python run.py -n 20 -t 8
+
+# 调权重 / 容量（tempmail 优先；满 slot 才溢出 yyds）
+MAIL_CHANNEL_WEIGHTS=tempmail:100,yyds:40 MAIL_CHANNEL_CAPACITY=tempmail:3,yyds:2 \
+  python run.py -n 20 -t 8
+
+# 关邮箱池（注册时现场 create；路由仍可用）
+MAIL_POOL=0 python run.py -n 4 -t 2
+
+# 固定 token 池参数（覆盖自动）
 TURNSTILE_POOL_SIZE=6 TURNSTILE_POOL_MINTERS=2 python run.py -n 20 -t 4
 
-# 关池（退回每线程现场 mint；PARALLEL 默认= -t）
+# 关 token 池（退回每线程现场 mint；PARALLEL 默认= -t）
 TURNSTILE_POOL=0 python run.py -n 4 -t 2
 
 # 指定 Turnstile 后端
@@ -177,21 +222,15 @@ TURNSTILE_SOLVER=camoufox python run.py -n 1
 TURNSTILE_SOLVER=browser  python run.py -n 1
 
 # 代理池文件：每行一个代理 → 探测出口地区 → 只轮换指定地区
-# proxies.txt 示例：
-#   http://user:pass@1.2.3.4:8080
-#   http://user:pass@5.6.7.8:8080
 PROXY_POOL_FILE=./proxies.txt PROXY_REGION=us python run.py -n 10 -t 4
 
 # 临时暂停 mint / HID 点击（边干活边跑）
 touch /tmp/grok-turnstile.pause   # 暂停
 rm    /tmp/grok-turnstile.pause   # 恢复
 
-# 自建 Cloudflare 邮箱 / 仅 SSO / Device Flow
-python run.py -n 1 -e cloudflare
+# 仅 SSO / Device Flow / 台账 / 调试
 python run.py -n 1 --no-oauth
 python run.py -n 1 --no-oauth-protocol
-
-# 指定 CLIProxyAPI auth 目录 / 台账 / 调试
 python run.py -n 1 --cliproxyapi-auth-dir /path/to/CLIProxyAPI/data/auth
 python run.py -n 1 --accounts-output-dir ./accounts_output
 python run.py -n 1 --oauth-debug
@@ -290,17 +329,69 @@ python xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyapi_auth
 - CLI 默认 **`-t 4`**：贴近 free 层稳态吞吐
 - 无 `TEMPMAIL_API_KEY` 时，`create` 进程级节流默认 **3s/次（≈20/min）**，减轻 429
 - 有 Plus/Ultra key 时跳过 free create 节流；可自行提高 `-t`
+- **多渠道时**：free pacing / 429 只让 tempmail「这一拍」不可用，yyds 等立即补量；slot 恢复后仍优先 tempmail（不是全切）
 
 ### 启动日志怎么读
 
 ```text
-grok-build-auth: 20 accounts, 4 threads, ... turnstile=auto, pool=on
-  turnstile-pool: size=4 target=2 minters=1 max_age=200s (auto from -t=4)
-  [ts-pool] token pool start size=4 target=2 ...
+grok-build-auth: 20 accounts, 4 threads, email=auto, ... pool=on, mail-pool=on
+  mail-channels:        tempmail,yyds (prefer+overflow; weights via MAIL_CHANNEL_WEIGHTS)
+  turnstile-pool:       size=4 target=2 minters=1 max_age=200s (auto from -t=4)
+  mail-pool:            size=4 target=2 minters=1 max_age=600s (auto from -t=4)
   [ts-pool] pool +1 len=837 q=1/4 want=2 wait=0
-  [ts-pool] pool mint pause (satisfied q=2/4 want=2 waiting=0)
+  [mail-pool] mail pool +1 [tempmail] xai…@… q=2/4
+  [mail] mail channel tempmail rate: … (next_slot≈3.0s; overflow/retry)
+  [mail] mail create via yyds: xai…@…
+  [3/20] [#2] email [yyds]: xai…@…
   [3/20] [#2] Turnstile 837 chars from pool (age=6s q=1)
 ```
+
+---
+
+## 邮箱池与多渠道（默认）
+
+注册线程**只消费**已建好的 `Mailbox(email, receiver, channel)`；后台 minter 按渠道路由预创建。默认开启，与 Turnstile 池并行预热。
+
+### 渠道 registry（可扩展）
+
+| 渠道 | 默认 weight | 何时 available | 说明 |
+|---|---|---|---|
+| **tempmail** | 100 | 始终（free 或 `TEMPMAIL_API_KEY`） | 通常最高 create RPM；优先 |
+| **yyds** | 40 | `YYDS_API_KEY` 或 `YYDS_JWT` | 溢出补量；域名可全量 LB |
+| **cloudflare** | 60 | `CLOUDFLARE_*` + `ALIAS_MAIL_DOMAINS` | 自建 D1 别名邮箱 |
+| **自定义** | 自定 | `configured()` | `register_channel(ChannelSpec(...))`，CLI/`auto` 自动带上 |
+
+```python
+# 插件式扩展（无需改 run.py if/else）
+from xconsole_client.mail_channels import ChannelSpec, register_channel
+
+register_channel(ChannelSpec(
+    name="mymail",
+    weight=55,
+    capacity=2,
+    configured=lambda: bool(os.environ.get("MYMAIL_KEY")),
+    create=lambda: (email, receiver),  # receiver.wait_for_code(timeout=…)
+))
+```
+
+### Solo vs Multi
+
+| 模式 | 触发 | 行为 |
+|---|---|---|
+| **Solo** | 只解析出 1 个渠道（`-e yyds` / 仅配一种 / `MAIL_BACKENDS=yyds`） | 可阻塞 wait/retry，兼容旧单后端 |
+| **Multi** | `-e auto` 且 ≥2 个 available | **prefer + overflow**：高 weight 有 slot 就用；满/限速只挡这一拍，立刻用其它 ready 渠道补 |
+
+限速（RPM / free pacing / 429）≠ 渠道死亡：恢复 slot 后继续优先高 weight。
+
+### 池参数（随 `-t`）
+
+| 参数 | 自动规则 | env |
+|---|---|---|
+| size | `clamp(-t, 2..32)` | `MAIL_POOL_SIZE` |
+| target | `min(2, size)` | `MAIL_POOL_TARGET` |
+| minters | `ceil(-t/4)` 上限 4 | `MAIL_POOL_MINTERS` |
+| max_age | 600s | `MAIL_POOL_MAX_AGE` |
+| 开关 | 默认 on | `MAIL_POOL=0` 关闭 |
 
 ---
 
@@ -411,8 +502,8 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 **注册**
 
 1. Warm-up + 动态抓取 Next.js action  
-2. 临时邮箱创建 + 验证码（gRPC-web）  
-3. Turnstile（本机浏览器后端 mint token，见 [Turnstile 后端](#turnstile-后端)）  
+2. 从邮箱池取得 `Mailbox`（带 `channel`）→ 发码 → `receiver.wait_for_code`（渠道绑定）  
+3. Turnstile（本机浏览器后端 / token 池，见 [Turnstile 后端](#turnstile-后端)）  
 4. `create_account` + 提取 SSO → `sso_output/sso_*.json` + 追加 `sso_tokens.txt`  
 
 **Build OAuth**（`run.py` 注册后）
@@ -446,12 +537,15 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 │   ├── oauth_protocol.py          # 协议 OAuth（SSO session-reuse）
 │   ├── sso2auth.py                # SSO Device Flow → CPA
 │   ├── xai_oauth.py               # PKCE / 导出 / 浏览器登录
+│   ├── mail_channels.py           # 邮箱渠道 registry + prefer/overflow 路由
+│   ├── mailbox_pool.py            # 后台邮箱预创建池（默认 on）
 │   ├── tempmail_transport.py      # Tempmail.lol（free create 节流）
+│   ├── yyds_transport.py          # YYDS / maliapi 邮箱
 │   ├── turnstile_pool.py          # 后台 token 池（默认 on，随 -t 自动）
 │   ├── solver.py                  # Turnstile 工厂
 │   ├── drission_solver.py         # Drission + turnstilePatch（暖页复用）
 │   ├── camoufox_solver.py         # Camoufox
-│   └── sso.py / ...
+│   └── sso.py / mailbox.py / ...
 ├── turnstilePatch/                # Chrome 扩展（Drission 用）
 └── alias_mail/                    # 可选：Cloudflare 邮箱助手
 
@@ -472,8 +566,8 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 - 依赖第三方公开接口，部署变更可能导致链路失效
 - Turnstile 仍是瓶颈之一：冷启动首枚约 10–16s；**暖页约 2.4s/枚**；默认池按需生产，避免空闲狂 mint
 - headless / 脏 IP 更容易空 token；优先 `drission` 或 `camoufox` 有头
-- Tempmail **free** 有速率上限：默认 `-t 4` + create 3s 节流；冲更高吞吐请 Plus key 或 `-e cloudflare`
-- 邮箱 / 代理 SSL 抖动会影响成功率；Tempmail 默认 30s 无码即换箱
+- Tempmail **free** 有 RPM 上限：默认 `-t 4` + create 3s 节流；多渠道时 yyds/CF **补量**（非全切）；冲更高吞吐可 Plus key 或提高 tempmail capacity
+- 邮箱 / 代理 SSL 抖动会影响成功率；默认 30s 无码即换箱（换箱仍走路由/池）
 - 并发过高可能触发平台风控；研究用途请保持克制
 - 导出 CPA auth 需要完成 OAuth（协议或 Device Flow）
 - 注册 Turnstile 使用本机浏览器后端；OAuth 使用协议 session-reuse 与 Device Flow

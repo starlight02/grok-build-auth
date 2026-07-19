@@ -24,6 +24,13 @@
     TURNSTILE_PAUSE_FILE   存在则暂停 mint/HID 点击（默认 /tmp/grok-turnstile.pause）
     TEMPMAIL_API_KEY       Optional Tempmail.lol Plus/Ultra（免费层无需；提高限额）
     TEMPMAIL_FREE_CREATE_INTERVAL  无 key 时 create 最小间隔秒（默认 3 ≈20/min）
+    YYDS_API_KEY / YYDS_JWT  YYDS 邮箱（-e yyds|auto；二选一）
+    YYDS_API_BASE            默认 https://maliapi.215.im/v1
+    YYDS_DOMAINS             可选域名白名单（空=全部已验证域名，负载均衡）
+    MAIL_BACKENDS           多渠道列表（如 tempmail,yyds）；空则看 -e
+    MAIL_POOL               邮箱预创建池（默认开；0=关）
+    MAIL_POOL_SIZE/TARGET/MINTERS  同 turnstile 池语义（默认随 -t）
+    MAIL_POOL_MAX_AGE       池内邮箱最大年龄秒（默认 600）
     MAIL_CODE_TIMEOUT     Seconds to wait for verification code before rotating inbox (default 30)
     MAIL_MAX_ATTEMPTS     Fresh inboxes to try when mail is silent (default 3)
     CLOUDFLARE_API_TOKEN   Cloudflare API token (alias_mail 邮箱后端)
@@ -82,6 +89,15 @@ from xconsole_client.turnstile_pool import (
     pause_file_path,
     suggest_pool_params,
 )
+from xconsole_client.mailbox_pool import MailboxPool, suggest_mail_pool_params
+from xconsole_client.mail_channels import (
+    ChannelRouter,
+    Mailbox,
+    build_router,
+    cli_email_choices,
+    create_on_channel,
+    resolve_channels,
+)
 from xconsole_client.proxy_pool import (
     ProxyPool,
     is_proxy_transport_error,
@@ -98,6 +114,8 @@ from xconsole_client.sso2auth import mint_cpa_from_sso
 
 # -- secrets from environment only ---------------------------------------
 TEMPMAIL_KEY = os.environ.get("TEMPMAIL_API_KEY", "")
+YYDS_API_KEY = os.environ.get("YYDS_API_KEY", "")
+YYDS_JWT = os.environ.get("YYDS_JWT", "")
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 # Legacy single-proxy fallback (pool prefers PROXY_POOL / PROXY_POOL_FILE).
 PROXY = single_proxy_from_env()
@@ -138,6 +156,8 @@ def _turnstile_parallel(reg_threads: int = 2) -> int:
 
 _turnstile_lock = threading.Semaphore(2)
 _token_pool: Optional[TurnstileTokenPool] = None
+_mail_pool: Optional[MailboxPool] = None
+_mail_router: Optional[ChannelRouter] = None
 _shared_solver = None
 _proxy_pool: Optional[ProxyPool] = None
 _results: list[dict] = []
@@ -200,28 +220,65 @@ def _acquire_turnstile(index: int, turnstile_solver) -> tuple[str, float]:
     return token, time.time()
 
 
-def _make_email_provider(backend: str):
-    """Return (email, receiver) — receiver has .wait_for_code(timeout)."""
-    if backend == "tempmail":
-        from xconsole_client.tempmail_transport import TempmailInbox
+def _mail_pool_enabled() -> bool:
+    raw = (os.environ.get("MAIL_POOL") or "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    # Default ON — pre-create inboxes in parallel with turnstile mint.
+    return True
 
-        # Free tier: no API key. Optional TEMPMAIL_API_KEY for Plus/Ultra rate limits.
-        inbox = TempmailInbox(api_key=TEMPMAIL_KEY or "", prefix="xai", debug=False)
-        email = inbox.create()
-        return email, inbox
-    elif backend == "cloudflare":
-        from xconsole_client.mailbox import AliasMailAccount, AliasMailCodeReceiver
 
-        with _cf_lock:
-            cf = AliasMailAccount.ensure_cf()
-            alloc = AliasMailAccount(cf)
-            address = alloc.create(prefix="xai")
-        receiver = AliasMailCodeReceiver(
-            cf, address=address, timeout=120, interval=3, since_now=True
+def _create_email_inbox(backend: str):
+    """Create one fresh inbox on a single registered channel.
+
+    Kept for compatibility; new code should prefer ``create_on_channel`` /
+    ``build_router`` from ``mail_channels``.
+    """
+    return create_on_channel(backend)
+
+
+def _build_mail_router(channels: list[str], *, log=None) -> ChannelRouter:
+    """Build router from registry (creators resolved per ChannelSpec)."""
+    return build_router(channels, log=log)
+
+
+def _make_email_provider(backend: str = "auto"):
+    """Return (email, receiver, channel) — prefer mailbox pool when running."""
+    return _acquire_email(backend, index=0)
+
+
+def _acquire_email(backend: str = "auto", index: int = 0) -> tuple[str, object, str]:
+    """Return (email, receiver, channel). Pool preferred; else router/single."""
+    global _mail_pool, _mail_router
+    pool = _mail_pool
+    if pool is not None:
+        item = pool.acquire(
+            timeout=max(120.0, float(os.environ.get("MAIL_CODE_TIMEOUT") or 30) * 4)
         )
-        return address, receiver
-    else:
-        raise ValueError(f"unknown email backend: {backend}")
+        if index:
+            _log(
+                index,
+                f"email from pool [{item.channel}]: {item.email} "
+                f"(age={item.age:.0f}s q={pool.qsize()})",
+            )
+        return item.email, item.receiver, item.channel
+
+    router = _mail_router
+    if router is not None:
+        box = router.create()
+        if index:
+            _log(index, f"email via {box.channel}: {box.email}")
+        return box.email, box.receiver, box.channel
+
+    # Ad-hoc: resolve + create once (single = direct; multi = ephemeral router).
+    from xconsole_client.mail_channels import create_mailbox
+
+    box = create_mailbox(backend)
+    if index:
+        _log(index, f"email via {box.channel}: {box.email}")
+    return box.email, box.receiver, box.channel
 
 
 def _save_account_bundle(result: dict, output_dir: Path) -> Path:
@@ -499,7 +556,13 @@ def _register_one_attempt(
         mail_timeout = _mail_code_timeout()
         mail_attempts = _mail_max_attempts()
 
-        code_box: dict = {"code": None, "email": "", "err": None, "tries": 0}
+        code_box: dict = {
+            "code": None,
+            "email": "",
+            "channel": "",
+            "err": None,
+            "tries": 0,
+        }
         stop_mail = threading.Event()
 
         def _mail_loop() -> None:
@@ -508,16 +571,17 @@ def _register_one_attempt(
                 if stop_mail.is_set():
                     return
                 try:
-                    addr, receiver = _make_email_provider(email_backend)
+                    addr, receiver, channel = _acquire_email(email_backend, index)
                 except Exception as exc:  # noqa: BLE001
                     last_err = exc
                     code_box["err"] = exc
                     _log(index, f"mail create failed ({exc})")
                     return
                 code_box["email"] = addr
+                code_box["channel"] = channel
                 code_box["tries"] = attempt
                 tag = f" (try {attempt}/{mail_attempts})" if mail_attempts > 1 else ""
-                _log(index, f"email: {addr}{tag}")
+                _log(index, f"email [{channel}]: {addr}{tag}")
                 try:
                     c.create_email_validation_code(addr)
                 except Exception as exc:  # noqa: BLE001
@@ -647,11 +711,10 @@ def _register_one_attempt(
             "email": email,
             "password": password,
             "sso": sso,
+            "email_channel": code_box.get("channel") or "",
             "oauth_access_token": None,
             "oauth_refresh_token": None,
-            "oauth_record": None,
             "cliproxyapi_auth": None,
-            "build_base_url": cliproxyapi_base_url,
             "error": None,
         }
 
@@ -774,13 +837,6 @@ def _register_one_attempt(
                     result["cliproxyapi_auth_failed"] = gate["path"]
                     result["cliproxyapi_auth"] = None
                     result["error"] = gate.get("error") or "quota unusable"
-        else:
-            _log(index, "OAuth skipped (--no-oauth)")
-
-        if accounts_output_dir:
-            bundle = _save_account_bundle(result, Path(accounts_output_dir))
-            result["account_bundle"] = str(bundle)
-
         return result
 
     except Exception as e:
@@ -814,9 +870,9 @@ def main():
     p.add_argument(
         "-e",
         "--email",
-        choices=["tempmail", "cloudflare"],
-        default="tempmail",
-        help="邮箱后端: tempmail | cloudflare",
+        choices=cli_email_choices(),
+        default="auto",
+        help="邮箱渠道: auto=所有已配置渠道(优先+溢出) | 单渠道名(见 registry)",
     )
     p.add_argument(
         "--no-oauth",
@@ -884,12 +940,23 @@ def main():
     pool_size, pool_target, pool_minters = suggest_pool_params(
         threads, solver_mode=solver_mode
     )
+    use_mail_pool = _mail_pool_enabled()
+    mail_channels = resolve_channels(args.email)
+    mail_size, mail_target, mail_minters = suggest_mail_pool_params(threads)
     print(
         f"grok-build-auth: {args.count} accounts, {threads} threads, email={args.email}, "
         f"oauth={'on' if do_oauth else 'off'}, turnstile={ts_label}"
         f", pool={'on' if use_pool else 'off'}"
+        f", mail-pool={'on' if use_mail_pool else 'off'}"
         f", check-quota={'on' if check_quota else 'off'}"
     )
+    if len(mail_channels) == 1:
+        print(f"  mail-channels:        {mail_channels[0]} (solo, full wait/retry)")
+    else:
+        print(
+            f"  mail-channels:        {','.join(mail_channels)} "
+            f"(prefer+overflow; weights via MAIL_CHANNEL_WEIGHTS)"
+        )
     if do_oauth:
         print(f"  cliproxyapi-auth-dir: {args.cliproxyapi_auth_dir}")
         print(f"  build-base-url:       {args.cliproxyapi_base_url}")
@@ -904,11 +971,18 @@ def main():
             f"(auto from -t={threads})"
         )
         print(f"  pause-file:           {pause_file_path()}  (touch=pause mint/click, rm=resume)")
-    else:
+    if use_mail_pool:
+        print(
+            f"  mail-pool:            size={mail_size} target={mail_target} "
+            f"minters={mail_minters} "
+            f"max_age={os.environ.get('MAIL_POOL_MAX_AGE') or '600'}s "
+            f"(auto from -t={threads})"
+        )
+    if not use_pool:
         par = _turnstile_parallel(threads)
         print(f"  turnstile-parallel:   {par} (pool off; auto from -t={threads})")
 
-    global _token_pool, _shared_solver, _turnstile_lock, _proxy_pool
+    global _token_pool, _mail_pool, _mail_router, _shared_solver, _turnstile_lock, _proxy_pool
     def _proxy_log(msg: str) -> None:
         print(f"  [proxy-pool] {msg}", flush=True)
 
@@ -924,6 +998,8 @@ def main():
     print()
 
     _token_pool = None
+    _mail_pool = None
+    _mail_router = None
     _shared_solver = None
     # Shared turnstile minters stick to one proxy from the active region.
     mint_proxy = PROXY
@@ -952,6 +1028,19 @@ def main():
         # Non-pool path: rebind mint semaphore to match registration concurrency.
         _turnstile_lock = threading.Semaphore(_turnstile_parallel(threads))
 
+    def _mail_log(msg: str) -> None:
+        print(f"  [mail] {msg}", flush=True)
+
+    _mail_router = _build_mail_router(mail_channels, log=_mail_log)
+    if use_mail_pool:
+        _mail_pool = MailboxPool(
+            _mail_router,
+            size=mail_size,
+            target=mail_target,
+            minters=mail_minters,
+            log=lambda m: print(f"  [mail-pool] {m}", flush=True),
+        )
+        _mail_pool.start()
     try:
         accounts_dir = (args.accounts_output_dir or "").strip() or None
         common_kwargs = dict(
@@ -978,6 +1067,10 @@ def main():
                 for f in as_completed(futures):
                     _results.append(f.result())
     finally:
+        if _mail_pool is not None:
+            _mail_pool.stop(wait=2.0)
+            _mail_pool = None
+        _mail_router = None
         if _token_pool is not None:
             _token_pool.stop(wait=2.0)
             _token_pool = None

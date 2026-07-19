@@ -52,19 +52,42 @@ def _free_create_interval() -> float:
         return 3.0
 
 
-def _pace_free_create() -> None:
-    """Serialize free-tier inbox creates to free max steady rate."""
+def free_create_ready_in() -> float:
+    """Seconds until free-tier create slot is free (0 if ready / paid key)."""
+    if (os.environ.get("TEMPMAIL_API_KEY") or "").strip():
+        return 0.0
+    interval = _free_create_interval()
+    if interval <= 0:
+        return 0.0
+    with _free_create_lock:
+        return max(0.0, _free_create_next - time.time())
+
+def _pace_free_create(*, block: bool = True) -> None:
+    """Serialize free-tier inbox creates to free max steady rate.
+
+    When ``block=False`` (multi-channel mode), raises immediately if the slot
+    is not free so the router can fail over to yyds/cloudflare without waiting.
+    """
     global _free_create_next
     interval = _free_create_interval()
     if interval <= 0:
         return
-    with _free_create_lock:
-        now = time.time()
-        wait = _free_create_next - now
-        if wait > 0:
-            time.sleep(wait)
+    while True:
+        with _free_create_lock:
             now = time.time()
-        _free_create_next = now + interval
+            wait = _free_create_next - now
+            if wait <= 0:
+                _free_create_next = now + interval
+                return
+            if not block:
+                from xconsole_client.mail_channels import ChannelBusy
+
+                raise ChannelBusy(
+                    "tempmail",
+                    retry_after=wait,
+                    reason="free-tier pacing",
+                )
+        time.sleep(wait)
 
 
 @dataclass
@@ -115,14 +138,22 @@ class TempmailInbox:
             headers["Authorization"] = f"Bearer {key}"
         return headers
 
-    def create(self) -> str:
-        """Create a new inbox. Returns the email address."""
+    def create(self, *, allow_wait: Optional[bool] = None) -> str:
+        """Create a new inbox. Returns the email address.
+
+        ``allow_wait``: free-tier pacing. Default reads MAIL_CREATE_ALLOW_WAIT
+        (``0`` = multi-channel, raise ChannelBusy instead of sleeping).
+        """
         if self._created:
             raise RuntimeError("Inbox already created")
 
+        if allow_wait is None:
+            raw = (os.environ.get("MAIL_CREATE_ALLOW_WAIT") or "1").strip().lower()
+            allow_wait = raw not in {"0", "false", "no", "off"}
+
         # Free tier: pace creates process-wide so -t N ≈ free max without 429.
         if not (self.api_key or "").strip():
-            _pace_free_create()
+            _pace_free_create(block=bool(allow_wait))
 
         payload: dict = {}
         if self.prefix:
@@ -139,19 +170,33 @@ class TempmailInbox:
                     proxies=self._proxies(),
                 )
                 if resp.status_code == 429:
-                    last_err = RuntimeError(f"Tempmail.lol rate limited: {resp.text[:200]}")
+                    last_err = RuntimeError(
+                        f"Tempmail.lol rate limited: {resp.text[:200]}"
+                    )
+                    # Multi-channel: fail over immediately; single-channel backoff.
+                    if not allow_wait:
+                        from xconsole_client.mail_channels import ChannelBusy
+
+                        raise ChannelBusy(
+                            "tempmail",
+                            retry_after=8.0 + attempt * 4.0,
+                            reason="http-429",
+                        )
                     time.sleep(5 + attempt * 3)
                     continue
                 if resp.status_code not in (200, 201):
                     raise RuntimeError(
-                        f"Tempmail.lol create inbox failed: {resp.status_code} {resp.text[:300]}"
+                        f"Tempmail.lol create inbox failed: "
+                        f"{resp.status_code} {resp.text[:300]}"
                     )
 
                 data = resp.json() if resp.content else {}
                 address = str(data.get("address") or data.get("email") or "").strip()
                 token = str(data.get("token") or "").strip()
                 if not address or not token:
-                    raise RuntimeError(f"Tempmail.lol create missing address/token: {data}")
+                    raise RuntimeError(
+                        f"Tempmail.lol create missing address/token: {data}"
+                    )
 
                 self.address = address
                 self.token = token
@@ -161,10 +206,17 @@ class TempmailInbox:
                     print(f"  [Tempmail] inbox created: {self.address}")
 
                 return self.address
-            except (requests.RequestException, RuntimeError, ValueError) as exc:
-                last_err = exc
+            except Exception as exc:
+                # Re-raise ChannelBusy for router fail-over (no local retry storm).
+                from xconsole_client.mail_channels import ChannelBusy
+
+                if isinstance(exc, ChannelBusy):
+                    raise
+                last_err = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
                 if self.debug:
                     print(f"  [Tempmail] create attempt {attempt + 1}/4 failed: {exc}")
+                if not allow_wait and attempt >= 1:
+                    raise
                 time.sleep(1.5 + attempt)
 
         raise RuntimeError(f"Tempmail.lol create failed after retries: {last_err}")

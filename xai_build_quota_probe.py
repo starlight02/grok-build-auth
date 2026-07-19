@@ -21,7 +21,14 @@ from urllib.parse import urljoin
 
 import requests
 
-from check_accounts import CHAT_ENDPOINT_DENIED, is_chat_endpoint_denied
+from check_accounts import (
+    BUILD_USAGE_BALANCE_EXHAUSTED,
+    CHAT_ENDPOINT_DENIED,
+    SPENDING_LIMIT_EXHAUSTED,
+    is_build_usage_balance_exhausted,
+    is_chat_endpoint_denied,
+    is_spending_limit_exhausted,
+)
 
 
 DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
@@ -127,6 +134,15 @@ def summarize_response(resp: requests.Response) -> dict[str, Any]:
         if is_chat_endpoint_denied(resp.status_code, body=body_text, error=out.get("error")):
             out["code"] = CHAT_ENDPOINT_DENIED
             out["chat_endpoint_denied"] = True
+        elif is_build_usage_balance_exhausted(
+            resp.status_code, body=body_text, error=out.get("error")
+        ):
+            out["code"] = BUILD_USAGE_BALANCE_EXHAUSTED
+            out.setdefault("remaining_tokens", 0)
+        elif is_spending_limit_exhausted(
+            resp.status_code, body=body_text, error=out.get("error")
+        ):
+            out["code"] = SPENDING_LIMIT_EXHAUSTED
         return out
 
     err_obj: Any = None
@@ -150,14 +166,30 @@ def summarize_response(resp: requests.Response) -> dict[str, Any]:
         if isinstance(raw_code, str) and raw_code.strip():
             top_code = raw_code.strip()
 
+    err_for_match = err_obj if err_obj is not None else out.get("error")
     if is_chat_endpoint_denied(
         resp.status_code,
         body=body_text,
-        error=err_obj if err_obj is not None else out.get("error"),
+        error=err_for_match,
         code=top_code,
     ):
         out["code"] = CHAT_ENDPOINT_DENIED
         out["chat_endpoint_denied"] = True
+    elif is_build_usage_balance_exhausted(
+        resp.status_code,
+        body=body_text,
+        error=err_for_match,
+        code=top_code,
+    ):
+        out["code"] = BUILD_USAGE_BALANCE_EXHAUSTED
+        out.setdefault("remaining_tokens", 0)
+    elif is_spending_limit_exhausted(
+        resp.status_code,
+        body=body_text,
+        error=err_for_match,
+        code=top_code,
+    ):
+        out["code"] = SPENDING_LIMIT_EXHAUSTED
     return out
 
 

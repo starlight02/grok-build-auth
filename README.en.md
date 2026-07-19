@@ -8,7 +8,7 @@ A **protocol-research client** for publicly observable **x.ai / Grok web authent
 
 for protocol analysis, interoperability research, and **authorized** local integration testing.
 
-Default path: signup/OAuth over pure HTTP (`curl_cffi`). Signup Turnstile uses a local browser backend (`auto`→Drission+turnstilePatch; optional Camoufox / Playwright) with a **background token pool on by default** (depth/minters auto-scale with `-t`). Mailbox defaults to Tempmail free (steady state around `-t 4`). OAuth: protocol session-reuse, Device Flow fallback.
+Default path: signup/OAuth over pure HTTP (`curl_cffi`). Turnstile **token pool on by default**. Mailbox: **pluggable multi-channel registry + background mail pool on by default** (`-e auto` enables every configured channel — prefer high-RPM sources, overflow on rate limits; single channel → solo). OAuth: protocol session-reuse, Device Flow fallback.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
@@ -55,7 +55,8 @@ Highlights:
 
 - **Protocol-first** pure HTTP (`curl_cffi`) for signup / OAuth
 - **Turnstile pool**: background mint, signup threads only consume; **on by default**; demand-driven (stop when stock covers demand)
-- **Auto-tune from `-t`**: pool size / mint concurrency scale with registration threads (env can pin values)
+- **Mail pool + multi-channel**: pluggable `mail_channels` registry; background inbox create; **prefer + overflow** (tempmail keeps its RPM; yyds/CF fill gaps — not a full switch on rate limit)
+- **Auto-tune from `-t`**: token/mail pool size & minters scale with registration threads (env can pin values)
 - **OAuth dual path**: SSO session-reuse (`oauth_protocol`); Device Flow fallback (`sso2auth`)
 - **Lean outputs**: default writes `sso_output/` + `cliproxyapi_auth/`
 
@@ -66,15 +67,36 @@ CPA export needs OAuth `access_token` / `refresh_token` (protocol path or Device
 ## Architecture
 
 ```mermaid
-flowchart LR
-    A[run.py<br/>-n / -t] --> P[Turnstile pool<br/>turnstile_pool]
-    P -->|mint| S[browser backend<br/>drission / camoufox / browser]
-    A --> B[signup client.py<br/>mail code + consume token]
-    P -->|token| B
-    B --> C[SSO sso.py]
-    C --> D{OAuth fast path<br/>oauth_protocol<br/>SSO session-reuse}
+flowchart TB
+    subgraph entry [run.py]
+      A["-n / -t / -e auto|channel"]
+    end
+
+    subgraph pools [Background pools default on]
+      TP[TurnstileTokenPool<br/>turnstile_pool]
+      MP[MailboxPool<br/>mailbox_pool]
+      R[ChannelRouter<br/>mail_channels]
+      MP --> R
+      R -->|prefer| TM[tempmail]
+      R -->|overflow| YY[yyds]
+      R -->|overflow| CF[cloudflare]
+      R -.->|register_channel| X[future channels…]
+    end
+
+    subgraph browser [Turnstile browser backends]
+      S[drission / camoufox / browser]
+    end
+
+    A --> TP
+    A --> MP
+    TP -->|mint| S
+    A --> B[signup client.py]
+    TP -->|token| B
+    MP -->|Mailbox email+receiver+channel| B
+    B --> C[SSO sso_output]
+    C --> D{OAuth fast path<br/>oauth_protocol}
     D -->|OK| E[token exchange]
-    D -->|fail| F[sso2auth<br/>Device Flow]
+    D -->|fail| F[sso2auth Device Flow]
     F --> E
     E --> G[cliproxyapi_auth/*.json]
 ```
@@ -87,7 +109,7 @@ This is **not** a zero-config product. At minimum you need:
 
 - Python 3.9+
 - Turnstile: local browser backend (default Drission + headed Chrome; optional Camoufox / Playwright)
-- Mailbox: Tempmail.lol **free tier (no API key)** by default; optional Plus/Ultra key or your Cloudflare D1 alias mailbox
+- Mailbox: default `-e auto` — **all configured** channels (tempmail always; yyds/cloudflare when credentials exist); or force one with `-e tempmail|yyds|cloudflare`
 - Optional HTTP(S) proxy
 - Optional local CLIProxyAPI install to load exported auth files
 
@@ -134,9 +156,18 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 | `TURNSTILE_BROWSER_REUSE` | no | `1` = warm browser reuse (default 1; drission warm-page) |
 | `TEMPMAIL_API_KEY` | no | Tempmail.lol Plus/Ultra (**free tier needs no key**) |
 | `TEMPMAIL_FREE_CREATE_INTERVAL` | no | free-tier create min interval seconds (default **3 ≈ 20/min**) |
+| `YYDS_API_KEY` / `YYDS_JWT` | no | YYDS mailbox (either; included by `-e auto` when set) |
+| `YYDS_API_BASE` | no | default `https://maliapi.215.im/v1` |
+| `YYDS_DOMAINS` | no | domain allow-list (empty = **all verified**, domain-level LB) |
+| `MAIL_BACKENDS` | no | explicit channel list, overrides `-e auto` (e.g. `tempmail,yyds`) |
+| `MAIL_CHANNEL_WEIGHTS` | no | preference, e.g. `tempmail:100,yyds:40,cloudflare:60` |
+| `MAIL_CHANNEL_CAPACITY` | no | max concurrent creates per channel before overflow |
+| `MAIL_POOL` | no | background inbox pool (**on by default**; `0` off) |
+| `MAIL_POOL_SIZE` / `_TARGET` / `_MINTERS` | no | same semantics as turnstile pool (auto from `-t`) |
+| `MAIL_POOL_MAX_AGE` | no | max age of pooled inboxes in seconds (default 600) |
 | `MAIL_CODE_TIMEOUT` | no | seconds to wait for code before rotating inbox (default 30) |
 | `MAIL_MAX_ATTEMPTS` | no | max fresh inboxes when mail is silent (default 3) |
-| `CLOUDFLARE_API_TOKEN` | for `-e cloudflare` | CF API token |
+| `CLOUDFLARE_API_TOKEN` | for `-e cloudflare` / auto-detect | CF API token |
 | `CLOUDFLARE_ACCOUNT_ID` | same | CF account |
 | `CLOUDFLARE_D1_DB_ID` | same | D1 database ID |
 | `ALIAS_MAIL_DOMAINS` | same | domains you control (comma-separated) |
@@ -152,35 +183,48 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 ### Run (research / accounts you own)
 
 ```bash
-# Zero-config batch: default -t 4 + token pool on + Tempmail free pacing
-# pool size/minters follow -t; mint pauses when stock is enough
+# Zero-config batch: -t 4 + token pool + mail pool + -e auto (prefer+overflow)
 python run.py -n 20
 
 # Single-account smoke
 python run.py -n 1
 
-# Change concurrency (pool auto-retunes; -t 8 → size=8 minters=2)
+# Concurrency (token/mail pools auto-retune; -t 8 → size=8 minters=2)
 python run.py -n 20 -t 8
 
-# Pin pool knobs (override auto)
+# Force a single channel (solo: may block on wait/retry)
+python run.py -n 10 -e yyds
+python run.py -n 10 -e tempmail
+python run.py -n 1 -e cloudflare
+
+# Explicit multi-channel list
+MAIL_BACKENDS=tempmail,yyds python run.py -n 20 -t 8
+
+# Weights / capacity (prefer tempmail; overflow when slots full)
+MAIL_CHANNEL_WEIGHTS=tempmail:100,yyds:40 MAIL_CHANNEL_CAPACITY=tempmail:3,yyds:2 \
+  python run.py -n 20 -t 8
+
+# Disable mail pool (create at register time; router still works)
+MAIL_POOL=0 python run.py -n 4 -t 2
+
+# Pin token pool knobs
 TURNSTILE_POOL_SIZE=6 TURNSTILE_POOL_MINTERS=2 python run.py -n 20 -t 4
 
-# Disable pool (per-thread mint; PARALLEL defaults to -t)
+# Disable token pool
 TURNSTILE_POOL=0 python run.py -n 4 -t 2
 
-# Pick a Turnstile backend
+# Turnstile backends
 TURNSTILE_SOLVER=drission python run.py -n 10 -t 4
 TURNSTILE_SOLVER=camoufox python run.py -n 1
 TURNSTILE_SOLVER=browser  python run.py -n 1
 
-# Proxy pool file: one URL per line → probe exit country → rotate in PROXY_REGION
+# Proxy pool file
 PROXY_POOL_FILE=./proxies.txt PROXY_REGION=us python run.py -n 10 -t 4
 
-# Pause mint / HID clicks while you use the machine
-touch /tmp/grok-turnstile.pause   # pause
-rm    /tmp/grok-turnstile.pause   # resume
+# Pause mint / HID clicks
+touch /tmp/grok-turnstile.pause
+rm    /tmp/grok-turnstile.pause
 
-python run.py -n 1 -e cloudflare
 python run.py -n 1 --no-oauth
 python run.py -n 1 --no-oauth-protocol
 python run.py -n 1 --cliproxyapi-auth-dir /path/to/CLIProxyAPI/data/auth
@@ -249,16 +293,66 @@ Explicit `TURNSTILE_POOL_SIZE` / `_TARGET` / `_MINTERS` / `TURNSTILE_PARALLEL` w
 - CLI default **`-t 4`** targets free-tier steady throughput
 - Without `TEMPMAIL_API_KEY`, inbox `create` is paced at **3s** (≈20/min) process-wide
 - Plus/Ultra key skips free create pacing; raise `-t` if needed
+- **Multi-channel**: free pacing / 429 only blocks tempmail *for that slot*; yyds/etc. overflow immediately; tempmail is preferred again when ready (not a full switch)
 
 ### How to read startup logs
 
 ```text
-grok-build-auth: 20 accounts, 4 threads, ... turnstile=auto, pool=on
-  turnstile-pool: size=4 target=2 minters=1 max_age=200s (auto from -t=4)
+grok-build-auth: 20 accounts, 4 threads, email=auto, ... pool=on, mail-pool=on
+  mail-channels:        tempmail,yyds (prefer+overflow; weights via MAIL_CHANNEL_WEIGHTS)
+  turnstile-pool:       size=4 target=2 minters=1 max_age=200s (auto from -t=4)
+  mail-pool:            size=4 target=2 minters=1 max_age=600s (auto from -t=4)
   [ts-pool] pool +1 len=837 q=1/4 want=2 wait=0
-  [ts-pool] pool mint pause (satisfied q=2/4 want=2 waiting=0)
+  [mail-pool] mail pool +1 [tempmail] xai…@… q=2/4
+  [mail] mail channel tempmail rate: … (next_slot≈3.0s; overflow/retry)
+  [mail] mail create via yyds: xai…@…
+  [3/20] [#2] email [yyds]: xai…@…
   [3/20] [#2] Turnstile 837 chars from pool (age=6s q=1)
 ```
+
+---
+
+## Mail pool & multi-channel (default)
+
+Signup threads **only consume** ready `Mailbox(email, receiver, channel)` objects; background minters create via the channel router. On by default, warming in parallel with the Turnstile pool.
+
+### Channel registry (extensible)
+
+| Channel | Default weight | Available when | Notes |
+|---|---|---|---|
+| **tempmail** | 100 | always (free or `TEMPMAIL_API_KEY`) | usually highest create RPM; preferred |
+| **yyds** | 40 | `YYDS_API_KEY` or `YYDS_JWT` | overflow / top-up; domain-level LB |
+| **cloudflare** | 60 | `CLOUDFLARE_*` + `ALIAS_MAIL_DOMAINS` | self-hosted D1 alias mail |
+| **custom** | yours | `configured()` | `register_channel(ChannelSpec(...))` — auto picks up in CLI/`auto` |
+
+```python
+from xconsole_client.mail_channels import ChannelSpec, register_channel
+
+register_channel(ChannelSpec(
+    name="mymail",
+    weight=55,
+    capacity=2,
+    configured=lambda: bool(os.environ.get("MYMAIL_KEY")),
+    create=lambda: (email, receiver),  # receiver.wait_for_code(timeout=…)
+))
+```
+
+### Solo vs multi
+
+| Mode | When | Behavior |
+|---|---|---|
+| **Solo** | exactly one resolved channel (`-e yyds`, single backend, or `MAIL_BACKENDS=yyds`) | may block on wait/retry (legacy single-backend path) |
+| **Multi** | `-e auto` with ≥2 available | **prefer + overflow**: use high-weight when a slot is free; rate limits only delay *that* slot, other ready channels fill immediately |
+
+### Pool knobs (from `-t`)
+
+| Param | Auto rule | Env |
+|---|---|---|
+| size | `clamp(-t, 2..32)` | `MAIL_POOL_SIZE` |
+| target | `min(2, size)` | `MAIL_POOL_TARGET` |
+| minters | `ceil(-t/4)` cap 4 | `MAIL_POOL_MINTERS` |
+| max_age | 600s | `MAIL_POOL_MAX_AGE` |
+| enable | on by default | `MAIL_POOL=0` to disable |
 
 ---
 
