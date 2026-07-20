@@ -19,6 +19,7 @@ frame(s) followed by exactly one trailer frame.
 Only the protobuf wire types we actually observe are implemented:
   0 = varint, 1 = fixed64, 2 = length-delimited (string/bytes/sub-msg), 5 = fixed32.
 """
+
 from __future__ import annotations
 
 import struct
@@ -61,10 +62,6 @@ def encode_string(field_no: int, text: str) -> bytes:
 def encode_bytes(field_no: int, raw: bytes) -> bytes:
     """Encode a length-delimited bytes / nested-message field."""
     return _tag(field_no, WT_LEN) + encode_varint(len(raw)) + raw
-
-
-def encode_varint_field(field_no: int, value: int) -> bytes:
-    return _tag(field_no, WT_VARINT) + encode_varint(value)
 
 
 def encode_message(fields: List[Tuple[int, str]]) -> bytes:
@@ -111,13 +108,20 @@ def decode_message(data: bytes) -> List[Dict[str, Any]]:
             val, i = _read_varint(data, i)
             fields.append({"field": field_no, "type": "varint", "value": val})
         elif wt == WT_FIXED64:
-            chunk = data[i:i + 8]; i += 8
-            fields.append({"field": field_no, "type": "fixed64",
-                           "double": struct.unpack("<d", chunk)[0] if len(chunk) == 8 else None,
-                           "hex": chunk.hex()})
+            chunk = data[i : i + 8]
+            i += 8
+            fields.append(
+                {
+                    "field": field_no,
+                    "type": "fixed64",
+                    "double": struct.unpack("<d", chunk)[0] if len(chunk) == 8 else None,
+                    "hex": chunk.hex(),
+                }
+            )
         elif wt == WT_LEN:
             ln, i = _read_varint(data, i)
-            chunk = data[i:i + ln]; i += ln
+            chunk = data[i : i + ln]
+            i += ln
             try:
                 s = chunk.decode("utf-8")
                 if s.isprintable():
@@ -127,11 +131,17 @@ def decode_message(data: bytes) -> List[Dict[str, Any]]:
                 pass
             fields.append({"field": field_no, "type": "bytes", "hex": chunk.hex(), "len": ln})
         elif wt == WT_FIXED32:
-            chunk = data[i:i + 4]; i += 4
-            fields.append({"field": field_no, "type": "fixed32",
-                           "float": struct.unpack("<f", chunk)[0] if len(chunk) == 4 else None,
-                           "uint": struct.unpack("<I", chunk)[0] if len(chunk) == 4 else None,
-                           "hex": chunk.hex()})
+            chunk = data[i : i + 4]
+            i += 4
+            fields.append(
+                {
+                    "field": field_no,
+                    "type": "fixed32",
+                    "float": struct.unpack("<f", chunk)[0] if len(chunk) == 4 else None,
+                    "uint": struct.unpack("<I", chunk)[0] if len(chunk) == 4 else None,
+                    "hex": chunk.hex(),
+                }
+            )
         else:
             raise ValueError(f"unsupported wire type {wt} at offset {i}")
     return fields
@@ -156,8 +166,8 @@ def parse_response(body: bytes) -> Dict[str, Any]:
     n = len(body)
     while i + 5 <= n:
         flag = body[i]
-        length = struct.unpack(">I", body[i + 1:i + 5])[0]
-        payload = body[i + 5:i + 5 + length]
+        length = struct.unpack(">I", body[i + 1 : i + 5])[0]
+        payload = body[i + 5 : i + 5 + length]
         i += 5 + length
         if flag & 0x80:  # trailer frame
             for line in payload.decode("utf-8", "replace").split("\r\n"):

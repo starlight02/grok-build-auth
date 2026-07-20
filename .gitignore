@@ -45,6 +45,9 @@ logs/
 !docs/**/*.png
 oauth_retry_list.json
 quota_sample*.txt
+# scratch email/token dumps produced by run.py --sso-only etc.
+tmp_*.txt
+*_sso_only_emails.txt
 .ruff_cache/
 
 # OS / editor

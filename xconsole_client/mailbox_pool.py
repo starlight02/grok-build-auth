@@ -9,6 +9,7 @@ Each pooled item records ``channel`` (tempmail | yyds | cloudflare). Producers
 use ``ChannelRouter`` so free-tier / 429 on one backend fail over immediately
 to another configured backend — never dead-wait on a single source.
 """
+
 from __future__ import annotations
 
 import os
@@ -71,10 +72,6 @@ def suggest_mail_pool_params(reg_threads: int) -> Tuple[int, int, int]:
     return size, target, minters
 
 
-# Backward-compatible name.
-PooledInbox = Mailbox
-
-
 class MailboxPool:
     """Producer/consumer pool of pre-created multi-channel inboxes."""
 
@@ -89,9 +86,7 @@ class MailboxPool:
         log: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._source = source
-        self._size = int(
-            size if size is not None else _env_int("MAIL_POOL_SIZE", 4, lo=1, hi=32)
-        )
+        self._size = int(size if size is not None else _env_int("MAIL_POOL_SIZE", 4, lo=1, hi=32))
         self._max_age = float(
             max_age
             if max_age is not None
@@ -170,9 +165,11 @@ class MailboxPool:
         by = ""
         with self._stats_lock:
             if self._by_channel:
-                by = " by={" + ",".join(
-                    f"{k}:{v}" for k, v in sorted(self._by_channel.items())
-                ) + "}"
+                by = (
+                    " by={"
+                    + ",".join(f"{k}:{v}" for k, v in sorted(self._by_channel.items()))
+                    + "}"
+                )
         r = self.router()
         health = f" health=[{r.summary()}]" if r is not None else ""
         self._log(
@@ -203,8 +200,7 @@ class MailboxPool:
                     with self._stats_lock:
                         self._discarded += 1
                     self._log(
-                        f"mail pool discard stale age={item.age:.0f}s "
-                        f"[{item.channel}] {item.email}"
+                        f"mail pool discard stale age={item.age:.0f}s [{item.channel}] {item.email}"
                     )
                     continue
                 with self._stats_lock:
