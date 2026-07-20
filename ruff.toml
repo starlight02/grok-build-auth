@@ -1,0 +1,15 @@
+# Ruff config for grok-build-auth.
+# Formatter + linter are paired: `ruff format` owns layout, `ruff check` owns correctness.
+target-version = "py311"
+line-length = 100
+
+[lint]
+# Default selection (F + E4/E7/E9 + W) — correctness, not cosmetic line length.
+# E501 is intentionally NOT enabled: the formatter leaves long string/comment
+# literals unwrapped by design, so line-length would false-fail the gate.
+ignore = [
+    # run.py imports follow a `sys.path.insert(_ROOT)` bootstrap and dotenv load;
+    # a few modules register atexit handlers after the functions they reference.
+    # These module-level imports are intentionally not at file top.
+    "E402",
+]

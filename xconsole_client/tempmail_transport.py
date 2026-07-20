@@ -13,6 +13,9 @@ An Email object: { from, to, subject, body, html, date (unix ms) }.
 Free tier needs no API key (https://github.com/tempmail-lol/api-python README).
 TEMPMAIL_API_KEY is only for Plus/Ultra / higher rate limits.
 
+Without a key, create() is process-wide paced (TEMPMAIL_FREE_CREATE_INTERVAL,
+default 3s ≈ 20/min) so bulk -t N stays near free-tier max without 429 storms.
+
 Usage:
     from xconsole_client.tempmail_transport import TempmailInbox
     inbox = TempmailInbox(prefix="xai")  # free tier
@@ -20,18 +23,73 @@ Usage:
     # ... send email to address ...
     code = inbox.wait_for_code(timeout=90)
 """
+
 from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Optional
 
 import requests
 
 
 BASE_URL = "https://api.tempmail.lol"
+
+# Free-tier create pacing (no API key). Plus/Ultra skip this.
+_free_create_lock = threading.Lock()
+_free_create_next = 0.0
+
+
+def _free_create_interval() -> float:
+    raw = (os.environ.get("TEMPMAIL_FREE_CREATE_INTERVAL") or "").strip()
+    if not raw:
+        return 3.0
+    try:
+        return max(0.0, min(float(raw), 60.0))
+    except ValueError:
+        return 3.0
+
+
+def free_create_ready_in() -> float:
+    """Seconds until free-tier create slot is free (0 if ready / paid key)."""
+    if (os.environ.get("TEMPMAIL_API_KEY") or "").strip():
+        return 0.0
+    interval = _free_create_interval()
+    if interval <= 0:
+        return 0.0
+    with _free_create_lock:
+        return max(0.0, _free_create_next - time.time())
+
+
+def _pace_free_create(*, block: bool = True) -> None:
+    """Serialize free-tier inbox creates to free max steady rate.
+
+    When ``block=False`` (multi-channel mode), raises immediately if the slot
+    is not free so the router can fail over to yyds/cloudflare without waiting.
+    """
+    global _free_create_next
+    interval = _free_create_interval()
+    if interval <= 0:
+        return
+    while True:
+        with _free_create_lock:
+            now = time.time()
+            wait = _free_create_next - now
+            if wait <= 0:
+                _free_create_next = now + interval
+                return
+            if not block:
+                from xconsole_client.mail_channels import ChannelBusy
+
+                raise ChannelBusy(
+                    "tempmail",
+                    retry_after=wait,
+                    reason="free-tier pacing",
+                )
+        time.sleep(wait)
 
 
 @dataclass
@@ -82,10 +140,22 @@ class TempmailInbox:
             headers["Authorization"] = f"Bearer {key}"
         return headers
 
-    def create(self) -> str:
-        """Create a new inbox. Returns the email address."""
+    def create(self, *, allow_wait: Optional[bool] = None) -> str:
+        """Create a new inbox. Returns the email address.
+
+        ``allow_wait``: free-tier pacing. Default reads MAIL_CREATE_ALLOW_WAIT
+        (``0`` = multi-channel, raise ChannelBusy instead of sleeping).
+        """
         if self._created:
             raise RuntimeError("Inbox already created")
+
+        if allow_wait is None:
+            raw = (os.environ.get("MAIL_CREATE_ALLOW_WAIT") or "1").strip().lower()
+            allow_wait = raw not in {"0", "false", "no", "off"}
+
+        # Free tier: pace creates process-wide so -t N ≈ free max without 429.
+        if not (self.api_key or "").strip():
+            _pace_free_create(block=bool(allow_wait))
 
         payload: dict = {}
         if self.prefix:
@@ -103,6 +173,15 @@ class TempmailInbox:
                 )
                 if resp.status_code == 429:
                     last_err = RuntimeError(f"Tempmail.lol rate limited: {resp.text[:200]}")
+                    # Multi-channel: fail over immediately; single-channel backoff.
+                    if not allow_wait:
+                        from xconsole_client.mail_channels import ChannelBusy
+
+                        raise ChannelBusy(
+                            "tempmail",
+                            retry_after=8.0 + attempt * 4.0,
+                            reason="http-429",
+                        )
                     time.sleep(5 + attempt * 3)
                     continue
                 if resp.status_code not in (200, 201):
@@ -124,10 +203,17 @@ class TempmailInbox:
                     print(f"  [Tempmail] inbox created: {self.address}")
 
                 return self.address
-            except (requests.RequestException, RuntimeError, ValueError) as exc:
-                last_err = exc
+            except Exception as exc:
+                # Re-raise ChannelBusy for router fail-over (no local retry storm).
+                from xconsole_client.mail_channels import ChannelBusy
+
+                if isinstance(exc, ChannelBusy):
+                    raise
+                last_err = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
                 if self.debug:
                     print(f"  [Tempmail] create attempt {attempt + 1}/4 failed: {exc}")
+                if not allow_wait and attempt >= 1:
+                    raise
                 time.sleep(1.5 + attempt)
 
         raise RuntimeError(f"Tempmail.lol create failed after retries: {last_err}")
@@ -201,16 +287,18 @@ class TempmailInbox:
             emails = self.get_emails(budget=min(8.0, remaining))
             for email in emails:
                 # Use from+subject+date as a dedup key
-                eid = f"{email.get('from','')}:{email.get('subject','')}:{email.get('date','')}"
+                eid = f"{email.get('from', '')}:{email.get('subject', '')}:{email.get('date', '')}"
                 if eid in seen_ids:
                     continue
                 seen_ids.add(eid)
 
-                text = " ".join([
-                    email.get("subject", "") or "",
-                    email.get("body", "") or "",
-                    email.get("from", "") or "",
-                ])
+                text = " ".join(
+                    [
+                        email.get("subject", "") or "",
+                        email.get("body", "") or "",
+                        email.get("from", "") or "",
+                    ]
+                )
                 code = _extract_code(text)
                 if code:
                     if self.debug:
@@ -241,12 +329,8 @@ _CODE_PATTERNS = (
     # x.ai legacy format: 6 uppercase alphanumeric, no dash (e.g. "XAI0X1")
     re.compile(r"(?<![A-Z0-9])([A-Z0-9]{6})(?![A-Z0-9])"),
     # keyword-anchored fallbacks
-    re.compile(
-        r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{3}-[A-Z0-9]{3})"
-    ),
-    re.compile(
-        r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{6})"
-    ),
+    re.compile(r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{3}-[A-Z0-9]{3})"),
+    re.compile(r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{6})"),
 )
 
 

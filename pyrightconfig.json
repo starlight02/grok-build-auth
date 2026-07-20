@@ -1,0 +1,24 @@
+{
+  "include": [
+    "run.py",
+    "check_accounts.py",
+    "xai_build_quota_probe.py",
+    "retry_oauth_from_sso.py",
+    "xai_oauth_export_cliproxyapi.py",
+    "xai_oauth_login.py",
+    "alias_mail",
+    "xconsole_client"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "**/.ruff_cache",
+    "logs",
+    "tmp",
+    "sso_output"
+  ],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "reportAttributeAccessIssue": "warning"
+}

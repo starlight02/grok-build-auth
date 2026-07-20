@@ -62,9 +62,10 @@
     }
 
     function autoClickTurnstile() {
-        // 定时检查 Turnstile iframe 是否出现
+        // Cross-origin: cannot open iframe DOM. Click the iframe box from the parent page.
         var checkCount = 0;
-        var maxChecks = 100; // 最多检查 100 次（约 50 秒）
+        var maxChecks = 120; // ~60s
+        var lastClickAt = 0;
         var timer = setInterval(function () {
             checkCount++;
             if (checkCount > maxChecks) {
@@ -72,41 +73,46 @@
                 return;
             }
             try {
-                // 查找 Turnstile iframe
-                var iframes = document.querySelectorAll(
-                    'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
-                );
-                for (var i = 0; i < iframes.length; i++) {
-                    var iframe = iframes[i];
-                    try {
-                        // 尝试访问 iframe 内部的 checkbox
-                        var body = iframe.contentDocument || iframe.contentWindow.document;
-                        var checkbox = body.querySelector(
-                            'input[type="checkbox"], .mark, #cf-chl-widget-nomu1_resp'
-                        );
-                        if (checkbox && !checkbox.checked) {
-                            checkbox.click();
-                        }
-                    } catch (e) {
-                        // 跨域限制，尝试通过 postMessage 触发
-                        try {
-                            iframe.contentWindow.postMessage(
-                                { type: "turnstile-auto-click" },
-                                "*"
-                            );
-                        } catch (e2) {}
-                    }
-                }
-
-                // 也尝试直接操作 Turnstile API
                 if (
                     window.turnstile &&
                     typeof window.turnstile.getResponse === "function"
                 ) {
                     var resp = window.turnstile.getResponse();
-                    if (resp && resp.length > 0) {
-                        clearInterval(timer); // 已获得 token，停止检查
+                    if (resp && String(resp).length >= 80) {
+                        clearInterval(timer);
+                        return;
                     }
+                }
+                var now = Date.now();
+                if (now - lastClickAt < 1500) return;
+
+                var nodes = document.querySelectorAll(
+                    'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], #xai-force-ts-host iframe, .cf-turnstile iframe, .cf-turnstile'
+                );
+                for (var i = 0; i < nodes.length; i++) {
+                    var el = nodes[i];
+                    var r = el.getBoundingClientRect();
+                    if (r.width < 20 || r.height < 20) continue;
+                    // Checkbox sits on the left of the managed widget.
+                    var x = r.left + Math.min(28, Math.max(18, r.width * 0.1));
+                    var y = r.top + r.height * 0.5;
+                    var target = document.elementFromPoint(x, y) || el;
+                    ["mouseover", "mouseenter", "mousemove", "mousedown", "mouseup", "click"].forEach(function (type) {
+                        try {
+                            target.dispatchEvent(
+                                new MouseEvent(type, {
+                                    bubbles: true,
+                                    cancelable: true,
+                                    view: window,
+                                    clientX: x,
+                                    clientY: y,
+                                    button: 0,
+                                })
+                            );
+                        } catch (e) {}
+                    });
+                    lastClickAt = now;
+                    break;
                 }
             } catch (e) {}
         }, 500);

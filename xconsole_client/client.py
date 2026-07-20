@@ -35,6 +35,7 @@ forged offline and must be obtained from a live browser/solver:
   * cf_clearance cookie (Cloudflare managed challenge)
 This client reproduces the wire format faithfully; it does not bypass those.
 """
+
 from __future__ import annotations
 
 import gzip
@@ -45,7 +46,7 @@ import re
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 from urllib.parse import quote
 
 from . import config as C
@@ -63,16 +64,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class _UrllibTransport:
-    def __init__(self, *, timeout: float, debug: bool):
+    def __init__(self, *, timeout: float, debug: bool, proxy: Optional[str] = None):
         self._timeout = timeout
         self._debug = debug
         self.cookies = http.cookiejar.CookieJar()
-        self._opener = urllib.request.build_opener(
+        handlers: List[Any] = [
             urllib.request.HTTPCookieProcessor(self.cookies),
             _NoRedirect(),
-        )
+        ]
+        proxy = (proxy or "").strip()
+        if proxy:
+            handlers.insert(0, urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        self._opener = urllib.request.build_opener(*handlers)
 
-    def request(self, method, url, *, headers, body=None):
+    def request(
+        self, method: str, url: str, *, headers: Dict[str, str], body: Optional[bytes] = None
+    ) -> Tuple[int, Dict[str, str], List[str], bytes]:
         req = urllib.request.Request(url, data=body, method=method)
         for k, v in headers.items():
             req.add_header(k, v)
@@ -80,7 +87,7 @@ class _UrllibTransport:
             resp = self._opener.open(req, timeout=self._timeout)
         except urllib.error.HTTPError as e:
             resp = e
-        status = resp.getcode()
+        status = int(resp.getcode() or 0)
         raw = resp.read()
         if resp.headers.get("content-encoding", "").lower() == "gzip" and raw[:2] == b"\x1f\x8b":
             try:
@@ -90,10 +97,25 @@ class _UrllibTransport:
         set_cookies = resp.headers.get_all("set-cookie") or []
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
         if self._debug:
-            print(f"  <- {status} {method} {url}  ({len(raw)} bytes, {len(set_cookies)} set-cookie, transport=urllib)")
+            print(
+                f"  <- {status} {method} {url}  ({len(raw)} bytes, {len(set_cookies)} set-cookie, transport=urllib)"
+            )
         return status, hdrs, set_cookies, raw
 
-    def close(self): pass
+    def close(self):
+        pass
+
+
+class Transport(Protocol):
+    """Structural contract shared by _UrllibTransport and FingerprintTransport."""
+
+    cookies: Any
+
+    def request(
+        self, method: str, url: str, *, headers: Dict[str, str], body: Optional[bytes] = None
+    ) -> Tuple[int, Dict[str, str], List[str], bytes]: ...
+
+    def close(self) -> None: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -102,48 +124,81 @@ class _UrllibTransport:
 class XConsoleAuthClient:
     GROK_HOME = "https://grok.com/"
 
+    # After a successful curl_cffi→urllib fallback, stick to urllib for this process.
+    _sticky_transport: Optional[str] = None
+    _t: Transport
+
     def __init__(
         self,
         *,
-        transport: str = "curl_cffi",
+        transport: str = "auto",
         impersonate: str = "chrome131",
         debug: bool = False,
         timeout: float = 30.0,
         proxy: Optional[str] = None,
         signup_url: Optional[str] = None,
     ):
-        if transport not in ("curl_cffi", "urllib"):
-            raise ValueError("transport must be 'curl_cffi' or 'urllib'")
-        self.debug = debug
-        self.timeout = timeout
-        # Per-instance signup URL avoids concurrent clobber of global C.SIGNUP_URL.
-        self.signup_url = signup_url or C.SIGNUP_URL
-        if transport == "curl_cffi":
-            # imported lazily so the package still loads without it
-            from .fingerprint import FingerprintTransport
-            self._t = FingerprintTransport(
-                impersonate=impersonate, timeout=timeout, debug=debug, proxy=proxy,
-            )
-            self.transport_name = f"curl_cffi(impersonate={impersonate})"
+        t = (transport or "auto").strip().lower()
+        if t not in ("auto", "curl_cffi", "urllib"):
+            raise ValueError("transport must be 'auto', 'curl_cffi', or 'urllib'")
+        self.debug = bool(debug)
+        self.timeout = float(timeout)
+        self.proxy = (proxy or "").strip() or None
+        self._impersonate = impersonate
+        self._transport_mode = t  # auto | curl_cffi | urllib
+        # Resolve initial backend.
+        if t == "auto":
+            sticky = type(self)._sticky_transport
+            initial = sticky if sticky in ("curl_cffi", "urllib") else "curl_cffi"
         else:
-            self._t = _UrllibTransport(timeout=timeout, debug=debug)
-            self.transport_name = "urllib"
+            initial = t
+        self._bind_transport(initial)
 
         # Dynamically scraped per-session — populated by load_signup_page().
+        self.signup_url = (signup_url or "").strip() or "https://accounts.x.ai/sign-up"
         self._next_action_id: Optional[str] = None
         self._next_router_state_tree: Optional[str] = None
         self._last_rsc_body: str = ""
         self._last_create_set_cookies: List[str] = []
 
-    def cookie_names(self) -> List[str]:
-        """Return a list of cookie names currently held by the underlying transport."""
-        c = self._t.cookies
-        if hasattr(c, "keys") and not hasattr(c, "_cookies"):
-            return list(c.keys())
-        return [ck.name for ck in c]
+    def _bind_transport(self, name: str) -> None:
+        """(Re)build the underlying HTTP backend. Drops cookies — call before scrape."""
+        name = (name or "").strip().lower()
+        if name not in ("curl_cffi", "urllib"):
+            raise ValueError(f"unknown transport backend: {name}")
+        old = getattr(self, "_t", None)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+        if name == "curl_cffi":
+            from .fingerprint import FingerprintTransport
+
+            self._t = FingerprintTransport(
+                impersonate=self._impersonate,
+                timeout=self.timeout,
+                debug=self.debug,
+                proxy=self.proxy,
+            )
+            self.transport_name = f"curl_cffi(impersonate={self._impersonate})"
+        else:
+            self._t = _UrllibTransport(timeout=self.timeout, debug=self.debug, proxy=self.proxy)
+            self.transport_name = "urllib"
+        self._backend = name
+
+    def switch_transport(self, name: str) -> None:
+        """Public: switch HTTP backend and clear scraped session state."""
+        self._bind_transport(name)
+        self._next_action_id = None
+        self._next_router_state_tree = None
+        self._last_rsc_body = ""
+        self._last_create_set_cookies = []
 
     # ----------------------------------------------------------------- transport wrappers
-    def _request(self, method, url, *, headers, body=None):
+    def _request(
+        self, method: str, url: str, *, headers: Dict[str, str], body: Optional[bytes] = None
+    ) -> Tuple[int, Dict[str, str], List[str], bytes]:
         return self._t.request(method, url, headers=headers, body=body)
 
     def _base_headers(self) -> Dict[str, str]:
@@ -157,39 +212,91 @@ class XConsoleAuthClient:
 
     def _grpc_headers(self, referer: str) -> Dict[str, str]:
         h = self._base_headers()
-        h.update({
-            "content-type": "application/grpc-web+proto",
-            "x-grpc-web": "1",
-            "x-user-agent": C.CONNECT_ES_VERSION,
-            "accept": "*/*",
-            "origin": C.ACCOUNTS_ORIGIN,
-            "referer": referer,
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-dest": "empty",
-        })
+        h.update(
+            {
+                "content-type": "application/grpc-web+proto",
+                "x-grpc-web": "1",
+                "x-user-agent": C.CONNECT_ES_VERSION,
+                "accept": "*/*",
+                "origin": C.ACCOUNTS_ORIGIN,
+                "referer": referer,
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
+            }
+        )
         return h
 
     # ----------------------------------------------------------------- entry
     def visit_home(self) -> int:
         h = self._base_headers()
-        h.update({"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                  "sec-fetch-site": "none", "sec-fetch-mode": "navigate",
-                  "sec-fetch-dest": "document", "upgrade-insecure-requests": "1"})
+        h.update(
+            {
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "sec-fetch-site": "none",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-dest": "document",
+                "upgrade-insecure-requests": "1",
+            }
+        )
         status, _, _, _ = self._request("GET", C.HOME_URL, headers=h)
         return status
 
     def load_signup_page(self) -> int:
         """GET the sign-up page AND scrape the current next-action / router-state-tree.
 
-        The scraped values are stored on the instance and used automatically by
-        ``create_account()``.  Calling this is REQUIRED before ``create_account()``
-        so the values are fresh.
+        With ``transport=auto`` (default): if curl_cffi hits a Cloudflare block /
+        challenge page, automatically rebuild the session on urllib and retry once.
         """
+        try:
+            return self._load_signup_page_once()
+        except RuntimeError as exc:
+            if not self._should_fallback_transport(exc):
+                raise
+            print(
+                f"  [transport] {self.transport_name} 被 Cloudflare 拦截 → 自动切换 urllib 重试",
+                flush=True,
+            )
+            self.switch_transport("urllib")
+            type(self)._sticky_transport = "urllib"
+            # Warm cookies on the new backend, then scrape again.
+            try:
+                self.visit_home()
+            except Exception:
+                pass
+            return self._load_signup_page_once()
+
+    def _should_fallback_transport(self, exc: BaseException) -> bool:
+        if self._transport_mode not in ("auto", "curl_cffi"):
+            return False
+        if getattr(self, "_backend", "") != "curl_cffi":
+            return False
+        msg = str(exc).lower()
+        needles = (
+            "cloudflare",
+            "cf 硬拦截",
+            "cf 挑战",
+            "cf 拦截",
+            "attention required",
+            "sorry, you have been blocked",
+            "just a moment",
+            "js challenge",
+            "ip 被",
+            "出口被",
+        )
+        return any(n in msg for n in needles)
+
+    def _load_signup_page_once(self) -> int:
         h = self._base_headers()
-        h.update({"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                  "sec-fetch-site": "same-site", "sec-fetch-mode": "navigate",
-                  "sec-fetch-dest": "document", "referer": "https://console.x.ai/"})
+        h.update(
+            {
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "sec-fetch-site": "same-site",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-dest": "document",
+                "referer": "https://console.x.ai/",
+            }
+        )
         status, _hdrs, _sc, raw = self._request("GET", self.signup_url, headers=h)
         html = raw.decode("utf-8", "replace")
 
@@ -201,50 +308,55 @@ class XConsoleAuthClient:
             raise
         except Exception as exc:
             raise RuntimeError(
-                "Could not scrape signup page metadata "
-                f"(next-action / router-state-tree). {exc}"
+                "注册页元数据抓取失败（next-action / router-state-tree）。"
+                f" 传输={self.transport_name}。原始错误: {exc}"
             ) from exc
 
         if self.debug:
-            print(f"  [scrape] next-action={self._next_action_id[:16]}... "
-                  f"({len(self._next_action_id or '')} chars)")
+            print(
+                f"  [scrape] next-action={(self._next_action_id or '')[:16]}... "
+                f"({len(self._next_action_id or '')} chars)"
+            )
             print(f"  [scrape] router-state-tree len={len(self._next_router_state_tree or '')}")
 
         return status
 
-
     @staticmethod
-    def _signup_html_problem(html: str) -> str:
-        """Explain why the signup HTML is not a usable Next.js document."""
+    def _signup_html_problem(html: str, *, transport_name: str = "") -> str:
+        """Explain why the signup HTML is not a usable Next.js document (中文可读)."""
         raw = html or ""
         text = re.sub(r"\s+", " ", raw).strip()
         low = text.lower()
         html_len = len(raw)
+        via = f" 当前HTTP通道={transport_name}。" if transport_name else ""
 
         if "just a moment" in low or "cf-browser-verification" in low or "cf-challenge" in low:
-            kind = "Cloudflare challenge / interstitial page"
-            hint = "IP or proxy is likely blocked; try another network/proxy."
-        elif "attention required" in low or "sorry, you have been blocked" in low:
-            kind = "Cloudflare block page"
-            hint = "IP or proxy is blocked; rotate IP/proxy and retry."
-        elif "enable javascript" in low and "cloudflare" in low:
-            kind = "Cloudflare JS challenge shell"
-            hint = "protocol scrape cannot pass this; use a clean IP/proxy."
-        elif html_len < 800:
-            kind = "too-short non-app HTML"
-            hint = "not the Next.js signup document (often a block/redirect body)."
-        else:
-            kind = "HTML without Next.js chunk scripts"
+            kind = "Cloudflare 挑战页（JS 验证壳，不是注册页）"
             hint = (
-                "page markup may have changed, or a WAF returned a full-page "
-                "substitute without /_next/static/chunks/*.js."
+                "协议层无法执行浏览器 JS 挑战。"
+                "可试：XCONSOLE_TRANSPORT=urllib，或换干净代理/出口 IP。"
             )
+        elif "attention required" in low or "sorry, you have been blocked" in low:
+            kind = "Cloudflare 硬拦截（封禁页，不是可点的验证码）"
+            hint = (
+                "出口 IP 被 CF 直接拉黑，和浏览器能否打开不是一回事。"
+                "默认会自动改用 urllib 重试；仍失败则换代理/IP。"
+            )
+        elif "enable javascript" in low and "cloudflare" in low:
+            kind = "Cloudflare JS 挑战壳"
+            hint = "协议 scrape 过不了 JS 挑战；换 urllib 或干净 IP。"
+        elif html_len < 800:
+            kind = "过短非应用 HTML"
+            hint = "多半是拦截/跳转体，不是 Next.js 注册文档。"
+        else:
+            kind = "HTML 里没有 Next.js chunk 脚本"
+            hint = "页面结构可能变了，或 WAF 返回了整页替身（缺少 /_next/static/chunks/*.js）。"
 
-        head = text[:160]
+        head = text[:120]
         return (
-            f"Signup page scrape failed: got {kind} (html_len={html_len}). "
-            f"{hint} Expected a Next.js document with "
-            f"/_next/static/chunks/*.js. html_head={head!r}"
+            f"注册页抓取失败：{kind}（html_len={html_len}）。{via}"
+            f"{hint} 需要含 /_next/static/chunks/*.js 的 Next.js 文档。"
+            f" html_head={head!r}"
         )
 
     # ----------------------------------------------------------------- dynamic action scraper
@@ -282,9 +394,9 @@ class XConsoleAuthClient:
                     depth = 0
                     tree_end = 0
                     for i, ch in enumerate(flight_seg):
-                        if ch == '[':
+                        if ch == "[":
                             depth += 1
-                        elif ch == ']':
+                        elif ch == "]":
                             depth -= 1
                             if depth == 0:
                                 tree_end = i + 1
@@ -310,7 +422,7 @@ class XConsoleAuthClient:
             mt = re.search(
                 r'\[""\s*,\s*\{[^}]*"children":[^]]*"\(app\)"[^]]*"\(auth\)"[^]]*"sign-up"[^\]]*\]'
                 r'[^]]*\][^]]*\]\s*,\s*"\$undefined"\s*,\s*"\$undefined"\s*,\s*16\]',
-                rsc_full
+                rsc_full,
             )
             if mt:
                 router_tree = mt.group(0)
@@ -331,12 +443,12 @@ class XConsoleAuthClient:
     # Chunks that are likely to contain the action ID (from the RSC flight data).
     # We search these first; the sign-up action chunk has field-name keywords.
     _PRIORITY_CHUNK_PATTERNS = [
-        r'06rqcsyrqa6v-',   # sign-up action (contains createUserAndSessionRequest)
-        r'0ewiyh8jhugm9',   # actionId dispatch / extractInfoFromServerReferenceId
-        r'0j2vdu-bdg~mi',   # had a 42-char hex in diagnostics
-        r'0mjo1a97a5yaq',   # component registration, large chunk
-        r'0vlulu7bwpnvs',   # component registration
-        r'0\.k--fzd9bco3',  # component registration
+        r"06rqcsyrqa6v-",  # sign-up action (contains createUserAndSessionRequest)
+        r"0ewiyh8jhugm9",  # actionId dispatch / extractInfoFromServerReferenceId
+        r"0j2vdu-bdg~mi",  # had a 42-char hex in diagnostics
+        r"0mjo1a97a5yaq",  # component registration, large chunk
+        r"0vlulu7bwpnvs",  # component registration
+        r"0\.k--fzd9bco3",  # component registration
     ]
 
     # Metadata byte that encodes: type=server-action (bit7=0), all 6 args used
@@ -367,7 +479,7 @@ class XConsoleAuthClient:
         if not js_urls:
             # Common when CF interstitial / challenge HTML is returned instead of
             # the Next.js sign-up document (no /_next/static/chunks/*.js at all).
-            raise RuntimeError(self._signup_html_problem(html))
+            raise RuntimeError(self._signup_html_problem(html, transport_name=self.transport_name))
 
         # 2. sort: priority chunks first, then the rest
         priority: List[str] = []
@@ -428,17 +540,17 @@ class XConsoleAuthClient:
         #    Format: 2 hex chars metadata + 40 hex chars hash = 42 chars total.
         #    Do NOT prepend a metadata byte — it's already embedded.
         if self.debug:
-            print(f"  [scrape] action ID={action_hash[:16]}... "
-                  f"({len(action_hash)} chars, {'signup-chunk' if signup_hash else 'fallback'})")
+            print(
+                f"  [scrape] action ID={action_hash[:16]}... "
+                f"({len(action_hash)} chars, {'signup-chunk' if signup_hash else 'fallback'})"
+            )
         return action_hash
 
     @property
     def next_action_id(self) -> str:
         """The current ``next-action`` header value (populated by ``load_signup_page()``)."""
         if self._next_action_id is None:
-            raise RuntimeError(
-                "next_action_id not available — call load_signup_page() first"
-            )
+            raise RuntimeError("next_action_id not available — call load_signup_page() first")
         return self._next_action_id
 
     @property
@@ -462,14 +574,21 @@ class XConsoleAuthClient:
         # (e.g. email domain blocked, Cloudflare challenge, etc.).
         if not raw:
             return GrpcResult(
-                ok=False, http_status=status, grpc_status=None,
-                messages=[], trailers={}, raw=raw,
+                ok=False,
+                http_status=status,
+                grpc_status=None,
+                messages=[],
+                trailers={},
+                raw=raw,
             )
         parsed = grpcweb.parse_response(raw)
         return GrpcResult(
             ok=(status == 200 and parsed["grpc_status"] == 0),
-            http_status=status, grpc_status=parsed["grpc_status"],
-            messages=parsed["messages"], trailers=parsed["trailers"], raw=raw,
+            http_status=status,
+            grpc_status=parsed["grpc_status"],
+            messages=parsed["messages"],
+            trailers=parsed["trailers"],
+            raw=raw,
         )
 
     def create_email_validation_code(self, email: str) -> GrpcResult:
@@ -484,47 +603,63 @@ class XConsoleAuthClient:
         return PasswordStrength(raw_fields=res.first_message)
 
     # ----------------------------------------------------------------- account creation
-    def create_account(self, *, email: str, given_name: str, family_name: str,
-                       password: str, email_validation_code: str,
-                       turnstile_token: str, castle_request_token: str,
-                       conversion_id: str, tos_accepted_version: Optional[str] = None) -> SignupResult:
+    def create_account(
+        self,
+        *,
+        email: str,
+        given_name: str,
+        family_name: str,
+        password: str,
+        email_validation_code: str,
+        turnstile_token: str,
+        castle_request_token: str,
+        conversion_id: str,
+        tos_accepted_version: Optional[str] = None,
+    ) -> SignupResult:
         create_req = {
             "email": email,
             "givenName": given_name,
             "familyName": family_name,
             "clearTextPassword": password,
-            "tosAcceptedVersion": tos_accepted_version if tos_accepted_version is not None else "$undefined",
+            "tosAcceptedVersion": tos_accepted_version
+            if tos_accepted_version is not None
+            else "$undefined",
         }
         args = [
-            {"emailValidationCode": email_validation_code,
-             "createUserAndSessionRequest": create_req,
-             "turnstileToken": turnstile_token,
-             "conversionId": conversion_id,
-             "castleRequestToken": castle_request_token},
+            {
+                "emailValidationCode": email_validation_code,
+                "createUserAndSessionRequest": create_req,
+                "turnstileToken": turnstile_token,
+                "conversionId": conversion_id,
+                "castleRequestToken": castle_request_token,
+            },
             {"client": "$T", "meta": "$undefined", "mutationKey": "$undefined"},
         ]
         body = json.dumps(args, separators=(",", ":")).encode("utf-8")
 
         # Use dynamically-scraped values (populated by load_signup_page)
         h = self._base_headers()
-        h.update({
-            "accept": "text/x-component",
-            "content-type": "text/plain;charset=UTF-8",
-            "next-action": self.next_action_id,
-            "next-router-state-tree": self.next_router_state_tree,
-            "origin": C.ACCOUNTS_ORIGIN,
-            "referer": self.signup_url,
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-dest": "empty",
-            "content-length": str(len(body)),
-        })
+        h.update(
+            {
+                "accept": "text/x-component",
+                "content-type": "text/plain;charset=UTF-8",
+                "next-action": self.next_action_id,
+                "next-router-state-tree": self.next_router_state_tree,
+                "origin": C.ACCOUNTS_ORIGIN,
+                "referer": self.signup_url,
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
+                "content-length": str(len(body)),
+            }
+        )
         status, _, set_cookies, raw = self._request("POST", self.signup_url, headers=h, body=body)
         rsc_body = raw.decode("utf-8", "replace")
         self._last_rsc_body = rsc_body  # store for fetch_sso_token()
         self._last_create_set_cookies = list(set_cookies or [])
         return SignupResult(
-            ok=(status == 200), http_status=status,
+            ok=(status == 200),
+            http_status=status,
             set_cookies=set_cookies,
             rsc_body=rsc_body,
         )
@@ -553,20 +688,27 @@ class XConsoleAuthClient:
     def _fetch_sso_via_grok_home(self) -> Optional[str]:
         """Fallback: visit grok.com so the logged-in accounts session yields ``sso``."""
         headers = self._base_headers()
-        headers.update({
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "sec-fetch-site": "cross-site",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-dest": "document",
-            "referer": C.ACCOUNTS_ORIGIN + "/",
-        })
+        headers.update(
+            {
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "sec-fetch-site": "cross-site",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-dest": "document",
+                "referer": C.ACCOUNTS_ORIGIN + "/",
+            }
+        )
         try:
             status, _hdrs, set_cookies, _raw = self._request(
-                "GET", self.GROK_HOME, headers=headers,
+                "GET",
+                self.GROK_HOME,
+                headers=headers,
             )
             if self.debug:
-                print(f"  [sso] grok.com fallback HTTP {status}, set-cookies={len(set_cookies or [])}")
+                print(
+                    f"  [sso] grok.com fallback HTTP {status}, set-cookies={len(set_cookies or [])}"
+                )
             from .sso import parse_sso_from_set_cookies
+
             token = parse_sso_from_set_cookies(set_cookies or [])
             if token:
                 return token

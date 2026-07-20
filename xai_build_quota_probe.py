@@ -10,6 +10,7 @@ Examples:
     python xai_build_quota_probe.py --auth-dir ./cliproxyapi_auth
     python xai_build_quota_probe.py --auth-dir ./cliproxyapi_auth --include-disabled
 """
+
 from __future__ import annotations
 
 import argparse
@@ -20,6 +21,15 @@ from typing import Any
 from urllib.parse import urljoin
 
 import requests
+
+from check_accounts import (
+    BUILD_USAGE_BALANCE_EXHAUSTED,
+    CHAT_ENDPOINT_DENIED,
+    SPENDING_LIMIT_EXHAUSTED,
+    is_build_usage_balance_exhausted,
+    is_chat_endpoint_denied,
+    is_spending_limit_exhausted,
+)
 
 
 DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
@@ -115,13 +125,27 @@ def summarize_response(resp: requests.Response) -> dict[str, Any]:
             out["error"] = body_text[:300]
         return out
 
+    data: Any = None
     try:
         data = resp.json()
     except Exception:
         if body_text:
             out["body"] = body_text[:300]
+            out["error"] = body_text[:300]
+        if is_chat_endpoint_denied(resp.status_code, body=body_text, error=out.get("error")):
+            out["code"] = CHAT_ENDPOINT_DENIED
+            out["chat_endpoint_denied"] = True
+        elif is_build_usage_balance_exhausted(
+            resp.status_code, body=body_text, error=out.get("error")
+        ):
+            out["code"] = BUILD_USAGE_BALANCE_EXHAUSTED
+            out.setdefault("remaining_tokens", 0)
+        elif is_spending_limit_exhausted(resp.status_code, body=body_text, error=out.get("error")):
+            out["code"] = SPENDING_LIMIT_EXHAUSTED
         return out
 
+    err_obj: Any = None
+    top_code: str | None = None
     if isinstance(data, dict):
         if model := data.get("model"):
             out["model"] = model
@@ -131,6 +155,40 @@ def summarize_response(resp: requests.Response) -> dict[str, Any]:
                 out["probe_total_tokens"] = total
             elif total := usage.get("totalTokens"):
                 out["probe_total_tokens"] = total
+        err_obj = data.get("error")
+        if err_obj is not None and resp.status_code >= 400:
+            if isinstance(err_obj, dict):
+                out["error"] = str(err_obj.get("message") or err_obj.get("code") or err_obj)[:300]
+            else:
+                out["error"] = str(err_obj)[:300]
+        raw_code = data.get("code")
+        if isinstance(raw_code, str) and raw_code.strip():
+            top_code = raw_code.strip()
+
+    err_for_match = err_obj if err_obj is not None else out.get("error")
+    if is_chat_endpoint_denied(
+        resp.status_code,
+        body=body_text,
+        error=err_for_match,
+        code=top_code,
+    ):
+        out["code"] = CHAT_ENDPOINT_DENIED
+        out["chat_endpoint_denied"] = True
+    elif is_build_usage_balance_exhausted(
+        resp.status_code,
+        body=body_text,
+        error=err_for_match,
+        code=top_code,
+    ):
+        out["code"] = BUILD_USAGE_BALANCE_EXHAUSTED
+        out.setdefault("remaining_tokens", 0)
+    elif is_spending_limit_exhausted(
+        resp.status_code,
+        body=body_text,
+        error=err_for_match,
+        code=top_code,
+    ):
+        out["code"] = SPENDING_LIMIT_EXHAUSTED
     return out
 
 
@@ -159,7 +217,9 @@ def probe(path: Path, timeout: float, use_auth_base_url: bool = False) -> dict[s
         "max_output_tokens": 8,
     }
     # Build/CLI free quota lives on cli-chat-proxy.grok.com, not api.x.ai paid API.
-    base_url = str(auth.get("base_url") or DEFAULT_BASE_URL) if use_auth_base_url else DEFAULT_BASE_URL
+    base_url = (
+        str(auth.get("base_url") or DEFAULT_BASE_URL) if use_auth_base_url else DEFAULT_BASE_URL
+    )
     if "api.x.ai" in base_url:
         base_url = DEFAULT_BASE_URL
     url = build_url(base_url)
@@ -178,9 +238,13 @@ def probe(path: Path, timeout: float, use_auth_base_url: bool = False) -> dict[s
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Probe xAI/Grok Build free quota from auth JSON files")
+    parser = argparse.ArgumentParser(
+        description="Probe xAI/Grok Build free quota from auth JSON files"
+    )
     parser.add_argument("--auth-dir", required=True, help="CLIProxyAPI auth directory")
-    parser.add_argument("--include-disabled", action="store_true", help="Also probe disabled auth files")
+    parser.add_argument(
+        "--include-disabled", action="store_true", help="Also probe disabled auth files"
+    )
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--json", action="store_true", help="Print JSON instead of a table")
     parser.add_argument(
@@ -194,7 +258,9 @@ def main() -> None:
     results = []
     for path in load_auth_files(auth_dir, include_disabled=args.include_disabled):
         try:
-            results.append(probe(path, timeout=args.timeout, use_auth_base_url=args.use_auth_base_url))
+            results.append(
+                probe(path, timeout=args.timeout, use_auth_base_url=args.use_auth_base_url)
+            )
         except Exception as exc:  # keep probing other accounts
             results.append({"file": path.name, "error": f"{type(exc).__name__}: {exc}"})
 
@@ -213,6 +279,13 @@ def main() -> None:
         print(f"\n{label} [{item.get('file')}] status={status}{disabled}")
         if item.get("error"):
             print(f"  error: {item['error']}")
+            if item.get("chat_endpoint_denied") or item.get("code") == CHAT_ENDPOINT_DENIED:
+                print(f"  code: {CHAT_ENDPOINT_DENIED}")
+            continue
+        if item.get("chat_endpoint_denied") or item.get("code") == CHAT_ENDPOINT_DENIED:
+            print(f"  code: {CHAT_ENDPOINT_DENIED}")
+            if item.get("error"):
+                print(f"  error: {item['error']}")
             continue
         if "actual_tokens" in item:
             print(

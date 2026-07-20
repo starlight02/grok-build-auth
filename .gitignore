@@ -16,10 +16,15 @@ venv/
 
 # Runtime outputs (tokens / accounts — never commit)
 sso_output/
+sso*.json
 oauth_output/
 accounts_output/
 cliproxyapi_auth/
 cliproxyapi_auth_failed/
+
+# Proxy geo probe cache
+.proxy_geo_cache.json
+*proxies*
 
 # alias_mail runtime state
 .alias_domain_health.json
@@ -32,6 +37,7 @@ _dbg_*.py
 _consent*
 _parse_consent.py
 *.html.bak
+logs/
 *.log*
 
 # Debug screenshots / scratch lists
@@ -39,6 +45,9 @@ _parse_consent.py
 !docs/**/*.png
 oauth_retry_list.json
 quota_sample*.txt
+# scratch email/token dumps produced by run.py --sso-only etc.
+tmp_*.txt
+*_sso_only_emails.txt
 .ruff_cache/
 
 # OS / editor
@@ -47,3 +56,4 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+*.pid

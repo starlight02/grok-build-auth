@@ -8,7 +8,7 @@ A **protocol-research client** for publicly observable **x.ai / Grok web authent
 
 for protocol analysis, interoperability research, and **authorized** local integration testing.
 
-Default path: signup/OAuth over pure HTTP (`curl_cffi`). **Turnstile only mints a token** via a local browser backend (`auto`→Drission+turnstilePatch; optional Camoufox / Playwright).
+Default path: signup/OAuth over pure HTTP (`curl_cffi`). Turnstile **token pool on by default**. Mailbox: **pluggable multi-channel registry + background mail pool on by default** (`-e auto` enables every configured channel — prefer high-RPM sources, overflow on rate limits; single channel → solo). OAuth: protocol session-reuse, Device Flow fallback.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
@@ -48,40 +48,70 @@ A research-oriented protocol client, **not** an official SDK.
 |---|---|
 | **Signup** | Email code (gRPC-web) + Turnstile + Next.js Server Action on `accounts.x.ai` |
 | **SSO** | Session JWT extraction for OAuth session reuse |
-| **OAuth** | `auth.x.ai` PKCE + cookie-setter + consent; CreateSession fallback |
+| **OAuth** | Fast path: `oauth_protocol` SSO session-reuse (PKCE + cookie-setter + consent); fallback: `sso2auth` Device Flow; pure HTTP end-to-end |
 | **Export** | Local `type=xai` auth files compatible with [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (Grok Build channel) |
 
 Highlights:
 
-- **Protocol-first** pure HTTP (`curl_cffi`) for signup / OAuth  
-- **Turnstile**: three local backends (see [Turnstile backends](#turnstile-backends)); default `auto`→Drission  
-- **SSO reuse** can skip a second Turnstile on OAuth  
-- **Lean outputs**: default writes only `sso_output/` + `cliproxyapi_auth/`  
+- **Protocol-first** pure HTTP (`curl_cffi`) for signup / OAuth
+- **Turnstile pool**: background mint, signup threads only consume; **on by default**; demand-driven (stop when stock covers demand)
+- **Mail pool + multi-channel**: pluggable `mail_channels` registry; background inbox create; **prefer + overflow** (tempmail keeps its RPM; yyds/CF fill gaps — not a full switch on rate limit)
+- **Auto-tune from `-t`**: token/mail pool size & minters scale with registration threads (env can pin values)
+- **OAuth dual path**: SSO session-reuse (`oauth_protocol`); Device Flow fallback (`sso2auth`)
+- **Lean outputs**: default writes `sso_output/` + `cliproxyapi_auth/`
 
-SSO **alone cannot** become a CPA auth file; OAuth tokens are required.
+CPA export needs OAuth `access_token` / `refresh_token` (protocol path or Device Flow).
 
 ---
 
 ## Architecture
 
 ```mermaid
-flowchart LR
-    A[run.py] --> B[signup client.py]
-    B --> C[SSO sso.py]
-    C --> D[OAuth oauth_protocol.py]
-    D --> E[token exchange]
-    E --> F[cliproxyapi_auth/*.json]
+flowchart TB
+    subgraph entry [run.py]
+      A["-n / -t / -e auto|channel"]
+    end
+
+    subgraph pools [Background pools default on]
+      TP[TurnstileTokenPool<br/>turnstile_pool]
+      MP[MailboxPool<br/>mailbox_pool]
+      R[ChannelRouter<br/>mail_channels]
+      MP --> R
+      R -->|prefer| TM[tempmail]
+      R -->|overflow| YY[yyds]
+      R -->|overflow| CF[cloudflare]
+      R -.->|register_channel| X[future channels…]
+    end
+
+    subgraph browser [Turnstile browser backends]
+      S[drission / camoufox / browser]
+    end
+
+    A --> TP
+    A --> MP
+    TP -->|mint| S
+    A --> B[signup client.py]
+    TP -->|token| B
+    MP -->|Mailbox email+receiver+channel| B
+    B --> C[SSO sso_output]
+    C --> D{OAuth fast path<br/>oauth_protocol}
+    D -->|OK| E[token exchange]
+    D -->|fail| F[sso2auth Device Flow]
+    F --> E
+    E --> G[cliproxyapi_auth/*.json]
 ```
 
 ---
 
 ## Requirements
 
+This is **not** a zero-config product. At minimum you need:
+
 - Python 3.9+
-- Turnstile: local browser backend (default Drission + headed Chrome; optional Camoufox / Playwright)  
-- Mailbox: Tempmail.lol **free tier (no API key)** by default; optional Plus/Ultra key or your Cloudflare D1 alias mailbox  
-- Optional HTTP(S) proxy  
-- Optional local CLIProxyAPI install to load exported auth files  
+- Turnstile: local browser backend (default Drission + headed Chrome; optional Camoufox / Playwright)
+- Mailbox: default `-e auto` — **all configured** channels (tempmail always; yyds/cloudflare when credentials exist); or force one with `-e tempmail|yyds|cloudflare`
+- Optional HTTP(S) proxy
+- Optional local CLIProxyAPI install to load exported auth files
 
 Platform terms, risk controls, and API changes may break the flow at any time. Maintainers have **no duty** to keep it working.
 
@@ -109,46 +139,97 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 
 | Variable | Required | Notes |
 |---|---|---|
-| `TURNSTILE_SOLVER` | no | `auto` (default) / `drission` / `camoufox` / `browser` — see [Turnstile backends](#turnstile-backends) |
+| `TURNSTILE_SOLVER` | no | `auto` (default) / `drission` / `camoufox` / `browser` / `safari` — see [Turnstile backends](#turnstile-backends) |
 | `TURNSTILE_HEADLESS` | no | drission/camoufox default `0` (headed); playwright default `1`; camoufox may use `virtual` |
 | `TURNSTILE_TIMEOUT` | no | hard wall-clock seconds per mint (**drission default 30**; camoufox/browser default 60) |
-| `TURNSTILE_PARALLEL` | no | concurrent Turnstile mint slots (default **2**; one thread-local Chrome per slot) |
+| `TURNSTILE_POOL` | no | background token pool (**on by default**; `0` disables) |
+| `TURNSTILE_POOL_SIZE` | no | hard max buffered tokens (**auto from `-t`**: `max(2, -t)`, cap 32) |
+| `TURNSTILE_POOL_TARGET` | no | idle ready stock (default `min(2, size)`; stop minting when satisfied) |
+| `TURNSTILE_POOL_MINTERS` | no | mint threads (**auto from `-t`**: `ceil(-t/4)` cap 4; Safari forced to 1) |
+| `TURNSTILE_TOKEN_MAX_AGE` | no | max age of pooled tokens in seconds (default 200) |
+| `TURNSTILE_PAUSE_FILE` | no | if present, pause mint/click (default `/tmp/grok-turnstile.pause`) |
+| `TURNSTILE_PARALLEL` | no | mint slots **only when pool is off** (default follows `-t`, cap 8) |
 | `TURNSTILE_MINIMIZED` | no | drission headed default `1`: minimize via Drission/CDP |
-| `TURNSTILE_OFFSCREEN` | no | drission headed default `1`: off-screen `--window-position` backup |
+| `TURNSTILE_OFFSCREEN` | no | drission headed default `1`: off-screen window backup |
 | `TURNSTILE_BROWSER_CHANNEL` | no | playwright only; auto-selects system `chrome` when available |
 | `TURNSTILE_INTERACTIVE` | no | playwright only: `1` = manual click (forces headed) |
-| `TURNSTILE_BROWSER_REUSE` | no | `1` = warm browser reuse (default 1; drission is thread-local) |
+| `TURNSTILE_BROWSER_REUSE` | no | `1` = warm browser reuse (default 1; drission warm-page) |
 | `TEMPMAIL_API_KEY` | no | Tempmail.lol Plus/Ultra (**free tier needs no key**) |
+| `TEMPMAIL_FREE_CREATE_INTERVAL` | no | free-tier create min interval seconds (default **3 ≈ 20/min**) |
+| `YYDS_API_KEY` / `YYDS_JWT` | no | YYDS mailbox (either; included by `-e auto` when set) |
+| `YYDS_API_BASE` | no | default `https://maliapi.215.im/v1` |
+| `YYDS_DOMAINS` | no | domain allow-list (empty = **all verified**, domain-level LB) |
+| `MAIL_BACKENDS` | no | explicit channel list, overrides `-e auto` (e.g. `tempmail,yyds`) |
+| `MAIL_CHANNEL_WEIGHTS` | no | preference, e.g. `tempmail:100,yyds:40,cloudflare:60` |
+| `MAIL_CHANNEL_CAPACITY` | no | max concurrent creates per channel before overflow |
+| `MAIL_POOL` | no | background inbox pool (**on by default**; `0` off) |
+| `MAIL_POOL_SIZE` / `_TARGET` / `_MINTERS` | no | same semantics as turnstile pool (auto from `-t`) |
+| `MAIL_POOL_MAX_AGE` | no | max age of pooled inboxes in seconds (default 600) |
 | `MAIL_CODE_TIMEOUT` | no | seconds to wait for code before rotating inbox (default 30) |
 | `MAIL_MAX_ATTEMPTS` | no | max fresh inboxes when mail is silent (default 3) |
-| `CLOUDFLARE_API_TOKEN` | for `-e cloudflare` | CF API token |
+| `CLOUDFLARE_API_TOKEN` | for `-e cloudflare` / auto-detect | CF API token |
 | `CLOUDFLARE_ACCOUNT_ID` | same | CF account |
 | `CLOUDFLARE_D1_DB_ID` | same | D1 database ID |
 | `ALIAS_MAIL_DOMAINS` | same | domains you control (comma-separated) |
 | `CLIPROXYAPI_AUTH_DIR` | no | default `./cliproxyapi_auth` |
-| `HTTPS_PROXY` / `HTTP_PROXY` | no | proxy |
+| `HTTPS_PROXY` / `HTTP_PROXY` | no | single proxy (when no pool file) |
+| `PROXY_POOL_FILE` | no | proxy list file, **one URL per line**; exit-IP geo probe on start |
+| `PROXY_POOL` | no | small inline list; use FILE for large pools |
+| `PROXY_REGION` | no | target country code (`us`/`jp`/`hk`…); rotate only matches |
+| `PROXY_POOL_SCOPE` | no | `same_region` (**default**) / `all` |
+| `PROXY_GEO_WORKERS` | no | concurrent probes (default 16) |
+| `PROXY_GEO_CACHE` | no | probe cache (default `./.proxy_geo_cache.json`) |
 
 ### Run (research / accounts you own)
 
 ```bash
-# Full pipeline: signup + SSO + Build OAuth → cliproxyapi_auth/
-# Default Turnstile: auto → drission when DrissionPage is installed
+# Zero-config batch: -t 4 + token pool + mail pool + -e auto (prefer+overflow)
+python run.py -n 20
+
+# Single-account smoke
 python run.py -n 1
 
-# Pick a Turnstile backend (see section below)
-TURNSTILE_SOLVER=drission python run.py -n 1
+# Concurrency (token/mail pools auto-retune; -t 8 → size=8 minters=2)
+python run.py -n 20 -t 8
+
+# Force a single channel (solo: may block on wait/retry)
+python run.py -n 10 -e yyds
+python run.py -n 10 -e tempmail
+python run.py -n 1 -e cloudflare
+
+# Explicit multi-channel list
+MAIL_BACKENDS=tempmail,yyds python run.py -n 20 -t 8
+
+# Weights / capacity (prefer tempmail; overflow when slots full)
+MAIL_CHANNEL_WEIGHTS=tempmail:100,yyds:40 MAIL_CHANNEL_CAPACITY=tempmail:3,yyds:2 \
+  python run.py -n 20 -t 8
+
+# Disable mail pool (create at register time; router still works)
+MAIL_POOL=0 python run.py -n 4 -t 2
+
+# Pin token pool knobs
+TURNSTILE_POOL_SIZE=6 TURNSTILE_POOL_MINTERS=2 python run.py -n 20 -t 4
+
+# Disable token pool
+TURNSTILE_POOL=0 python run.py -n 4 -t 2
+
+# Turnstile backends
+TURNSTILE_SOLVER=drission python run.py -n 10 -t 4
 TURNSTILE_SOLVER=camoufox python run.py -n 1
 TURNSTILE_SOLVER=browser  python run.py -n 1
 
-# Multi-account (signup + protocol OAuth concurrent; Turnstile default 2 parallel mints)
-python run.py -n 5 -t 3
-TURNSTILE_PARALLEL=2 TURNSTILE_SOLVER=drission python run.py -n 4 -t 4
-python run.py -n 1 -e cloudflare
+# Proxy pool file
+PROXY_POOL_FILE=./proxies.txt PROXY_REGION=us python run.py -n 10 -t 4
+
+# Pause mint / HID clicks
+touch /tmp/grok-turnstile.pause
+rm    /tmp/grok-turnstile.pause
+
 python run.py -n 1 --no-oauth
+python run.py -n 1 --no-oauth-protocol
 python run.py -n 1 --cliproxyapi-auth-dir /path/to/CLIProxyAPI/data/auth
-python run.py -n 1 --accounts-output-dir ./accounts_output   # optional ledger
+python run.py -n 1 --accounts-output-dir ./accounts_output
 python run.py -n 1 --oauth-debug
-# After OAuth, probe Build quota (off by default): keep only usable files
 python run.py -n 1 --check-quota
 python run.py -n 5 -t 4 --check-quota --failed-auth-dir ./cliproxyapi_auth_failed
 ```
@@ -164,8 +245,114 @@ python run.py -n 5 -t 4 --check-quota --failed-auth-dir ./cliproxyapi_auth_faile
 | `accounts_output/` | off | pipeline ledger (`--accounts-output-dir`) |
 
 Helpers:
-- `check_accounts.py` — **only** auth usability / Build quota checker
-- `xai_oauth_login.py`, `xai_oauth_export_cliproxyapi.py` — standalone OAuth helpers
+- `check_accounts.py` — auth usability / Build quota
+- `retry_oauth_from_sso.py` — SSO → CPA Device Flow
+- `xai_oauth_login.py` — interactive browser OAuth
+- `xai_oauth_export_cliproxyapi.py` — export oauth_output → CPA auth
+
+---
+
+## Token pool (default)
+
+Signup threads **only consume** tokens; background minters mint via a local browser. On by default to avoid cold-starting a browser per account and over-minting while idle.
+
+### Why a pool
+
+| Mode | Behavior | Use when |
+|---|---|---|
+| **Pool on (default)** | Background keeps a small stock; signup HTTP path acquires tokens | Batches / run while working |
+| **Pool off** | Each signup thread calls `solve_turnstile` under `TURNSTILE_PARALLEL` | Debugging a single mint |
+
+### Demand-driven minting
+
+- **Idle**: keep only `target` ready tokens (default 2); log `pool mint pause (satisfied …)`
+- **Waiters present**: desire expands to `min(size, waiting + target)`
+- **Slow mint finishes after demand is covered**: drop the surplus instead of filling the hard cap
+
+### Auto-tune from `-t`
+
+When the matching env vars are unset, `suggest_pool_params(-t)` applies:
+
+| Param | Auto rule | Examples |
+|---|---|---|
+| `size` | `clamp(-t, 2..32)` | `-t4→4`, `-t8→8` |
+| `target` | `min(2, size)` | idle stock of 2 |
+| `minters` | `ceil(-t/4)` cap 4; **Safari forced to 1** | `-t4→1`, `-t8→2`, `-t16→4` |
+| `PARALLEL` (pool off) | `min(8, -t)` | matches registration concurrency |
+
+Explicit `TURNSTILE_POOL_SIZE` / `_TARGET` / `_MINTERS` / `TURNSTILE_PARALLEL` win over auto.
+
+### Drission warm-page mint (recommended)
+
+- Each worker **navigates signup once**
+- Later mints reuse the page (`force-render` + CDP click) ≈ **2.3–2.5s/token** (first cold mint ≈ 10–16s)
+- Headed defaults: **minimized + off-screen** to avoid stealing OS focus
+
+### Tempmail free alignment
+
+- CLI default **`-t 4`** targets free-tier steady throughput
+- Without `TEMPMAIL_API_KEY`, inbox `create` is paced at **3s** (≈20/min) process-wide
+- Plus/Ultra key skips free create pacing; raise `-t` if needed
+- **Multi-channel**: free pacing / 429 only blocks tempmail *for that slot*; yyds/etc. overflow immediately; tempmail is preferred again when ready (not a full switch)
+
+### How to read startup logs
+
+```text
+grok-build-auth: 20 accounts, 4 threads, email=auto, ... pool=on, mail-pool=on
+  mail-channels:        tempmail,yyds (prefer+overflow; weights via MAIL_CHANNEL_WEIGHTS)
+  turnstile-pool:       size=4 target=2 minters=1 max_age=200s (auto from -t=4)
+  mail-pool:            size=4 target=2 minters=1 max_age=600s (auto from -t=4)
+  [ts-pool] pool +1 len=837 q=1/4 want=2 wait=0
+  [mail-pool] mail pool +1 [tempmail] xai…@… q=2/4
+  [mail] mail channel tempmail rate: … (next_slot≈3.0s; overflow/retry)
+  [mail] mail create via yyds: xai…@…
+  [3/20] [#2] email [yyds]: xai…@…
+  [3/20] [#2] Turnstile 837 chars from pool (age=6s q=1)
+```
+
+---
+
+## Mail pool & multi-channel (default)
+
+Signup threads **only consume** ready `Mailbox(email, receiver, channel)` objects; background minters create via the channel router. On by default, warming in parallel with the Turnstile pool.
+
+### Channel registry (extensible)
+
+| Channel | Default weight | Available when | Notes |
+|---|---|---|---|
+| **tempmail** | 100 | always (free or `TEMPMAIL_API_KEY`) | usually highest create RPM; preferred |
+| **yyds** | 40 | `YYDS_API_KEY` or `YYDS_JWT` | overflow / top-up; domain-level LB |
+| **cloudflare** | 60 | `CLOUDFLARE_*` + `ALIAS_MAIL_DOMAINS` | self-hosted D1 alias mail |
+| **custom** | yours | `configured()` | `register_channel(ChannelSpec(...))` — auto picks up in CLI/`auto` |
+
+```python
+from xconsole_client.mail_channels import ChannelSpec, register_channel
+
+register_channel(ChannelSpec(
+    name="mymail",
+    weight=55,
+    capacity=2,
+    configured=lambda: bool(os.environ.get("MYMAIL_KEY")),
+    create=lambda: (email, receiver),  # receiver.wait_for_code(timeout=…)
+))
+```
+
+### Solo vs multi
+
+| Mode | When | Behavior |
+|---|---|---|
+| **Solo** | exactly one resolved channel (`-e yyds`, single backend, or `MAIL_BACKENDS=yyds`) | may block on wait/retry (legacy single-backend path) |
+| **Multi** | `-e auto` with ≥2 available | **prefer + overflow**: use high-weight when a slot is free; rate limits only delay *that* slot, other ready channels fill immediately |
+
+### Pool knobs (from `-t`)
+
+| Param | Auto rule | Env |
+|---|---|---|
+| size | `clamp(-t, 2..32)` | `MAIL_POOL_SIZE` |
+| target | `min(2, size)` | `MAIL_POOL_TARGET` |
+| minters | `ceil(-t/4)` cap 4 | `MAIL_POOL_MINTERS` |
+| max_age | 600s | `MAIL_POOL_MAX_AGE` |
+| enable | on by default | `MAIL_POOL=0` to disable |
 
 ---
 
@@ -179,18 +366,17 @@ Select a backend with `TURNSTILE_SOLVER` (or `resolve_turnstile_solver(backend=.
 | `TURNSTILE_SOLVER` | Stack | Headed by default? | When to use |
 |---|---|---|---|
 | **`auto` (default)** | DrissionPage installed → **drission**; else → **browser** | follows backend | daily default |
-| **`drission`** | DrissionPage + system **Chrome** + `turnstilePatch/` | **yes** (`0`) | **recommended** for batch runs |
-| **`camoufox`** | **Camoufox** anti-detect Firefox (launched via Playwright) | **yes** (`0`) | Firefox / anti-detect path; needs `camoufox fetch` |
-| **`browser`** | Playwright Chromium/Chrome | **no** (`1`) | fallback when Drission is missing; often weaker on residential IPs |
+| **`drission`** | DrissionPage + system **Chrome** + `turnstilePatch/` | **yes** (`0`) | **recommended** for warm-page pool batches |
+| **`camoufox`** | **Camoufox** anti-detect Firefox (via Playwright) | **yes** (`0`) | Firefox / anti-detect; needs `camoufox fetch` |
+| **`browser`** | Playwright Chromium/Chrome | **no** (`1`) | fallback without Drission |
+| **`safari`** | system Safari (macOS) | steals focus | manual/single path; pool minters fixed at 1 |
 
 Aliases:
 
 - drission: `dp` / `clean` / `drissionpage`
 - camoufox: `camou` / `camoufox-firefox`
 - browser: `local` / `playwright` / `chromium` / `chrome` / `free`
-
-Remote captcha APIs (YesCaptcha / CapSolver / 2Captcha, …) are **not** implemented.  
-Legacy `obscura` backend is removed.
+- safari: `webkit-system` / `system-safari`
 
 ### Dependencies
 
@@ -202,23 +388,18 @@ pip install -r requirements.txt
 
 # camoufox extra:
 pip install camoufox
-camoufox fetch          # download Camoufox binary once
+camoufox fetch
 ```
 
 ### Commands
 
 ```bash
-# default = auto → drission
-python run.py -n 1
+# default = auto → drission + pool on + -t 4
+python run.py -n 20
 
-# explicit Drission (recommended for batches)
-TURNSTILE_SOLVER=drission TURNSTILE_HEADLESS=0 python run.py -n 10 -t 4
-
-# Camoufox (headed is more reliable; try virtual without a display)
+TURNSTILE_SOLVER=drission python run.py -n 10 -t 4
 TURNSTILE_SOLVER=camoufox python run.py -n 1
 TURNSTILE_SOLVER=camoufox TURNSTILE_HEADLESS=virtual python run.py -n 1
-
-# Playwright fallback
 TURNSTILE_SOLVER=browser python run.py -n 1
 TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 ```
@@ -228,29 +409,43 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 | Variable | Default | Notes |
 |---|---|---|
 | `TURNSTILE_SOLVER` | `auto` | backend picker |
-| `TURNSTILE_HEADLESS` | drission/camoufox=`0`; browser=`1` | `0` headed; `1` headless; camoufox also accepts `virtual` |
-| `TURNSTILE_TIMEOUT` | drission=`30`; others=`60` | hard timeout per token mint (seconds); empty token fails ~12s |
-| `TURNSTILE_PARALLEL` | `2` | concurrent mint slots (Semaphore); drission uses thread-local Chrome |
-| `TURNSTILE_MINIMIZED` | `1` (headed) | minimize window via Drission/CDP |
-| `TURNSTILE_OFFSCREEN` | `1` (headed) | off-screen `--window-position` backup |
-| `TURNSTILE_BROWSER_REUSE` | `1` | warm browser reuse |
+| `TURNSTILE_HEADLESS` | drission/camoufox=`0`; browser=`1` | `0` headed; `1` headless; camoufox also `virtual` |
+| `TURNSTILE_TIMEOUT` | drission=`30`; others=`60` | hard timeout per mint |
+| `TURNSTILE_POOL` | **on** | `0` disables pool |
+| `TURNSTILE_POOL_SIZE` | from `-t` | hard buffer cap |
+| `TURNSTILE_POOL_TARGET` | `min(2,size)` | idle stock; pause when satisfied |
+| `TURNSTILE_POOL_MINTERS` | from `-t` | background mint threads; Safari=1 |
+| `TURNSTILE_PARALLEL` | from `-t` (pool off only) | live mint concurrency, cap 8 |
+| `TURNSTILE_MINIMIZED` | `1` (headed) | minimize window |
+| `TURNSTILE_OFFSCREEN` | `1` (headed) | off-screen backup |
+| `TURNSTILE_BROWSER_REUSE` | `1` | warm reuse / warm page |
 | `TURNSTILE_DEBUG` | off | `1` = verbose solver logs |
 | `TURNSTILE_BROWSER_CHANNEL` | auto | browser only: prefer system Chrome |
 | `TURNSTILE_INTERACTIVE` | off | browser only: manual click |
-| `HTTPS_PROXY` / `HTTP_PROXY` | empty | proxy for browser + protocol HTTP |
+| `HTTPS_PROXY` / `HTTP_PROXY` | empty | single proxy |
+| `PROXY_POOL_FILE` | empty | one proxy URL per line; geo-probe on start |
+| `PROXY_REGION` | auto/set | if set, rotate only that country after probe |
+| `PROXY_POOL_SCOPE` | `same_region` | `same_region` or `all` |
+| `PROXY_GEO_WORKERS` | `16` | concurrent geo probes |
+| `PROXY_GEO_CACHE` | `./.proxy_geo_cache.json` | region cache |
 
 Notes:
 
-1. **Signup / mail code / SSO / OAuth stay pure HTTP**; the browser only mints `turnstileToken`.  
-2. `run.py` bounds Turnstile with **`TURNSTILE_PARALLEL` (default 2)**; drission uses **thread-local Chrome** + empty-token fail-fast and `-t N` still speeds mail + protocol stages.  
-3. With SSO, the OAuth fast path usually **skips** a second Turnstile.  
-4. Headless is blocked more often; prefer **headed + minimized/off-screen + warm reuse** for batches.
+1. Signup / mail / SSO / OAuth use protocol HTTP; Turnstile mint is only needed before create-account.  
+2. **Token pool is default**: background mint; signup threads take `from pool`. `TURNSTILE_PARALLEL` applies only when pool is off.  
+3. Drission warm-page ≈ 2.4s/token; first cold mint is slower.  
+4. OAuth: SSO session-reuse first, Device Flow on failure.  
+5. Prefer **headed + minimized/off-screen + warm reuse + pool** for batches.
 
-### How to tell which backend ran
+### How to tell which path ran
 
 ```text
+# pool mode (default)
+[ts-pool] pool +1 len=837 q=2/4 want=2 wait=0
+[#3] Turnstile 837 chars from pool (age=4s q=1)
+
+# pool off
 [#1] Turnstile 730 chars via DrissionTurnstileSolver
-# or CamoufoxTurnstileSolver / LocalBrowserTurnstileSolver
 ```
 
 ---
@@ -274,7 +469,6 @@ Security: private channel only — [`SECURITY.md`](SECURITY.md).
 
 | Channel | Purpose |
 |---|---|
-| [**LINUX DO**](https://linux.do/) | Technical discussion, protocol research feedback, long-term notes |
 | GitHub Issues | Bug reports and PRs (primary entry) |
 
 ---

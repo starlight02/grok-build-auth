@@ -13,6 +13,7 @@ Public API:
     strength = c.validate_password("you@example.com", "hunter2hunter2")
     c.create_account(... turnstile_token=..., castle_request_token=..., conversion_id=...)
 """
+
 from .client import XConsoleAuthClient
 from .models import GrpcResult, PasswordStrength, SignupResult
 from .solver import (
@@ -37,7 +38,6 @@ from .xai_oauth import (
     OAuthLoginResult,
     build_authorization_url,
     build_cliproxyapi_auth_record,
-    complete_build_oauth,
     default_cliproxyapi_auth_dir,
     exchange_code_for_token,
     fetch_userinfo as fetch_xai_userinfo,
@@ -53,6 +53,7 @@ from . import grpcweb, config, sso
 # fingerprint.py is optional (depends on curl_cffi); expose it only if importable.
 try:
     from .fingerprint import FingerprintTransport  # noqa: F401
+
     _has_fingerprint = True
 except Exception:
     _has_fingerprint = False
@@ -79,7 +80,6 @@ __all__ = [
     "OAuthLoginResult",
     "build_authorization_url",
     "build_cliproxyapi_auth_record",
-    "complete_build_oauth",
     "default_cliproxyapi_auth_dir",
     "exchange_code_for_token",
     "fetch_xai_userinfo",

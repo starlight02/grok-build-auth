@@ -6,8 +6,8 @@ Decoded canonical flows: _capture\\business_flows.json
 """
 
 # ---- hosts ----
-CONSOLE_HOST = "console.x.ai"          # the Cloud Console SPA (Next.js)
-ACCOUNTS_HOST = "accounts.x.ai"        # auth / account management (Next.js + gRPC-web)
+CONSOLE_HOST = "console.x.ai"  # the Cloud Console SPA (Next.js)
+ACCOUNTS_HOST = "accounts.x.ai"  # auth / account management (Next.js + gRPC-web)
 ACCOUNTS_ORIGIN = "https://accounts.x.ai"
 
 # entry point: visiting this unauthenticated redirects to the sign-in page below
@@ -37,8 +37,10 @@ NEXT_ROUTER_STATE_TREE = (
 )
 
 # ---- realistic browser fingerprint (Chrome 148 on Windows, from the capture) ----
-USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+)
 SEC_CH_UA = '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"'
 SEC_CH_UA_PLATFORM = '"Windows"'
 ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9"
@@ -47,12 +49,12 @@ ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9"
 CONNECT_ES_VERSION = "connect-es/2.1.1"
 
 # ---- captured SAMPLE values — THROWAWAY TEST DATA, not secrets. Use as placeholders. ----
-SAMPLE_EMAIL = "test@xai.test"          # 13 chars — synthetic, never a real address
+SAMPLE_EMAIL = "test@xai.test"  # 13 chars — synthetic, never a real address
 SAMPLE_GIVEN_NAME = "<givenName>"
 SAMPLE_FAMILY_NAME = "<familyName>"
-SAMPLE_PASSWORD = "NotARealPwd123!@#"   # 17 chars — synthetic, never a real password
-SAMPLE_EMAIL_CODE = "XAI0X1"            # 6-char code — synthetic test fixture
-SAMPLE_CONVERSION_ID = "806733ff-ba51-4928-b62c-f682857d962b"   # a per-attempt UUID
+SAMPLE_PASSWORD = "NotARealPwd123!@#"  # 17 chars — synthetic, never a real password
+SAMPLE_EMAIL_CODE = "XAI0X1"  # 6-char code — synthetic test fixture
+SAMPLE_CONVERSION_ID = "806733ff-ba51-4928-b62c-f682857d962b"  # a per-attempt UUID
 # ---- anti-bot keys extracted from accounts.x.ai/sign-up page (public, not secrets) ----
 TURNSTILE_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 TURNSTILE_URL = SIGNUP_URL

@@ -51,6 +51,7 @@ Running tests::
     cd xconsole_client
     python mailbox.py
 """
+
 from __future__ import annotations
 
 import os
@@ -81,12 +82,10 @@ def _load_alias_mail() -> Any:
     """
     try:
         import alias_mail  # type: ignore  # noqa: WPS433
+
         return alias_mail
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            "alias_mail backend not available; see "
-            "alias_mail\\README.md"
-        ) from exc
+        raise RuntimeError("alias_mail backend not available; see alias_mail\\README.md") from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -362,11 +361,13 @@ class AliasMailCodeReceiver:
         # Same concatenation as alias_mail.latest_code, kept locally so a
         # future change in alias_mail doesn't silently drop fields we depend
         # on.
-        return " ".join([
-            str(mail.get("subject", "") or ""),
-            str(mail.get("body", "") or ""),
-            str(mail.get("from", "") or ""),
-        ])
+        return " ".join(
+            [
+                str(mail.get("subject", "") or ""),
+                str(mail.get("body", "") or ""),
+                str(mail.get("from", "") or ""),
+            ]
+        )
 
     # ----------------------------------------------------------------- public
     def wait_for_code(self) -> str:
@@ -379,10 +380,7 @@ class AliasMailCodeReceiver:
             RuntimeError: if the alias_mail backend is not importable.
         """
         if self.alias_mail is None:
-            raise RuntimeError(
-                "alias_mail backend not available; see "
-                "alias_mail\\README.md"
-            )
+            raise RuntimeError("alias_mail backend not available; see alias_mail\\README.md")
         deadline = time.time() + self.timeout
         seen_ids: set[int] = set()
         last_err: Optional[BaseException] = None
@@ -395,8 +393,7 @@ class AliasMailCodeReceiver:
                 last_err = exc
                 if time.time() >= deadline:
                     raise TimeoutError(
-                        "alias_mail.list_mails kept failing for "
-                        "%.0fs: %r" % (self.timeout, exc)
+                        "alias_mail.list_mails kept failing for %.0fs: %r" % (self.timeout, exc)
                     ) from exc
                 time.sleep(self.interval)
                 continue
@@ -438,15 +435,22 @@ def _run_unit_tests() -> int:
     spec_cases = [
         # (input, expected, description)
         ("Your code is XAI0X1", "XAI0X1", "synthetic sample, sentence form"),
-        ("Subject: xAI verification\n\nXAI0X1", "XAI0X1", "synthetic sample, subject+body form"),
+        (
+            "Subject: xAI verification\n\nXAI0X1",
+            "XAI0X1",
+            "synthetic sample, subject+body form",
+        ),
         ("123456", None, "pure digits NOT a code we accept here"),
         ("ABCDEF", "ABCDEF", "plain 6-char uppercase alnum"),
         ("AB12CD34EF", "AB12CD34", "10-char run, 8-char pattern takes first 8"),
         ("", None, "empty input"),
     ]
     extra_cases = [
-        ("Your verification code is XAI0X1. It expires in 10 minutes.",
-         "XAI0X1", "typical x.ai email body (synthetic)"),
+        (
+            "Your verification code is XAI0X1. It expires in 10 minutes.",
+            "XAI0X1",
+            "typical x.ai email body (synthetic)",
+        ),
         ("ABCDEFGH", "ABCDEFGH", "8-char uppercase alnum, primary pattern 2"),
         ("your code is xai0x1", "XAI0X1", "lowercase still works (?i) flag"),
         ("验证码 ABCDEF", "ABCDEF", "Chinese keyword + 6-char code"),

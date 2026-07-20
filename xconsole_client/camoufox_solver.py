@@ -14,6 +14,7 @@ Env:
   TURNSTILE_TIMEOUT=60
   HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
 """
+
 from __future__ import annotations
 
 import atexit
@@ -241,9 +242,7 @@ class CamoufoxTurnstileSolver:
                 proxy=proxy_dict,
             )
             # Never pass viewport — Camoufox Juggler rejects isMobile.
-            launch_kwargs = {
-                k: v for k, v in opts.items() if k not in ("viewport", "screen")
-            }
+            launch_kwargs = {k: v for k, v in opts.items() if k not in ("viewport", "screen")}
             pw = sync_playwright().start()
             browser = pw.firefox.launch(**launch_kwargs)
             _shared["playwright"] = pw
@@ -421,9 +420,7 @@ class CamoufoxTurnstileSolver:
 
                 if not self._ensure_turnstile_api(page, min(deadline, time.time() + 8)):
                     self._click_email_path(page)
-                    if not self._ensure_turnstile_api(
-                        page, min(deadline, time.time() + 12)
-                    ):
+                    if not self._ensure_turnstile_api(page, min(deadline, time.time() + 12)):
                         raise RuntimeError("turnstile API not available on page")
                 else:
                     self._click_email_path(page)

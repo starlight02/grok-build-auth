@@ -27,15 +27,15 @@ Protocol (reverse-engineered from the live flow, 2026-06-29):
 The old 3-hop fan-out (grokipedia → grokusercontent → grok.com) is partially
 decommissioned; only the ``grokusercontent`` hop is still functional.
 """
+
 from __future__ import annotations
 
 import base64
 import json
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 import threading
 
@@ -46,11 +46,12 @@ from . import config as C
 # public helpers
 # --------------------------------------------------------------------------- #
 
+
 def parse_sso_jwt_url(rsc_body: str) -> Optional[str]:
     """Return the first SSO ``set-cookie?q=<JWT>`` URL found in *rsc_body*."""
     m = re.search(
         r'https?://[^\s"\'<>]+set-cookie\?q='
-        r'(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)',
+        r"(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)",
         rsc_body,
     )
     return m.group(0) if m else None
@@ -83,7 +84,7 @@ def parse_sso_from_set_cookies(set_cookies: List[str]) -> Optional[str]:
             continue
         # Match sso=<jwt> at cookie start or after a comma-joined boundary.
         m = re.search(
-            r'(?:^|,\s*)sso=(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)',
+            r"(?:^|,\s*)sso=(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)",
             sc,
             flags=re.IGNORECASE,
         )
@@ -94,9 +95,7 @@ def parse_sso_from_set_cookies(set_cookies: List[str]) -> Optional[str]:
 
 def _extract_jwt_from_url(url: str) -> Optional[str]:
     """Pull the ``q=<JWT>`` parameter out of a set-cookie URL."""
-    m = re.search(
-        r'q=(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)', url
-    )
+    m = re.search(r"q=(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)", url)
     return m.group(1) if m else None
 
 
@@ -104,12 +103,19 @@ def _extract_jwt_from_url(url: str) -> Optional[str]:
 # SSOExtractor
 # --------------------------------------------------------------------------- #
 
+
 # Type for the transport request method:
 #   (method, url, *, headers, body) -> (status, resp_headers, set_cookies, raw_bytes)
-TransportRequest = Callable[
-    [str, str, Dict[str, str], Optional[bytes]],
-    Tuple[int, Dict[str, str], List[str], bytes],
-]
+class TransportRequest(Protocol):
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Dict[str, str],
+        body: Optional[bytes] = None,
+    ) -> Tuple[int, Dict[str, str], List[str], bytes]: ...
+
 
 # Type for base-headers factory: () -> Dict[str, str]
 HeadersFactory = Callable[[], Dict[str, str]]
@@ -198,19 +204,24 @@ class SSOExtractor:
 
         # 3. hit the grokusercontent endpoint (retry once on transport errors)
         headers = self._base_headers()
-        headers.update({
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "sec-fetch-site": "cross-site",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-dest": "document",
-            "referer": C.ACCOUNTS_ORIGIN + "/",
-        })
+        headers.update(
+            {
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "sec-fetch-site": "cross-site",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-dest": "document",
+                "referer": C.ACCOUNTS_ORIGIN + "/",
+            }
+        )
         set_cookies: List[str] = []
         last_exc: Optional[BaseException] = None
         for attempt in range(2):
             try:
                 _status, _hdrs, set_cookies, _raw = self._request(
-                    "GET", success_url, headers=headers, body=None,
+                    "GET",
+                    success_url,
+                    headers=headers,
+                    body=None,
                 )
                 last_exc = None
                 if self.debug:
@@ -223,7 +234,9 @@ class SSOExtractor:
                 # Some transports accept headers as keyword-only without body=.
                 try:
                     _status, _hdrs, set_cookies, _raw = self._request(
-                        "GET", success_url, headers=headers,
+                        "GET",
+                        success_url,
+                        headers=headers,
                     )
                     last_exc = None
                     break
@@ -235,6 +248,7 @@ class SSOExtractor:
                     print(f"  [sso] request failed (attempt {attempt + 1}): {exc}")
                 if attempt == 0:
                     import time as _time
+
                     _time.sleep(0.4)
         if last_exc is not None:
             if self.debug:
@@ -246,8 +260,7 @@ class SSOExtractor:
 
         # 5. persist if requested
         if token and (save or email):
-            path = save_sso(token, email=email, password=password,
-                            output_dir=output_dir)
+            path = save_sso(token, email=email, password=password, output_dir=output_dir)
             if self.debug:
                 print(f"  [sso] saved to: {path}")
 
@@ -283,6 +296,7 @@ class SSOExtractor:
 # --------------------------------------------------------------------------- #
 # SSO persistence — save extracted tokens to a dedicated directory
 # --------------------------------------------------------------------------- #
+
 
 # Default output directory, resolved relative to the xconsole repo root.
 def _default_output_dir() -> Path:
@@ -350,9 +364,7 @@ def save_sso(
         record["payload"] = payload
 
     filepath = target / filename
-    filepath.write_text(
-        json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    filepath.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # Pure SSO list: one JWT per line, no email/password/metadata.
     list_path = target / _SSO_LIST_NAME
