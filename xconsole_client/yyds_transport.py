@@ -19,6 +19,7 @@ Usage:
     email = inbox.create()
     code = inbox.wait_for_code(timeout=90)
 """
+
 from __future__ import annotations
 
 import os
@@ -123,8 +124,7 @@ class YydsInbox:
     def _require_creds(self) -> None:
         if not (self.api_key or "").strip() and not (self.jwt or "").strip():
             raise RuntimeError(
-                "YYDS credentials missing: set YYDS_API_KEY or YYDS_JWT "
-                "(see .env.example)"
+                "YYDS credentials missing: set YYDS_API_KEY or YYDS_JWT (see .env.example)"
             )
 
     def _request(
@@ -151,9 +151,7 @@ class YydsInbox:
             proxies=self._proxies(),
         )
         if resp.status_code >= 400:
-            raise RuntimeError(
-                f"YYDS {method} {path} failed: {resp.status_code} {resp.text[:300]}"
-            )
+            raise RuntimeError(f"YYDS {method} {path} failed: {resp.status_code} {resp.text[:300]}")
         try:
             data = resp.json() if resp.content else {}
         except ValueError as exc:
@@ -199,8 +197,7 @@ class YydsInbox:
             # keep allow-list order uniqueness then fill any verified matches
             if not picked:
                 raise RuntimeError(
-                    "YYDS_DOMAINS set but none match verified domains: "
-                    + ",".join(preferred[:8])
+                    "YYDS_DOMAINS set but none match verified domains: " + ",".join(preferred[:8])
                 )
             return picked
         return verified
@@ -262,10 +259,7 @@ class YydsInbox:
             except (requests.RequestException, RuntimeError) as exc:
                 last_err = exc
                 if self.debug:
-                    print(
-                        f"  [YYDS] create attempt {attempt + 1}/4 "
-                        f"domain={domain} failed: {exc}"
-                    )
+                    print(f"  [YYDS] create attempt {attempt + 1}/4 domain={domain} failed: {exc}")
                 time.sleep(0.5 + attempt * 0.4)
 
         raise RuntimeError(f"YYDS create failed after retries: {last_err}")
@@ -353,7 +347,7 @@ class YydsInbox:
                     msg.get("id")
                     or msg.get("messageId")
                     or msg.get("_id")
-                    or f"{msg.get('from','')}:{msg.get('subject','')}:{msg.get('createdAt') or msg.get('date') or ''}"
+                    or f"{msg.get('from', '')}:{msg.get('subject', '')}:{msg.get('createdAt') or msg.get('date') or ''}"
                 )
                 if mid in seen_ids:
                     continue
@@ -394,22 +388,15 @@ class YydsInbox:
                     f"{total:.0f}s ({len(seen_ids)} messages seen)"
                 )
             if self.debug:
-                print(
-                    f"  [YYDS] polling... ({len(seen_ids)} msgs so far, "
-                    f"{remaining:.0f}s left)"
-                )
+                print(f"  [YYDS] polling... ({len(seen_ids)} msgs so far, {remaining:.0f}s left)")
             time.sleep(min(self.interval, remaining))
 
 
 _CODE_PATTERNS = (
     re.compile(r"(?<![A-Z0-9])([A-Z0-9]{3}-[A-Z0-9]{3})(?![A-Z0-9])"),
     re.compile(r"(?<![A-Z0-9])([A-Z0-9]{6})(?![A-Z0-9])"),
-    re.compile(
-        r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{3}-[A-Z0-9]{3})"
-    ),
-    re.compile(
-        r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{6})"
-    ),
+    re.compile(r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{3}-[A-Z0-9]{3})"),
+    re.compile(r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{6})"),
 )
 
 

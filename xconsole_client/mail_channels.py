@@ -14,6 +14,7 @@ Design goals
 
 Built-ins: ``tempmail``, ``yyds``, ``cloudflare``.
 """
+
 from __future__ import annotations
 
 import os
@@ -43,8 +44,7 @@ class ChannelBusy(Exception):
         self.retry_after = max(0.05, float(retry_after))
         self.reason = reason or "busy"
         super().__init__(
-            f"channel {self.channel} busy ({self.reason}, "
-            f"retry_after={self.retry_after:.2f}s)"
+            f"channel {self.channel} busy ({self.reason}, retry_after={self.retry_after:.2f}s)"
         )
 
 
@@ -123,15 +123,9 @@ def register_channel(spec: ChannelSpec, *, replace: bool = False) -> None:
     with _REGISTRY_LOCK:
         if name in _REGISTRY and not replace:
             raise ValueError(
-                f"mail channel {name!r} already registered "
-                f"(use replace=True to override)"
+                f"mail channel {name!r} already registered (use replace=True to override)"
             )
         _REGISTRY[name] = spec
-
-
-def unregister_channel(name: str) -> None:
-    with _REGISTRY_LOCK:
-        _REGISTRY.pop((name or "").strip().lower(), None)
 
 
 def get_channel(name: str) -> Optional[ChannelSpec]:
@@ -209,9 +203,7 @@ def _create_cloudflare() -> Tuple[str, Any]:
         cf = AliasMailAccount.ensure_cf()
         alloc = AliasMailAccount(cf)
         address = alloc.create(prefix="xai")
-    receiver = AliasMailCodeReceiver(
-        cf, address=address, timeout=120, interval=3, since_now=True
-    )
+    receiver = AliasMailCodeReceiver(cf, address=address, timeout=120, interval=3, since_now=True)
     return address, receiver
 
 
@@ -271,11 +263,7 @@ _register_builtins()
 
 
 def parse_channel_list(raw: str) -> List[str]:
-    parts = [
-        p.strip().lower()
-        for p in re.split(r"[,，\s|]+", raw or "")
-        if p.strip()
-    ]
+    parts = [p.strip().lower() for p in re.split(r"[,，\s|]+", raw or "") if p.strip()]
     out: List[str] = []
     seen: set[str] = set()
     known = set(known_channels())
@@ -283,9 +271,7 @@ def parse_channel_list(raw: str) -> List[str]:
         if p in {"auto", "all", "*"}:
             continue
         if p not in known:
-            raise ValueError(
-                f"unknown mail channel {p!r}; registered: {sorted(known)}"
-            )
+            raise ValueError(f"unknown mail channel {p!r}; registered: {sorted(known)}")
         if p not in seen:
             seen.add(p)
             out.append(p)
@@ -296,6 +282,7 @@ def detect_available_channels() -> List[str]:
     """Channels that look usable under current env."""
     _register_builtins()
     found = [n for n, spec in _REGISTRY.items() if spec.is_available()]
+
     # Stable: higher default weight first for display.
     def _w(n: str) -> int:
         s = get_channel(n)
@@ -330,10 +317,7 @@ def resolve_channels(choice: str = "auto") -> List[str]:
         return found
 
     if raw not in _REGISTRY:
-        raise ValueError(
-            f"unknown email backend {raw!r}; "
-            f"use auto|{'|'.join(known_channels())}"
-        )
+        raise ValueError(f"unknown email backend {raw!r}; use auto|{'|'.join(known_channels())}")
     return [raw]
 
 
@@ -484,9 +468,7 @@ class ChannelRouter:
             raise ValueError("ChannelRouter requires at least one channel")
         for c in chans:
             if c not in _REGISTRY and not (creators and c in creators):
-                raise ValueError(
-                    f"unknown mail channel {c!r}; registered={known_channels()}"
-                )
+                raise ValueError(f"unknown mail channel {c!r}; registered={known_channels()}")
 
         self._channels = chans
         # Creators: explicit map wins; else registry.
@@ -507,9 +489,7 @@ class ChannelRouter:
             c: _ChannelState(
                 name=c,
                 weight=int(w.get(c, 50)),
-                capacity=int(
-                    (capacities or {}).get(c, channel_capacity(c))
-                ),
+                capacity=int((capacities or {}).get(c, channel_capacity(c))),
             )
             for c in chans
         }
@@ -521,10 +501,6 @@ class ChannelRouter:
     @property
     def channels(self) -> List[str]:
         return list(self._channels)
-
-    @property
-    def single_channel(self) -> bool:
-        return self._single
 
     def summary(self) -> str:
         now = time.time()
@@ -576,6 +552,7 @@ class ChannelRouter:
                 waiting.append((wait, st))
 
         if ready:
+
             def score(st: _ChannelState) -> tuple:
                 penalized = 1 if st.penalty_until > now else 0
                 headroom = max(0, st.capacity - st.in_flight)
@@ -615,9 +592,7 @@ class ChannelRouter:
 
             try:
                 prev = os.environ.get("MAIL_CREATE_ALLOW_WAIT")
-                os.environ["MAIL_CREATE_ALLOW_WAIT"] = (
-                    "1" if self._allow_wait else "0"
-                )
+                os.environ["MAIL_CREATE_ALLOW_WAIT"] = "1" if self._allow_wait else "0"
                 try:
                     email, receiver = self._creators[ch]()
                 finally:
@@ -634,14 +609,10 @@ class ChannelRouter:
                     st.last_error = str(exc)[:160]
                     if kind == "rate":
                         st.busy_hits += 1
-                        st.rate_free_at = max(
-                            st.rate_free_at, time.time() + retry
-                        )
+                        st.rate_free_at = max(st.rate_free_at, time.time() + retry)
                     else:
                         st.created_fail += 1
-                        st.penalty_until = max(
-                            st.penalty_until, time.time() + retry
-                        )
+                        st.penalty_until = max(st.penalty_until, time.time() + retry)
                         if not self._single:
                             hard_exclude.add(ch)
                 if self._single:
@@ -651,8 +622,7 @@ class ChannelRouter:
                     hard_exclude.clear()
                 else:
                     self._log(
-                        f"mail channel {ch} {kind}: {exc} "
-                        f"(next_slot≈{retry:.1f}s; overflow/retry)"
+                        f"mail channel {ch} {kind}: {exc} (next_slot≈{retry:.1f}s; overflow/retry)"
                     )
                 continue
 
@@ -675,9 +645,7 @@ class ChannelRouter:
                 created_at=time.time(),
             )
 
-        raise RuntimeError(
-            f"all mail channels failed/busy ({self.summary()}); last={last_err}"
-        )
+        raise RuntimeError(f"all mail channels failed/busy ({self.summary()}); last={last_err}")
 
 
 def build_router(

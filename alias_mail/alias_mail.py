@@ -15,14 +15,12 @@ No secrets are hardcoded. Configure via environment variables:
 from __future__ import annotations
 
 import argparse
-import email
 import html
 import json
 import os
 import random
 import re
 import secrets
-import string
 import sys
 import time
 from dataclasses import dataclass
@@ -103,10 +101,12 @@ class CF:
     def request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = API_BASE + path
         headers = kwargs.pop("headers", {})
-        headers.update({
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        })
+        headers.update(
+            {
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+            }
+        )
         # Do not inherit a local HTTPS_PROXY for Cloudflare API calls.
         kwargs.pop("proxies", None)
         last_error: Exception | None = None
@@ -153,8 +153,7 @@ def env_token() -> str:
     token = _env("CLOUDFLARE_API_TOKEN") or _env("CLOUDFLARE_MCP_READ_ALL_TOKEN")
     if not token:
         raise SystemExit(
-            "Missing CLOUDFLARE_API_TOKEN (or CLOUDFLARE_MCP_READ_ALL_TOKEN). "
-            "See .env.example."
+            "Missing CLOUDFLARE_API_TOKEN (or CLOUDFLARE_MCP_READ_ALL_TOKEN). See .env.example."
         )
     return token
 
@@ -172,16 +171,72 @@ def normalize_address(value: str) -> str:
 
 
 ENGLISH_FIRST_NAMES = [
-    "richard", "robert", "michael", "william", "david", "james", "john", "thomas",
-    "daniel", "paul", "mark", "george", "kevin", "brian", "edward", "henry",
-    "charles", "andrew", "steven", "patrick", "samuel", "arthur", "peter", "martin",
-    "emily", "sophia", "olivia", "emma", "grace", "alice", "claire", "linda",
-    "sarah", "laura", "anna", "julia", "victoria", "natalie", "rachel", "katherine",
+    "richard",
+    "robert",
+    "michael",
+    "william",
+    "david",
+    "james",
+    "john",
+    "thomas",
+    "daniel",
+    "paul",
+    "mark",
+    "george",
+    "kevin",
+    "brian",
+    "edward",
+    "henry",
+    "charles",
+    "andrew",
+    "steven",
+    "patrick",
+    "samuel",
+    "arthur",
+    "peter",
+    "martin",
+    "emily",
+    "sophia",
+    "olivia",
+    "emma",
+    "grace",
+    "alice",
+    "claire",
+    "linda",
+    "sarah",
+    "laura",
+    "anna",
+    "julia",
+    "victoria",
+    "natalie",
+    "rachel",
+    "katherine",
 ]
 ENGLISH_LAST_NAMES = [
-    "miller", "wilson", "taylor", "anderson", "thomas", "moore", "martin", "jackson",
-    "white", "harris", "clark", "lewis", "young", "walker", "hall", "allen",
-    "king", "wright", "scott", "green", "baker", "adams", "nelson", "carter",
+    "miller",
+    "wilson",
+    "taylor",
+    "anderson",
+    "thomas",
+    "moore",
+    "martin",
+    "jackson",
+    "white",
+    "harris",
+    "clark",
+    "lewis",
+    "young",
+    "walker",
+    "hall",
+    "allen",
+    "king",
+    "wright",
+    "scott",
+    "green",
+    "baker",
+    "adams",
+    "nelson",
+    "carter",
 ]
 
 
@@ -189,9 +244,6 @@ def random_local(prefix: str = "name") -> str:
     """Generate a human-looking English-name local-part for protocol registration flows."""
     first = secrets.choice(ENGLISH_FIRST_NAMES)
     last = secrets.choice(ENGLISH_LAST_NAMES)
-    num = secrets.randbelow(900) + 100
-    # ???????????????????/???/????
-    # ????????????? local-part?
     local = f"{first}{last}"
     clean_prefix = (prefix or "").strip("-_.").lower()
     if clean_prefix and clean_prefix not in {"name", "person", "mail", "email"}:
@@ -241,7 +293,9 @@ def save_health(data: dict[str, Any]) -> None:
     tmp.replace(HEALTH_FILE)
 
 
-def set_domain_health(domain: str, status: str, reason: str = "", sample: str = "") -> dict[str, Any]:
+def set_domain_health(
+    domain: str, status: str, reason: str = "", sample: str = ""
+) -> dict[str, Any]:
     domain = pick_domain(domain)
     data = load_health()
     data[domain] = {
@@ -258,7 +312,12 @@ def healthy_domains(include_unhealthy: bool = False) -> list[str]:
     if include_unhealthy:
         return DOMAINS[:]
     h = load_health()
-    bad = {d for d, v in h.items() if isinstance(v, dict) and v.get("status") in {"email_unreachable", "silent_drop", "disabled"}}
+    bad = {
+        d
+        for d, v in h.items()
+        if isinstance(v, dict)
+        and v.get("status") in {"email_unreachable", "silent_drop", "disabled"}
+    }
     good = [d for d in DOMAINS if d not in bad]
     return good
 
@@ -300,7 +359,9 @@ def reset_rotating_domain(start_domain: str | None = None) -> dict[str, Any]:
     return state
 
 
-def create_alias(cf: CF, address: str, password: str | None = None, source_meta: str = "local-tool") -> dict[str, Any]:
+def create_alias(
+    cf: CF, address: str, password: str | None = None, source_meta: str = "local-tool"
+) -> dict[str, Any]:
     address = normalize_address(address)
     cf.d1(
         """
@@ -309,7 +370,10 @@ def create_alias(cf: CF, address: str, password: str | None = None, source_meta:
         """,
         [address, password, source_meta],
     )
-    rows = cf.d1("SELECT id, name, password, source_meta, created_at, updated_at FROM address WHERE name = ?", [address])
+    rows = cf.d1(
+        "SELECT id, name, password, source_meta, created_at, updated_at FROM address WHERE name = ?",
+        [address],
+    )
     if not rows:
         raise SystemExit("创建失败：D1 未返回该地址")
     return rows[0]
@@ -353,7 +417,9 @@ def decode_mime_header(value: str | None) -> str:
 
 
 def decode_raw(raw: str) -> dict[str, str]:
-    msg = BytesParser(policy=policy.default).parsebytes(raw.encode("utf-8", errors="surrogateescape"))
+    msg = BytesParser(policy=policy.default).parsebytes(
+        raw.encode("utf-8", errors="surrogateescape")
+    )
     subject = decode_mime_header(msg.get("subject"))
     from_ = decode_mime_header(msg.get("from"))
     to = decode_mime_header(msg.get("to"))
@@ -475,19 +541,27 @@ def cmd_status(cf: CF, _args: argparse.Namespace) -> None:
     where_mail = _sql_like_or("address", len(likes))
     rows = cf.d1(f"SELECT COUNT(*) AS count FROM address WHERE {where}", likes)
     mails = cf.d1(f"SELECT COUNT(*) AS count FROM raw_mails WHERE {where_mail}", likes)
-    print(json.dumps({
-        "token_status": verify["result"]["status"],
-        "domains": DOMAINS,
-        "alias_count": rows[0]["count"] if rows else 0,
-        "mail_count": mails[0]["count"] if mails else 0,
-    }, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "token_status": verify["result"]["status"],
+                "domains": DOMAINS,
+                "alias_count": rows[0]["count"] if rows else 0,
+                "mail_count": mails[0]["count"] if mails else 0,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def cmd_create(cf: CF, args: argparse.Namespace) -> None:
     if args.address:
         address = args.address
     else:
-        domain = next_rotating_domain(commit=True) if args.rotate_domain else pick_domain(args.domain)
+        domain = (
+            next_rotating_domain(commit=True) if args.rotate_domain else pick_domain(args.domain)
+        )
         address = f"{random_local(args.prefix)}@{domain}"
     row = create_alias(cf, address, args.password, args.source_meta)
     row["domain_rotation"] = {
@@ -508,8 +582,7 @@ def cmd_inbox(cf: CF, args: argparse.Namespace) -> None:
         print(json.dumps(mails, ensure_ascii=False, indent=2))
     else:
         compact = [
-            {k: m.get(k) for k in ("id", "created_at", "from", "subject", "body")}
-            for m in mails
+            {k: m.get(k) for k in ("id", "created_at", "from", "subject", "body")} for m in mails
         ]
         print(json.dumps(compact, ensure_ascii=False, indent=2))
 
@@ -519,14 +592,20 @@ def cmd_code(cf: CF, args: argparse.Namespace) -> None:
     while True:
         mail = latest_code(cf, args.address, args.digits)
         if mail:
-            print(json.dumps({
-                "address": normalize_address(args.address),
-                "code": mail["code"],
-                "mail_id": mail["id"],
-                "created_at": mail["created_at"],
-                "from": mail.get("from"),
-                "subject": mail.get("subject"),
-            }, ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "address": normalize_address(args.address),
+                        "code": mail["code"],
+                        "mail_id": mail["id"],
+                        "created_at": mail["created_at"],
+                        "from": mail.get("from"),
+                        "subject": mail.get("subject"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
             return
         if time.time() >= deadline:
             raise SystemExit("timeout: 未找到验证码")
@@ -537,15 +616,17 @@ def cmd_domains_inbox(cf: CF, args: argparse.Namespace) -> None:
     mails = latest_domain_mails(cf, args.limit)
     compact = []
     for m in mails:
-        compact.append({
-            "id": m.get("id"),
-            "address": m.get("address"),
-            "created_at": m.get("created_at"),
-            "from": m.get("from") or m.get("source"),
-            "subject": m.get("subject"),
-            "code": m.get("code"),
-            "body": m.get("body") if args.full else (m.get("body") or "")[:240],
-        })
+        compact.append(
+            {
+                "id": m.get("id"),
+                "address": m.get("address"),
+                "created_at": m.get("created_at"),
+                "from": m.get("from") or m.get("source"),
+                "subject": m.get("subject"),
+                "code": m.get("code"),
+                "body": m.get("body") if args.full else (m.get("body") or "")[:240],
+            }
+        )
     print(json.dumps(compact, ensure_ascii=False, indent=2))
 
 
@@ -561,13 +642,18 @@ def cmd_poll_domains(cf: CF, args: argparse.Namespace) -> None:
     )
     baseline = int(baseline_rows[0]["max_id"] if baseline_rows else 0)
     min_id = baseline if args.since_now else None
-    print(json.dumps({
-        "polling_domains": DOMAINS,
-        "baseline_max_id": baseline,
-        "since_now": args.since_now,
-        "timeout": args.timeout,
-        "interval": args.interval,
-    }, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "polling_domains": DOMAINS,
+                "baseline_max_id": baseline,
+                "since_now": args.since_now,
+                "timeout": args.timeout,
+                "interval": args.interval,
+            },
+            ensure_ascii=False,
+        )
+    )
 
     seen: set[int] = set()
     deadline = time.time() + args.timeout
@@ -601,15 +687,33 @@ def cmd_poll_domains(cf: CF, args: argparse.Namespace) -> None:
 
 def cmd_health(_cf: CF, args: argparse.Namespace) -> None:
     if args.set:
-        info = set_domain_health(args.domain, args.set, reason=args.reason or "", sample=args.sample or "")
-        print(json.dumps({"domain": args.domain, "health": info, "health_file": str(HEALTH_FILE)}, ensure_ascii=False, indent=2))
+        info = set_domain_health(
+            args.domain, args.set, reason=args.reason or "", sample=args.sample or ""
+        )
+        print(
+            json.dumps(
+                {
+                    "domain": args.domain,
+                    "health": info,
+                    "health_file": str(HEALTH_FILE),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return
-    print(json.dumps({
-        "domains": DOMAINS,
-        "usable_domains": healthy_domains(),
-        "health": load_health(),
-        "health_file": str(HEALTH_FILE),
-    }, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "domains": DOMAINS,
+                "usable_domains": healthy_domains(),
+                "health": load_health(),
+                "health_file": str(HEALTH_FILE),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def cmd_next_domain(_cf: CF, args: argparse.Namespace) -> None:
@@ -618,12 +722,18 @@ def cmd_next_domain(_cf: CF, args: argparse.Namespace) -> None:
         print(json.dumps({"reset": True, **state}, ensure_ascii=False, indent=2))
         return
     domain = next_rotating_domain(commit=not args.peek)
-    print(json.dumps({
-        "domain": domain,
-        "committed": not args.peek,
-        "next_domain": next_rotating_domain(commit=False),
-        "state_file": str(STATE_FILE),
-    }, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "domain": domain,
+                "committed": not args.peek,
+                "next_domain": next_rotating_domain(commit=False),
+                "state_file": str(STATE_FILE),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

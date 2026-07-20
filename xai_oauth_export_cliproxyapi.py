@@ -8,6 +8,7 @@ Example:
 
 If --record is omitted, the newest oauth_output/xai_oauth_*.json is used.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -29,7 +30,11 @@ def newest_oauth_record() -> Path:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Export xAI OAuth JSON to CLIProxyAPI auth JSON")
-    p.add_argument("--record", default=None, help="Path to oauth_output/xai_oauth_*.json; defaults to newest")
+    p.add_argument(
+        "--record",
+        default=None,
+        help="Path to oauth_output/xai_oauth_*.json; defaults to newest",
+    )
     p.add_argument(
         "--cliproxyapi-auth-dir",
         required=True,

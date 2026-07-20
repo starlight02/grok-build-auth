@@ -23,6 +23,7 @@ Usage:
     # ... send email to address ...
     code = inbox.wait_for_code(timeout=90)
 """
+
 from __future__ import annotations
 
 import os
@@ -30,7 +31,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Optional
 
 import requests
 
@@ -61,6 +62,7 @@ def free_create_ready_in() -> float:
         return 0.0
     with _free_create_lock:
         return max(0.0, _free_create_next - time.time())
+
 
 def _pace_free_create(*, block: bool = True) -> None:
     """Serialize free-tier inbox creates to free max steady rate.
@@ -170,9 +172,7 @@ class TempmailInbox:
                     proxies=self._proxies(),
                 )
                 if resp.status_code == 429:
-                    last_err = RuntimeError(
-                        f"Tempmail.lol rate limited: {resp.text[:200]}"
-                    )
+                    last_err = RuntimeError(f"Tempmail.lol rate limited: {resp.text[:200]}")
                     # Multi-channel: fail over immediately; single-channel backoff.
                     if not allow_wait:
                         from xconsole_client.mail_channels import ChannelBusy
@@ -186,17 +186,14 @@ class TempmailInbox:
                     continue
                 if resp.status_code not in (200, 201):
                     raise RuntimeError(
-                        f"Tempmail.lol create inbox failed: "
-                        f"{resp.status_code} {resp.text[:300]}"
+                        f"Tempmail.lol create inbox failed: {resp.status_code} {resp.text[:300]}"
                     )
 
                 data = resp.json() if resp.content else {}
                 address = str(data.get("address") or data.get("email") or "").strip()
                 token = str(data.get("token") or "").strip()
                 if not address or not token:
-                    raise RuntimeError(
-                        f"Tempmail.lol create missing address/token: {data}"
-                    )
+                    raise RuntimeError(f"Tempmail.lol create missing address/token: {data}")
 
                 self.address = address
                 self.token = token
@@ -290,16 +287,18 @@ class TempmailInbox:
             emails = self.get_emails(budget=min(8.0, remaining))
             for email in emails:
                 # Use from+subject+date as a dedup key
-                eid = f"{email.get('from','')}:{email.get('subject','')}:{email.get('date','')}"
+                eid = f"{email.get('from', '')}:{email.get('subject', '')}:{email.get('date', '')}"
                 if eid in seen_ids:
                     continue
                 seen_ids.add(eid)
 
-                text = " ".join([
-                    email.get("subject", "") or "",
-                    email.get("body", "") or "",
-                    email.get("from", "") or "",
-                ])
+                text = " ".join(
+                    [
+                        email.get("subject", "") or "",
+                        email.get("body", "") or "",
+                        email.get("from", "") or "",
+                    ]
+                )
                 code = _extract_code(text)
                 if code:
                     if self.debug:
@@ -330,12 +329,8 @@ _CODE_PATTERNS = (
     # x.ai legacy format: 6 uppercase alphanumeric, no dash (e.g. "XAI0X1")
     re.compile(r"(?<![A-Z0-9])([A-Z0-9]{6})(?![A-Z0-9])"),
     # keyword-anchored fallbacks
-    re.compile(
-        r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{3}-[A-Z0-9]{3})"
-    ),
-    re.compile(
-        r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{6})"
-    ),
+    re.compile(r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{3}-[A-Z0-9]{3})"),
+    re.compile(r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{6})"),
 )
 
 

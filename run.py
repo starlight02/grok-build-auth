@@ -64,10 +64,11 @@ import uuid
 import json
 import base64
 import time
+import signal
 import threading
 import argparse
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 from typing import Optional
 
@@ -92,10 +93,8 @@ from xconsole_client.turnstile_pool import (
 from xconsole_client.mailbox_pool import MailboxPool, suggest_mail_pool_params
 from xconsole_client.mail_channels import (
     ChannelRouter,
-    Mailbox,
     build_router,
     cli_email_choices,
-    create_on_channel,
     resolve_channels,
 )
 from xconsole_client.proxy_pool import (
@@ -113,9 +112,6 @@ from xconsole_client.oauth_protocol import extract_cookies_from_auth_client
 from xconsole_client.sso2auth import mint_cpa_from_sso
 
 # -- secrets from environment only ---------------------------------------
-TEMPMAIL_KEY = os.environ.get("TEMPMAIL_API_KEY", "")
-YYDS_API_KEY = os.environ.get("YYDS_API_KEY", "")
-YYDS_JWT = os.environ.get("YYDS_JWT", "")
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 # Legacy single-proxy fallback (pool prefers PROXY_POOL / PROXY_POOL_FILE).
 PROXY = single_proxy_from_env()
@@ -141,6 +137,91 @@ def _mail_max_attempts() -> int:
 
 _results_lock = threading.Lock()
 _cf_lock = threading.Lock()
+_stop = threading.Event()
+_sigint_count = 0
+
+
+def request_stop(reason: str = "stop") -> None:
+    """Cooperative cancel: first Ctrl+C stops pools and closes browsers.
+
+    Full stats are printed only at process end (or second Ctrl+C),
+    so they stay at the bottom of the log — not buried by worker FAIL lines.
+    """
+    first = not _stop.is_set()
+    if first:
+        with _results_lock:
+            n = len(_results)
+        print(
+            f"\n  [{reason}] 正在停止… 已完成 {n}/{_total or '?'}，收尾后打印统计；再按一次 Ctrl+C 强制退出并立即打印统计",
+            flush=True,
+        )
+    _stop.set()
+    try:
+        from xconsole_client.drission_solver import _close_all_drission_browsers
+
+        _close_all_drission_browsers()
+    except Exception:
+        pass
+    try:
+        from xconsole_client import solver as _solver_mod
+
+        close_fn = getattr(_solver_mod, "_close_thread_browsers", None)
+        if callable(close_fn):
+            close_fn()
+    except Exception:
+        pass
+    pool = _token_pool
+    if pool is not None:
+        try:
+            pool.stop(wait=0.2)
+        except Exception:
+            pass
+    mpool = _mail_pool
+    if mpool is not None:
+        try:
+            mpool.stop(wait=0.2)
+        except Exception:
+            pass
+
+
+def _install_sigint_handler() -> None:
+    def _handler(signum, frame):  # noqa: ARG001
+        global _sigint_count
+        _sigint_count += 1
+        if _sigint_count >= 2:
+            print("\n  [SIGINT] 强制退出 — 统计如下（应在日志最底部）", flush=True)
+            _stop.set()
+            try:
+                # brief pause so in-flight prints that already started can finish
+                time.sleep(0.15)
+            except Exception:
+                pass
+            try:
+                _print_run_summary(
+                    check_quota=bool(_summary_ctx.get("check_quota")),
+                    do_oauth=bool(_summary_ctx.get("do_oauth", True)),
+                    title="Forced stop",
+                )
+            except Exception:
+                pass
+            try:
+                import sys as _sys
+
+                _sys.stdout.flush()
+                _sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(130)
+        request_stop("SIGINT")
+
+    try:
+        signal.signal(signal.SIGINT, _handler)
+    except Exception:
+        pass
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+    except Exception:
+        pass
 
 
 # Turnstile mint concurrency when pool is OFF. Env overrides; else follow -t.
@@ -161,9 +242,11 @@ _mail_router: Optional[ChannelRouter] = None
 _shared_solver = None
 _proxy_pool: Optional[ProxyPool] = None
 _results: list[dict] = []
-_done = 0
-_total = 0
+_done = 0  # attempts finished
+_ok = 0  # successes toward -n target
+_total = 0  # target success count
 _t0 = 0.0
+_summary_ctx: dict = {"check_quota": False, "do_oauth": True}
 
 
 def _acquire_proxy() -> str:
@@ -186,11 +269,17 @@ def _mark_proxy_bad(proxy: str, reason: str) -> None:
         )
 
 
-
 def _log(i: int, msg: str):
-    elapsed = time.time() - _t0
-    bar = f"[{_done}/{_total}]" if _total > 1 else ""
-    print(f"  {bar} [#{i}] {msg}  ({elapsed:.0f}s)")
+    elapsed = time.time() - _t0 if _t0 else 0
+    with _results_lock:
+        ok, done, total = _ok, _done, _total
+    if total > 1:
+        bar = f"[ok {ok}/{total} att {done}]"
+    elif total == 1:
+        bar = f"[ok {ok}/{total}]"
+    else:
+        bar = ""
+    print(f"  {bar} [#{i}] {msg}  ({elapsed:.0f}s)", flush=True)
 
 
 def _pool_enabled(solver_mode: str) -> bool:
@@ -208,8 +297,13 @@ def _acquire_turnstile(index: int, turnstile_solver) -> tuple[str, float]:
     global _token_pool
     pool = _token_pool
     if pool is not None:
-        item = pool.acquire(timeout=max(120.0, float(os.environ.get("TURNSTILE_TIMEOUT") or 60) * 4))
-        _log(index, f"Turnstile {len(item.token)} chars from pool (age={item.age:.0f}s q={pool.qsize()})")
+        item = pool.acquire(
+            timeout=max(120.0, float(os.environ.get("TURNSTILE_TIMEOUT") or 60) * 4)
+        )
+        _log(
+            index,
+            f"Turnstile {len(item.token)} chars from pool (age={item.age:.0f}s q={pool.qsize()})",
+        )
         return item.token, item.minted_at
     with _turnstile_lock:
         token = turnstile_solver.solve_turnstile(
@@ -230,23 +324,9 @@ def _mail_pool_enabled() -> bool:
     return True
 
 
-def _create_email_inbox(backend: str):
-    """Create one fresh inbox on a single registered channel.
-
-    Kept for compatibility; new code should prefer ``create_on_channel`` /
-    ``build_router`` from ``mail_channels``.
-    """
-    return create_on_channel(backend)
-
-
 def _build_mail_router(channels: list[str], *, log=None) -> ChannelRouter:
     """Build router from registry (creators resolved per ChannelSpec)."""
     return build_router(channels, log=log)
-
-
-def _make_email_provider(backend: str = "auto"):
-    """Return (email, receiver, channel) — prefer mailbox pool when running."""
-    return _acquire_email(backend, index=0)
 
 
 def _acquire_email(backend: str = "auto", index: int = 0) -> tuple[str, object, str]:
@@ -279,20 +359,6 @@ def _acquire_email(backend: str = "auto", index: int = 0) -> tuple[str, object, 
     if index:
         _log(index, f"email via {box.channel}: {box.email}")
     return box.email, box.receiver, box.channel
-
-
-def _save_account_bundle(result: dict, output_dir: Path) -> Path:
-    """Persist a combined signup+oauth record for later tooling (opt-in)."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    email = str(result.get("email") or "unknown")
-    safe = (
-        "".join(ch if ch.isalnum() or ch in "._-@" else "_" for ch in email)
-        or "unknown"
-    )
-    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    path = output_dir / f"account_{safe}_{ts}.json"
-    path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
 
 
 def _default_failed_auth_dir(auth_dir: str | Path) -> Path:
@@ -360,8 +426,7 @@ def _check_and_gate_auth(
         wait_s = 2.0 * attempt  # 2s, 4s
         _log(
             index,
-            f"quota probe attempt {attempt}/{attempts} status={status}; "
-            f"retry in {wait_s:.0f}s",
+            f"quota probe attempt {attempt}/{attempts} status={status}; retry in {wait_s:.0f}s",
         )
         time.sleep(wait_s)
 
@@ -411,7 +476,6 @@ def _check_and_gate_auth(
     }
 
 
-
 def register_one(
     index: int,
     email_backend: str = "tempmail",
@@ -426,6 +490,9 @@ def register_one(
     failed_auth_dir: Optional[str | Path] = None,
     check_quota_timeout: float = 45.0,
 ) -> dict:
+    if _stop.is_set():
+        return {"error": "stopped", "email": None}
+
     """Run signup (+ optional Build OAuth export). Thread-safe.
 
     On proxy transport failures (timeout / CONNECT abort), mark the proxy bad
@@ -486,7 +553,7 @@ def register_one(
         return last
     finally:
         with _results_lock:
-            global _done
+            global _done, _ok
             _done += 1
 
 
@@ -523,12 +590,13 @@ def _register_one_attempt(
             "error": f"Turnstile solver unavailable: {exc}",
         }
 
-    # curl_cffi is often CF-blocked on residential/datacenter IPs that Safari/urllib still pass.
+    # HTTP transport is independent of Turnstile solver.
+    # Safari only serializes token mint (HID); registration threads still use -t.
+    # Default curl_cffi for all solvers; override with XCONSOLE_TRANSPORT=urllib|auto.
     transport = (os.environ.get("XCONSOLE_TRANSPORT") or "").strip().lower()
     if not transport:
-        solver = (os.environ.get("TURNSTILE_SOLVER") or "").strip().lower()
-        transport = "urllib" if solver in {"safari", "webkit-system", "system-safari"} else "curl_cffi"
-    if transport not in {"curl_cffi", "urllib"}:
+        transport = "curl_cffi"
+    if transport not in {"curl_cffi", "urllib", "auto"}:
         transport = "curl_cffi"
     c = XConsoleAuthClient(
         debug=False,
@@ -607,9 +675,7 @@ def _register_one_attempt(
             if last_err is not None:
                 code_box["err"] = last_err
 
-        mail_thread = threading.Thread(
-            target=_mail_loop, name=f"mail-{index}", daemon=True
-        )
+        mail_thread = threading.Thread(target=_mail_loop, name=f"mail-{index}", daemon=True)
         mail_thread.start()
 
         ts_t0 = time.time()
@@ -635,8 +701,7 @@ def _register_one_attempt(
         if not code:
             err = code_box.get("err")
             raise err or RuntimeError(
-                f"email code timeout after {mail_attempts} inbox(es) "
-                f"× {mail_timeout:.0f}s"
+                f"email code timeout after {mail_attempts} inbox(es) × {mail_timeout:.0f}s"
             )
         _log(index, f"code: {code}")
         c.verify_email_validation_code(email, code)
@@ -786,11 +851,7 @@ def _register_one_attempt(
                         "refresh_token": mint.get("refresh_token") or "",
                     }
                 )
-                userinfo = (
-                    mint.get("userinfo")
-                    if isinstance(mint.get("userinfo"), dict)
-                    else {}
-                )
+                userinfo = mint.get("userinfo") if isinstance(mint.get("userinfo"), dict) else {}
                 cpa_path = Path(str(mint["path"])) if mint.get("path") else None
                 oauth = OAuthLoginResult(
                     token=token,
@@ -815,9 +876,7 @@ def _register_one_attempt(
             # Optional: only keep auth files that still have Build free quota.
             if check_quota and oauth.cliproxyapi_path:
                 fail_dir = (
-                    Path(failed_auth_dir)
-                    if failed_auth_dir
-                    else _default_failed_auth_dir(auth_dir)
+                    Path(failed_auth_dir) if failed_auth_dir else _default_failed_auth_dir(auth_dir)
                 )
                 gate = _check_and_gate_auth(
                     Path(oauth.cliproxyapi_path),
@@ -853,13 +912,131 @@ def _register_one_attempt(
         c.close()
 
 
+def _result_is_success(r: dict, *, do_oauth: bool) -> bool:
+    """Success for -n target: BUILD export if oauth on, else SSO cookie."""
+    if do_oauth:
+        return bool(r and r.get("cliproxyapi_auth"))
+    return bool(r and r.get("sso"))
+
+
+def _print_run_summary(
+    *, check_quota: bool = False, do_oauth: bool = True, title: str = "Done"
+) -> None:
+    """Print per-account lines first, aggregate stats LAST (always at log bottom)."""
+    with _results_lock:
+        rows = list(_results)
+    ok_sso = [r for r in rows if r.get("sso")]
+    ok_build = [r for r in rows if r.get("cliproxyapi_auth")]
+    denied = [r for r in rows if r.get("chat_endpoint_denied")]
+    quota_fail = [
+        r for r in rows if r.get("cliproxyapi_auth_failed") and not r.get("chat_endpoint_denied")
+    ]
+    fail = [
+        r for r in rows if r.get("error") and not r.get("cliproxyapi_auth") and not r.get("sso")
+    ]
+    stopped = [r for r in rows if str(r.get("error") or "").startswith("stopped")]
+    elapsed = time.time() - _t0 if _t0 else 0.0
+
+    # Successes first (what user cares about), then failures (truncated errors).
+    print(f"\n----- 账号明细 ({len(rows)}) -----", flush=True)
+    if ok_build:
+        print(f"  [BUILD OK] {len(ok_build)}", flush=True)
+        for r in ok_build:
+            rem = r.get("quota_remaining_tokens")
+            extra = f"  tokens={rem}" if rem is not None else ""
+            print(
+                f"    + {r.get('email') or '?':40s}  {r.get('cliproxyapi_auth')}{extra}",
+                flush=True,
+            )
+    if ok_sso and not ok_build:
+        print(f"  [SSO only] {len(ok_sso)}", flush=True)
+        for r in ok_sso:
+            print(f"    + {r.get('email') or '?'}", flush=True)
+    elif ok_sso:
+        sso_only = [r for r in ok_sso if not r.get("cliproxyapi_auth")]
+        if sso_only:
+            print(f"  [SSO only / OAuth 未完成] {len(sso_only)}", flush=True)
+            for r in sso_only:
+                err = r.get("error")
+                if err:
+                    print(f"    ~ {r.get('email') or '?':40s}  {err}", flush=True)
+                else:
+                    print(f"    + {r.get('email') or '?'}", flush=True)
+    if denied:
+        print(f"  [DENIED] {len(denied)}", flush=True)
+        for r in denied[:20]:
+            print(
+                f"    - {r.get('email') or '?':40s}  {r.get('error', '?')}",
+                flush=True,
+            )
+        if len(denied) > 20:
+            print(f"    ... +{len(denied) - 20} more", flush=True)
+    if quota_fail:
+        print(f"  [QUOTA FAIL] {len(quota_fail)}", flush=True)
+        for r in quota_fail[:20]:
+            print(
+                f"    - {r.get('email') or '?':40s}  {r.get('error', '?')}",
+                flush=True,
+            )
+        if len(quota_fail) > 20:
+            print(f"    ... +{len(quota_fail) - 20} more", flush=True)
+
+    # Collapse identical FAIL reasons so 98 lines don't bury the footer.
+    fail_rows = [r for r in fail if not str(r.get("error") or "").startswith("stopped")]
+    if fail_rows:
+        from collections import Counter
+
+        reasons: Counter[str] = Counter()
+        for r in fail_rows:
+            msg = str(r.get("error") or "?")
+            # keep first line / first 120 chars as bucket key
+            key = msg.split("\n", 1)[0].strip()
+            if len(key) > 120:
+                key = key[:117] + "..."
+            reasons[key] += 1
+        print(f"  [FAIL] {len(fail_rows)}", flush=True)
+        for reason, n in reasons.most_common(12):
+            print(f"    x{n:3d}  {reason}", flush=True)
+        if len(reasons) > 12:
+            print(f"    ... +{len(reasons) - 12} more reason buckets", flush=True)
+
+    parts = [
+        f"{title} in {elapsed:.0f}s",
+        f"ok={len(ok_build) if _summary_ctx.get('do_oauth') else len(ok_sso)}/{_total or '?'}",
+        f"attempts={len(rows)}",
+        f"SSO OK: {len(ok_sso)}",
+        f"BUILD OK: {len(ok_build)}",
+    ]
+    if check_quota:
+        parts.append(f"DENIED: {len(denied)}")
+        parts.append(f"QUOTA FAIL: {len(quota_fail)}")
+    parts.append(f"FAIL: {len(fail_rows)}")
+    if stopped:
+        parts.append(f"STOPPED: {len(stopped)}")
+    print(f"\n{'=' * 50}", flush=True)
+    print("  |  ".join(parts), flush=True)
+    print(f"{'=' * 50}", flush=True)
+    if ok_build:
+        print(f"  已注册 BUILD: {len(ok_build)}  （明细见上）", flush=True)
+    elif ok_sso:
+        print(f"  已拿到 SSO: {len(ok_sso)}（尚未 BUILD 导出）", flush=True)
+    else:
+        print("  本轮无成功账号", flush=True)
+
+
 def main():
     global _total, _t0
     default_auth = str(default_cliproxyapi_auth_dir())
     p = argparse.ArgumentParser(
         description="grok-build-auth: x.ai register + SSO + Grok Build OAuth (CLIProxyAPI-ready)",
     )
-    p.add_argument("-n", "--count", type=int, default=1, help="账号数量")
+    p.add_argument(
+        "-n",
+        "--count",
+        type=int,
+        default=1,
+        help="目标成功账号数（一直尝试直到成功数达标或 Ctrl+C；非尝试次数）",
+    )
     p.add_argument(
         "-t",
         "--threads",
@@ -921,12 +1098,15 @@ def main():
         help="额度探测超时秒数（默认 45）",
     )
     args = p.parse_args()
+    _install_sigint_handler()
 
-    _total = args.count
+    _total = max(1, int(args.count))
     _t0 = time.time()
-    threads = min(args.threads, args.count)
+    threads = max(1, int(args.threads))
     do_oauth = not args.no_oauth
     check_quota = bool(args.check_quota) and do_oauth
+    _summary_ctx["check_quota"] = check_quota
+    _summary_ctx["do_oauth"] = do_oauth
     if args.check_quota and not do_oauth:
         print("warn: --check-quota ignored with --no-oauth", file=sys.stderr)
 
@@ -937,14 +1117,12 @@ def main():
     solver_mode = (os.environ.get("TURNSTILE_SOLVER") or "auto").strip().lower()
     ts_label = solver_mode if solver_mode else "auto"
     use_pool = _pool_enabled(solver_mode)
-    pool_size, pool_target, pool_minters = suggest_pool_params(
-        threads, solver_mode=solver_mode
-    )
+    pool_size, pool_target, pool_minters = suggest_pool_params(threads, solver_mode=solver_mode)
     use_mail_pool = _mail_pool_enabled()
     mail_channels = resolve_channels(args.email)
     mail_size, mail_target, mail_minters = suggest_mail_pool_params(threads)
     print(
-        f"grok-build-auth: {args.count} accounts, {threads} threads, email={args.email}, "
+        f"grok-build-auth: target {_total} success, {threads} threads, email={args.email}, "
         f"oauth={'on' if do_oauth else 'off'}, turnstile={ts_label}"
         f", pool={'on' if use_pool else 'off'}"
         f", mail-pool={'on' if use_mail_pool else 'off'}"
@@ -983,6 +1161,7 @@ def main():
         print(f"  turnstile-parallel:   {par} (pool off; auto from -t={threads})")
 
     global _token_pool, _mail_pool, _mail_router, _shared_solver, _turnstile_lock, _proxy_pool
+
     def _proxy_log(msg: str) -> None:
         print(f"  [proxy-pool] {msg}", flush=True)
 
@@ -994,7 +1173,7 @@ def main():
     if _proxy_pool is not None:
         print(f"  proxy-pool:           {_proxy_pool.summary()}")
     elif PROXY:
-        print(f"  proxy:                single (HTTPS_PROXY/HTTP_PROXY)")
+        print("  proxy:                single (HTTPS_PROXY/HTTP_PROXY)")
     print()
 
     _token_pool = None
@@ -1055,17 +1234,59 @@ def main():
             check_quota_timeout=args.check_quota_timeout,
         )
 
-        if args.count == 1:
-            result = register_one(1, email_backend=args.email, **common_kwargs)
-            _results.append(result)
-        else:
-            with ThreadPoolExecutor(max_workers=threads) as ex:
-                futures = [
-                    ex.submit(register_one, i, args.email, **common_kwargs)
-                    for i in range(1, args.count + 1)
-                ]
-                for f in as_completed(futures):
-                    _results.append(f.result())
+        def _record(result: dict) -> None:
+            global _ok
+            with _results_lock:
+                _results.append(result)
+                if _result_is_success(result, do_oauth=do_oauth):
+                    _ok += 1
+                    ok_now = _ok
+                else:
+                    ok_now = _ok
+            if ok_now >= _total and not _stop.is_set():
+                request_stop("target-reached")
+
+        next_index = 1
+        with ThreadPoolExecutor(max_workers=threads) as ex:
+            futures: dict = {}
+
+            def _submit_one() -> None:
+                nonlocal next_index
+                if _stop.is_set():
+                    return
+                with _results_lock:
+                    if _ok >= _total:
+                        return
+                idx = next_index
+                next_index += 1
+                futures[ex.submit(register_one, idx, args.email, **common_kwargs)] = idx
+
+            for _ in range(threads):
+                _submit_one()
+
+            while futures:
+                if _stop.is_set():
+                    for f in list(futures):
+                        f.cancel()
+                    done, _not_done = wait(set(futures), timeout=2.0)
+                    for f in done:
+                        futures.pop(f, None)
+                        try:
+                            _record(f.result(timeout=0))
+                        except Exception as exc:
+                            _record({"error": f"stopped: {exc}", "email": None})
+                    break
+                done, _pending = wait(set(futures), timeout=0.5, return_when=FIRST_COMPLETED)
+                for f in done:
+                    futures.pop(f, None)
+                    try:
+                        _record(f.result())
+                    except Exception as exc:
+                        _record({"error": str(exc), "email": None})
+                    with _results_lock:
+                        need_more = _ok < _total and not _stop.is_set()
+                    if need_more:
+                        _submit_one()
     finally:
         if _mail_pool is not None:
             _mail_pool.stop(wait=2.0)
@@ -1075,50 +1296,13 @@ def main():
             _token_pool.stop(wait=2.0)
             _token_pool = None
 
-    # summary
-    ok_sso = [r for r in _results if r.get("sso")]
-    ok_build = [r for r in _results if r.get("cliproxyapi_auth")]
-    denied = [r for r in _results if r.get("chat_endpoint_denied")]
-    quota_fail = [
-        r
-        for r in _results
-        if r.get("cliproxyapi_auth_failed") and not r.get("chat_endpoint_denied")
-    ]
-    fail = [r for r in _results if r.get("error") and not r.get("cliproxyapi_auth")]
-    print(f"\n{'=' * 50}")
-    parts = [
-        f"Done in {time.time() - _t0:.0f}s",
-        f"SSO OK: {len(ok_sso)}",
-        f"BUILD OK: {len(ok_build)}",
-    ]
-    if check_quota:
-        parts.append(f"DENIED: {len(denied)}")
-        parts.append(f"QUOTA FAIL: {len(quota_fail)}")
-    parts.append(f"FAIL: {len(fail)}")
-    print("  |  ".join(parts))
-    print(f"{'=' * 50}")
-    for r in _results:
-        email = r.get("email") or "?"
-        if r.get("cliproxyapi_auth"):
-            rem = r.get("quota_remaining_tokens")
-            extra = f"  tokens={rem}" if rem is not None else ""
-            print(f"  {email:40s}  BUILD  {r['cliproxyapi_auth']}{extra}")
-        elif r.get("chat_endpoint_denied"):
-            print(
-                f"  {email:40s}  DENIED  {r.get('cliproxyapi_auth_failed') or '-'}  "
-                f"({r.get('error', '?')})"
-            )
-        elif r.get("cliproxyapi_auth_failed"):
-            print(
-                f"  {email:40s}  QUOTA-FAIL  {r['cliproxyapi_auth_failed']}  "
-                f"({r.get('error', '?')})"
-            )
-        elif r.get("sso") and not do_oauth:
-            print(f"  {email:40s}  SSO    {r['sso'][:36]}...")
-        elif r.get("sso") and r.get("error"):
-            print(f"  {email:40s}  SSO-ok OAuth-FAIL: {r.get('error')}")
-        else:
-            print(f"  {email:40s}  FAIL: {r.get('error', '?')}")
+    # summary (also printed on Ctrl+C via request_stop / forced exit)
+    title = "Done"
+    if _stop.is_set():
+        # target-reached is success stop; Ctrl+C / other reasons stay Stopped
+        # request_stop sets event only; distinguish via ok count
+        title = "Done" if _ok >= _total else "Stopped"
+    _print_run_summary(check_quota=check_quota, do_oauth=do_oauth, title=title)
 
 
 if __name__ == "__main__":

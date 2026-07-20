@@ -10,6 +10,7 @@ Examples:
     python xai_build_quota_probe.py --auth-dir ./cliproxyapi_auth
     python xai_build_quota_probe.py --auth-dir ./cliproxyapi_auth --include-disabled
 """
+
 from __future__ import annotations
 
 import argparse
@@ -139,9 +140,7 @@ def summarize_response(resp: requests.Response) -> dict[str, Any]:
         ):
             out["code"] = BUILD_USAGE_BALANCE_EXHAUSTED
             out.setdefault("remaining_tokens", 0)
-        elif is_spending_limit_exhausted(
-            resp.status_code, body=body_text, error=out.get("error")
-        ):
+        elif is_spending_limit_exhausted(resp.status_code, body=body_text, error=out.get("error")):
             out["code"] = SPENDING_LIMIT_EXHAUSTED
         return out
 
@@ -218,7 +217,9 @@ def probe(path: Path, timeout: float, use_auth_base_url: bool = False) -> dict[s
         "max_output_tokens": 8,
     }
     # Build/CLI free quota lives on cli-chat-proxy.grok.com, not api.x.ai paid API.
-    base_url = str(auth.get("base_url") or DEFAULT_BASE_URL) if use_auth_base_url else DEFAULT_BASE_URL
+    base_url = (
+        str(auth.get("base_url") or DEFAULT_BASE_URL) if use_auth_base_url else DEFAULT_BASE_URL
+    )
     if "api.x.ai" in base_url:
         base_url = DEFAULT_BASE_URL
     url = build_url(base_url)
@@ -237,9 +238,13 @@ def probe(path: Path, timeout: float, use_auth_base_url: bool = False) -> dict[s
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Probe xAI/Grok Build free quota from auth JSON files")
+    parser = argparse.ArgumentParser(
+        description="Probe xAI/Grok Build free quota from auth JSON files"
+    )
     parser.add_argument("--auth-dir", required=True, help="CLIProxyAPI auth directory")
-    parser.add_argument("--include-disabled", action="store_true", help="Also probe disabled auth files")
+    parser.add_argument(
+        "--include-disabled", action="store_true", help="Also probe disabled auth files"
+    )
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--json", action="store_true", help="Print JSON instead of a table")
     parser.add_argument(
@@ -253,7 +258,9 @@ def main() -> None:
     results = []
     for path in load_auth_files(auth_dir, include_disabled=args.include_disabled):
         try:
-            results.append(probe(path, timeout=args.timeout, use_auth_base_url=args.use_auth_base_url))
+            results.append(
+                probe(path, timeout=args.timeout, use_auth_base_url=args.use_auth_base_url)
+            )
         except Exception as exc:  # keep probing other accounts
             results.append({"file": path.name, "error": f"{type(exc).__name__}: {exc}"})
 

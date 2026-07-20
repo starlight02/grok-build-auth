@@ -16,6 +16,7 @@ Examples:
   python check_accounts.py cliproxyapi_auth/user@example.com.json --json
   HTTPS_PROXY=http://127.0.0.1:7890 python check_accounts.py cliproxyapi_auth/
 """
+
 from __future__ import annotations
 
 import argparse
@@ -174,6 +175,7 @@ def is_spending_limit_exhausted(
             return True
     return any(m in joined for m in _SPENDING_LIMIT_MARKERS)
 
+
 def billing_url(base_url: str = DEFAULT_BASE_URL) -> str:
     """Weekly SuperGrok/Build usage lives on cli-chat-proxy /v1/billing."""
     base = normalize_base_url(base_url or DEFAULT_BASE_URL)
@@ -308,7 +310,6 @@ def parse_billing_payload(data: Any) -> dict[str, Any]:
         )
         out["monthly_used_usd"] = float(monthly_used) / 100.0
 
-
     return out
 
 
@@ -375,7 +376,6 @@ def fetch_billing_usage(
                     "on_demand_cap",
                     "on_demand_used",
                 ):
-
                     if k in mparsed and mparsed[k] is not None:
                         out[k] = mparsed[k]
                 # Keep a nested snapshot for JSON consumers.
@@ -457,14 +457,13 @@ _FREE_LABELS = {
 def _norm_label(value: str) -> str:
     return re.sub(r"[\s_\-]+", "", (value or "").strip().lower())
 
+
 def format_usd_cents(cents: Any) -> str:
     """Format USD cents as `$150.00`. Returns `--` for missing values."""
     value = _as_float(cents)
     if value is None:
         return "--"
     return f"${value / 100.0:,.2f}"
-
-
 
 
 def classify_plan_from_monthly_limit(monthly_limit: Any) -> dict[str, Any] | None:
@@ -484,9 +483,10 @@ def classify_plan_from_monthly_limit(monthly_limit: Any) -> dict[str, Any] | Non
     if limit <= 0:
         return None
     # Exact match like CPA panel TD().
-    if int(limit) == CPA_MONTHLY_LIMIT_SUPERGROK_HEAVY or abs(
-        limit - CPA_MONTHLY_LIMIT_SUPERGROK_HEAVY
-    ) < 0.5:
+    if (
+        int(limit) == CPA_MONTHLY_LIMIT_SUPERGROK_HEAVY
+        or abs(limit - CPA_MONTHLY_LIMIT_SUPERGROK_HEAVY) < 0.5
+    ):
         return {
             "plan": PLAN_SUPERGROK_HEAVY,
             "plan_reason": (
@@ -494,9 +494,7 @@ def classify_plan_from_monthly_limit(monthly_limit: Any) -> dict[str, Any] | Non
                 f"({format_usd_cents(limit)}/mo, CPA SuperGrok Heavy)"
             ),
         }
-    if int(limit) == CPA_MONTHLY_LIMIT_SUPERGROK or abs(
-        limit - CPA_MONTHLY_LIMIT_SUPERGROK
-    ) < 0.5:
+    if int(limit) == CPA_MONTHLY_LIMIT_SUPERGROK or abs(limit - CPA_MONTHLY_LIMIT_SUPERGROK) < 0.5:
         return {
             "plan": PLAN_SUPERGROK,
             "plan_reason": (
@@ -507,11 +505,8 @@ def classify_plan_from_monthly_limit(monthly_limit: Any) -> dict[str, Any] | Non
     # Unknown positive monthly allowance — paid, but not a known SuperGrok SKU.
     return {
         "plan": PLAN_PAID_OTHER,
-        "plan_reason": (
-            f"billing.monthlyLimit={limit} cents ({format_usd_cents(limit)}/mo)"
-        ),
+        "plan_reason": (f"billing.monthlyLimit={limit} cents ({format_usd_cents(limit)}/mo)"),
     }
-
 
 
 def classify_plan(
@@ -525,13 +520,13 @@ def classify_plan(
 ) -> dict[str, Any]:
     """Classify Free / SuperGrok Lite / SuperGrok / SuperGrok Heavy / other.
 
-      1) billing.monthlyLimit exact thresholds in USD cents
-         (CPA: 15000=$150/mo SuperGrok, 150000=$1500/mo Heavy)
+    1) billing.monthlyLimit exact thresholds in USD cents
+       (CPA: 15000=$150/mo SuperGrok, 150000=$1500/mo Heavy)
 
-      2) settings.subscription_tier_display (Free / SuperGrok / SuperGrok Lite / Heavy)
-      3) user.subscriptionTier (API enum, e.g. GrokPro)
-      4) billing productUsage / creditUsagePercent (paid signal)
-      5) JWT tier claim (weak)
+    2) settings.subscription_tier_display (Free / SuperGrok / SuperGrok Lite / Heavy)
+    3) user.subscriptionTier (API enum, e.g. GrokPro)
+    4) billing productUsage / creditUsagePercent (paid signal)
+    5) JWT tier claim (weak)
     """
     display = str(tier_display or "").strip()
     tiers = str(subscription_tiers or "").strip()
@@ -548,15 +543,27 @@ def classify_plan(
         reason = by_limit["plan_reason"]
         # If display explicitly says Lite/Heavy and conflicts, prefer more specific display.
         if display_n in {_norm_label(x) for x in _SUPERGROK_LITE_LABELS} and plan == PLAN_SUPERGROK:
-            plan, reason = PLAN_SUPERGROK_LITE, f"settings.subscription_tier_display={display}"
+            plan, reason = (
+                PLAN_SUPERGROK_LITE,
+                f"settings.subscription_tier_display={display}",
+            )
         elif display_n in {_norm_label(x) for x in _SUPERGROK_HEAVY_LABELS}:
-            plan, reason = PLAN_SUPERGROK_HEAVY, f"settings.subscription_tier_display={display}"
+            plan, reason = (
+                PLAN_SUPERGROK_HEAVY,
+                f"settings.subscription_tier_display={display}",
+            )
     elif display and display_n in {_norm_label(x) for x in _FREE_LABELS if x}:
         plan, reason = PLAN_FREE, "settings.subscription_tier_display=Free"
     elif display_n in {_norm_label(x) for x in _SUPERGROK_LITE_LABELS}:
-        plan, reason = PLAN_SUPERGROK_LITE, f"settings.subscription_tier_display={display}"
+        plan, reason = (
+            PLAN_SUPERGROK_LITE,
+            f"settings.subscription_tier_display={display}",
+        )
     elif display_n in {_norm_label(x) for x in _SUPERGROK_HEAVY_LABELS}:
-        plan, reason = PLAN_SUPERGROK_HEAVY, f"settings.subscription_tier_display={display}"
+        plan, reason = (
+            PLAN_SUPERGROK_HEAVY,
+            f"settings.subscription_tier_display={display}",
+        )
     elif display_n in {_norm_label(x) for x in _SUPERGROK_LABELS}:
         plan, reason = PLAN_SUPERGROK, f"settings.subscription_tier_display={display}"
     elif display:
@@ -571,8 +578,9 @@ def classify_plan(
         plan, reason = PLAN_PAID_OTHER, f"user.subscriptionTier={tiers}"
     elif has_product_usage or credit_usage_percent is not None:
         plan, reason = (
-            PLAN_SUPERGROK if has_product_usage else PLAN_PAID_OTHER
-        ), "billing.productUsage"
+            (PLAN_SUPERGROK if has_product_usage else PLAN_PAID_OTHER),
+            "billing.productUsage",
+        )
     elif jwt_tier is not None and str(jwt_tier).strip() not in {"", "0", "None"}:
         plan, reason = PLAN_PAID_OTHER, f"jwt.tier={jwt_tier}"
     else:
@@ -586,7 +594,6 @@ def classify_plan(
         "jwt_tier": jwt_tier,
         "monthly_limit": _as_float(monthly_limit),
     }
-
 
 
 def probe_strategy_for_plan(plan: str) -> dict[str, Any]:
@@ -614,7 +621,6 @@ def probe_strategy_for_plan(plan: str) -> dict[str, Any]:
                 "SuperGrok family: weekly productUsage + monthly included credit "
                 "in USD cents (CPA $150/$1500); 402 = Build balance"
             ),
-
         }
     if plan == PLAN_PAID_OTHER:
         return {
@@ -631,7 +637,6 @@ def probe_strategy_for_plan(plan: str) -> dict[str, Any]:
         "want_responses": True,
         "notes": "Unknown plan: run both detectors",
     }
-
 
 
 def fetch_plan_info(
@@ -708,9 +713,6 @@ def fetch_plan_info(
     return out
 
 
-
-
-
 def mask_email(value: str) -> str:
     value = (value or "").strip()
     if "@" not in value:
@@ -767,7 +769,6 @@ def jwt_meta(token: str, now: int | None = None) -> dict[str, Any]:
     }
 
 
-
 def header_int(headers: Any, name: str) -> int | None:
     raw = headers.get(name) if headers is not None else None
     if raw is None:
@@ -779,9 +780,7 @@ def header_int(headers: Any, name: str) -> int | None:
 
 
 def parse_exhausted(body: str) -> tuple[int | None, int | None]:
-    m = re.search(
-        r"tokens\s*\(actual/limit\)\s*:\s*(\d+)\s*/\s*(\d+)", body or "", re.I
-    )
+    m = re.search(r"tokens\s*\(actual/limit\)\s*:\s*(\d+)\s*/\s*(\d+)", body or "", re.I)
     if not m:
         return None, None
     return int(m.group(1)), int(m.group(2))
@@ -828,9 +827,7 @@ def summarize_response(resp: requests.Response) -> dict[str, Any]:
             resp.status_code, body=body_text, error=out.get("error")
         ):
             out["code"] = BUILD_USAGE_BALANCE_EXHAUSTED
-        elif is_spending_limit_exhausted(
-            resp.status_code, body=body_text, error=out.get("error")
-        ):
+        elif is_spending_limit_exhausted(resp.status_code, body=body_text, error=out.get("error")):
             out["code"] = SPENDING_LIMIT_EXHAUSTED
         return out
 
@@ -882,8 +879,6 @@ def summarize_response(resp: requests.Response) -> dict[str, Any]:
     return out
 
 
-
-
 def resolve_auth_record(path: Path) -> dict[str, Any]:
     """Normalize cliproxyapi_auth / accounts_output into one auth record."""
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -921,9 +916,7 @@ def resolve_auth_record(path: Path) -> dict[str, Any]:
     return {
         "email": data.get("email") or "",
         "access_token": token,
-        "refresh_token": data.get("refresh_token")
-        or data.get("oauth_refresh_token")
-        or "",
+        "refresh_token": data.get("refresh_token") or data.get("oauth_refresh_token") or "",
         "base_url": base_url,
         "headers": headers,
         "disabled": bool(data.get("disabled")),
@@ -965,7 +958,6 @@ def _cli_proxy_base(base_url: str = DEFAULT_BASE_URL) -> str:
     return base.rstrip("/")
 
 
-
 def _proxy_from_env() -> str:
     return (
         os.environ.get("HTTPS_PROXY")
@@ -981,9 +973,7 @@ def _iso_utc_now() -> str:
 
 def _iso_utc_from_unix(ts: Any) -> str:
     try:
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception:
         return ""
 
@@ -1017,9 +1007,7 @@ def persist_refreshed_tokens(auth_path: Path, token: dict[str, Any]) -> dict[str
         if iso:
             raw["expired"] = iso
     raw["last_refresh"] = _iso_utc_now()
-    auth_path.write_text(
-        json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    auth_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return raw
 
 
@@ -1068,11 +1056,9 @@ def refresh_auth_record(
         }
 
     auth_path_raw = str(auth.get("_auth_file") or auth.get("_source") or "").strip()
-    persisted = False
     if auth_path_raw:
         try:
             raw = persist_refreshed_tokens(Path(auth_path_raw), token)
-            persisted = True
             # Keep resolve-style shape but prefer disk content for token fields.
             updated = dict(auth)
             updated["access_token"] = str(raw.get("access_token") or "")
@@ -1180,13 +1166,17 @@ def check_one(
     if out["disabled"]:
         out["reasons"].append("disabled")
 
-    meta = jwt_meta(token, now=now) if token else {
-        "valid_jwt": False,
-        "expired": True,
-        "ttl_sec": None,
-        "scope": None,
-        "iss": None,
-    }
+    meta = (
+        jwt_meta(token, now=now)
+        if token
+        else {
+            "valid_jwt": False,
+            "expired": True,
+            "ttl_sec": None,
+            "scope": None,
+            "iss": None,
+        }
+    )
     out["jwt"] = {
         "valid": meta.get("valid_jwt"),
         "expired": meta.get("expired"),
@@ -1248,7 +1238,6 @@ def check_one(
         }
         return True
 
-
     # Proactive refresh when access token is missing/expired.
     if not token:
         if not _maybe_refresh("missing_access_token"):
@@ -1307,16 +1296,13 @@ def check_one(
     ):
         want_billing = bool(check_billing)
 
-
     # 1) responses probe
     # Free: authoritative for rolling free-token window (headers / 429 actual/limit)
     # SuperGrok: still needed for usability + 402 build-balance signal
     responses_url = urljoin(base_url.rstrip("/") + "/", "responses")
     out["responses_url"] = responses_url
     try:
-        resp = sess.post(
-            responses_url, headers=headers, json=PROBE_BODY, timeout=timeout
-        )
+        resp = sess.post(responses_url, headers=headers, json=PROBE_BODY, timeout=timeout)
         summary = summarize_response(resp)
         _apply_probe_summary(out, summary)
     except Exception as exc:
@@ -1346,9 +1332,7 @@ def check_one(
                 out["probe_strategy"] = strategy
                 want_billing = bool(check_billing) and out["plan"] != PLAN_FREE
             try:
-                resp = sess.post(
-                    responses_url, headers=headers, json=PROBE_BODY, timeout=timeout
-                )
+                resp = sess.post(responses_url, headers=headers, json=PROBE_BODY, timeout=timeout)
                 summary = summarize_response(resp)
                 _apply_probe_summary(out, summary)
                 # Drop prior network/auth noise after successful re-probe path.
@@ -1409,7 +1393,6 @@ def check_one(
             "billing_period_start",
             "billing_period_end",
             "billing_monthly",
-
         ):
             if k in billing:
                 out[k] = billing[k]
@@ -1427,13 +1410,10 @@ def check_one(
             out["plan_reason"] = refined.get("plan_reason")
             out["plan_info"] = {**(out.get("plan_info") or {}), **refined}
             out["probe_strategy"] = probe_strategy_for_plan(out["plan"])
-            out["reasons"] = [
-                r for r in out["reasons"] if not str(r).startswith("plan=")
-            ]
+            out["reasons"] = [r for r in out["reasons"] if not str(r).startswith("plan=")]
             out["reasons"].insert(0, f"plan={out['plan']}")
         elif refined.get("monthly_limit") is not None and out.get("monthly_limit") is None:
             out["monthly_limit"] = refined["monthly_limit"]
-
 
     # 3) optional /models smoke (uses final token)
     if check_models:
@@ -1507,14 +1487,11 @@ def check_one(
                 out["reasons"].append(str(out["probe_error"])[:120])
     elif status in (401, 403):
         out["usable"] = False
-        if (
-            out.get("code") == CHAT_ENDPOINT_DENIED
-            or is_chat_endpoint_denied(
-                status,
-                body=str((out.get("probe") or {}).get("error") or out.get("probe_error") or ""),
-                error=(out.get("probe") or {}).get("error") or out.get("probe_error"),
-                code=str(out.get("code") or "") or None,
-            )
+        if out.get("code") == CHAT_ENDPOINT_DENIED or is_chat_endpoint_denied(
+            status,
+            body=str((out.get("probe") or {}).get("error") or out.get("probe_error") or ""),
+            error=(out.get("probe") or {}).get("error") or out.get("probe_error"),
+            code=str(out.get("code") or "") or None,
         ):
             out["chat_endpoint_denied"] = True
             out["code"] = CHAT_ENDPOINT_DENIED
@@ -1554,7 +1531,6 @@ def check_one(
     return out
 
 
-
 def collect_paths(inputs: list[str]) -> list[Path]:
     paths: list[Path] = []
     seen: set[str] = set()
@@ -1590,7 +1566,11 @@ def collect_paths(inputs: list[str]) -> list[Path]:
                 head = c.read_text(encoding="utf-8", errors="ignore")[:200].lower()
             except Exception:
                 continue
-            if "access_token" not in head and "oauth_access_token" not in head and "cliproxyapi_auth" not in head:
+            if (
+                "access_token" not in head
+                and "oauth_access_token" not in head
+                and "cliproxyapi_auth" not in head
+            ):
                 # still allow if full file has token (small files)
                 try:
                     full = c.read_text(encoding="utf-8", errors="ignore").lower()
@@ -1653,7 +1633,7 @@ def print_table(results: list[dict[str, Any]]) -> None:
         print(f"       file={r.get('file')}  reasons={reasons}")
         if r.get("refresh_queued") and not r.get("refreshed"):
             print(
-                f"       refresh_queued=yes"
+                "       refresh_queued=yes"
                 + (
                     f" reason={r.get('refresh_queue_reason')}"
                     if r.get("refresh_queue_reason")
@@ -1701,15 +1681,10 @@ def print_table(results: list[dict[str, Any]]) -> None:
             period = ""
             if r.get("usage_period_start") or r.get("usage_period_end"):
                 period = (
-                    f"  period={r.get('usage_period_start', '?')}"
-                    f"..{r.get('usage_period_end', '?')}"
+                    f"  period={r.get('usage_period_start', '?')}..{r.get('usage_period_end', '?')}"
                 )
             if parts:
-                print(
-                    f"       billing={r.get('billing_status', '-')} "
-                    + " ".join(parts)
-                    + period
-                )
+                print(f"       billing={r.get('billing_status', '-')} " + " ".join(parts) + period)
             elif r.get("billing_error"):
                 print(
                     f"       billing={r.get('billing_status', '-')} "
@@ -1717,8 +1692,7 @@ def print_table(results: list[dict[str, Any]]) -> None:
                 )
             else:
                 print(
-                    f"       billing={r.get('billing_status', '-')} "
-                    f"(no productUsage bars){period}"
+                    f"       billing={r.get('billing_status', '-')} (no productUsage bars){period}"
                 )
 
         models = r.get("models") or {}
@@ -1853,8 +1827,6 @@ def _run_parallel_checks(
     return [by_path[str(p)] for p in paths]
 
 
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Check whether Grok Build auth JSON accounts are usable"
@@ -1951,8 +1923,6 @@ def main(argv: list[str] | None = None) -> int:
         refresh=False,
     )
 
-
-
     # Phase 2: queue 401 / expired JWT, refresh+reprobe at the end (also parallel).
     if do_refresh:
         queue_paths: list[Path] = []
@@ -2004,7 +1974,6 @@ def main(argv: list[str] | None = None) -> int:
                     r2.setdefault("reasons", []).insert(0, "access_token_refreshed")
                 results[idx] = r2
 
-
     if args.only_usable:
         results = [r for r in results if r.get("usable")]
     elif args.only_unusable:
@@ -2020,7 +1989,6 @@ def main(argv: list[str] | None = None) -> int:
     if not results:
         return 2
     return 0 if any(r.get("usable") for r in results) else 1
-
 
 
 if __name__ == "__main__":
