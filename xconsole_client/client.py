@@ -46,7 +46,7 @@ import re
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 from urllib.parse import quote
 
 from . import config as C
@@ -77,7 +77,9 @@ class _UrllibTransport:
             handlers.insert(0, urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
         self._opener = urllib.request.build_opener(*handlers)
 
-    def request(self, method, url, *, headers, body=None):
+    def request(
+        self, method: str, url: str, *, headers: Dict[str, str], body: Optional[bytes] = None
+    ) -> Tuple[int, Dict[str, str], List[str], bytes]:
         req = urllib.request.Request(url, data=body, method=method)
         for k, v in headers.items():
             req.add_header(k, v)
@@ -85,7 +87,7 @@ class _UrllibTransport:
             resp = self._opener.open(req, timeout=self._timeout)
         except urllib.error.HTTPError as e:
             resp = e
-        status = resp.getcode()
+        status = int(resp.getcode() or 0)
         raw = resp.read()
         if resp.headers.get("content-encoding", "").lower() == "gzip" and raw[:2] == b"\x1f\x8b":
             try:
@@ -104,6 +106,18 @@ class _UrllibTransport:
         pass
 
 
+class Transport(Protocol):
+    """Structural contract shared by _UrllibTransport and FingerprintTransport."""
+
+    cookies: Any
+
+    def request(
+        self, method: str, url: str, *, headers: Dict[str, str], body: Optional[bytes] = None
+    ) -> Tuple[int, Dict[str, str], List[str], bytes]: ...
+
+    def close(self) -> None: ...
+
+
 # --------------------------------------------------------------------------- #
 # public client
 # --------------------------------------------------------------------------- #
@@ -112,6 +126,7 @@ class XConsoleAuthClient:
 
     # After a successful curl_cffi→urllib fallback, stick to urllib for this process.
     _sticky_transport: Optional[str] = None
+    _t: Transport
 
     def __init__(
         self,
@@ -181,7 +196,9 @@ class XConsoleAuthClient:
         self._last_create_set_cookies = []
 
     # ----------------------------------------------------------------- transport wrappers
-    def _request(self, method, url, *, headers, body=None):
+    def _request(
+        self, method: str, url: str, *, headers: Dict[str, str], body: Optional[bytes] = None
+    ) -> Tuple[int, Dict[str, str], List[str], bytes]:
         return self._t.request(method, url, headers=headers, body=body)
 
     def _base_headers(self) -> Dict[str, str]:
@@ -297,7 +314,7 @@ class XConsoleAuthClient:
 
         if self.debug:
             print(
-                f"  [scrape] next-action={self._next_action_id[:16]}... "
+                f"  [scrape] next-action={(self._next_action_id or '')[:16]}... "
                 f"({len(self._next_action_id or '')} chars)"
             )
             print(f"  [scrape] router-state-tree len={len(self._next_router_state_tree or '')}")

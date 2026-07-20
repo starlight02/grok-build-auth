@@ -70,7 +70,7 @@ import argparse
 import shutil
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 _ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
@@ -843,15 +843,19 @@ def _register_one_attempt(
                         f"sso2auth failed: {mint.get('error')}"
                         + (f"; protocol: {protocol_err}" if protocol_err else "")
                     )
-                token = (
-                    mint.get("token")
-                    if isinstance(mint.get("token"), dict)
+                _mint_token = mint.get("token")
+                token: dict[str, Any] = (
+                    _mint_token
+                    if isinstance(_mint_token, dict)
                     else {
                         "access_token": mint.get("access_token") or "",
                         "refresh_token": mint.get("refresh_token") or "",
                     }
                 )
-                userinfo = mint.get("userinfo") if isinstance(mint.get("userinfo"), dict) else {}
+                _mint_userinfo = mint.get("userinfo")
+                userinfo: dict[str, Any] = (
+                    _mint_userinfo if isinstance(_mint_userinfo, dict) else {}
+                )
                 cpa_path = Path(str(mint["path"])) if mint.get("path") else None
                 oauth = OAuthLoginResult(
                     token=token,
@@ -1222,7 +1226,7 @@ def main():
         _mail_pool.start()
     try:
         accounts_dir = (args.accounts_output_dir or "").strip() or None
-        common_kwargs = dict(
+        common_kwargs: dict[str, Any] = dict(
             do_oauth=do_oauth,
             oauth_protocol=not args.no_oauth_protocol,
             oauth_debug=args.oauth_debug,

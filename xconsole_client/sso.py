@@ -35,7 +35,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 import threading
 
@@ -103,12 +103,19 @@ def _extract_jwt_from_url(url: str) -> Optional[str]:
 # SSOExtractor
 # --------------------------------------------------------------------------- #
 
+
 # Type for the transport request method:
 #   (method, url, *, headers, body) -> (status, resp_headers, set_cookies, raw_bytes)
-TransportRequest = Callable[
-    [str, str, Dict[str, str], Optional[bytes]],
-    Tuple[int, Dict[str, str], List[str], bytes],
-]
+class TransportRequest(Protocol):
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Dict[str, str],
+        body: Optional[bytes] = None,
+    ) -> Tuple[int, Dict[str, str], List[str], bytes]: ...
+
 
 # Type for base-headers factory: () -> Dict[str, str]
 HeadersFactory = Callable[[], Dict[str, str]]

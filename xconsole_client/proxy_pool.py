@@ -303,7 +303,7 @@ def _resolve_host_ip(host: str) -> str:
     try:
         infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
         for info in infos:
-            addr = info[4][0]
+            addr = str(info[4][0])
             if addr:
                 return addr
     except Exception:

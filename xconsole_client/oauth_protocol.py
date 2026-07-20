@@ -91,7 +91,7 @@ def resolve_submit_oauth2_consent_action(
         resolve_submit_oauth2_consent_action.last_source = "fallback"
         return SUBMIT_OAUTH2_CONSENT_ACTION
 
-    def _score(p: str) -> int:
+    def _score(p: str) -> Tuple[int, int]:
         # Prefer smaller page-specific chunks over giant shared bundles.
         name = p.rsplit("/", 1)[-1]
         return (0 if "0n0" in name or "consent" in name.lower() else 1, len(name))
@@ -258,7 +258,7 @@ class _UrllibCookieJar:
     def items(self):
         seen: Dict[str, str] = {}
         for ck in self._jar:
-            seen[ck.name] = ck.value
+            seen[ck.name] = ck.value or ""
         return seen.items()
 
     def __iter__(self):
@@ -464,6 +464,8 @@ class ProtocolOAuthClient:
         if not cookies:
             return
         jar = getattr(self._s, "cookies", None)
+        if jar is None:
+            return
         sso_domains = (
             "accounts.x.ai",
             ".x.ai",
@@ -515,7 +517,7 @@ class ProtocolOAuthClient:
         if not jwt_token:
             return
         jar = getattr(self._s, "cookies", None)
-        if not hasattr(jar, "set"):
+        if jar is None or not hasattr(jar, "set"):
             return
         for domain in (
             "accounts.x.ai",

@@ -60,7 +60,7 @@ class FingerprintTransport:
         debug: bool = False,
         proxy: Optional[str] = None,
     ):
-        if not _HAS_CURL_CFFI:
+        if not _HAS_CURL_CFFI or cc_requests is None:
             raise RuntimeError("curl_cffi is not installed. Install with: pip install curl_cffi")
         self._impersonate = impersonate
         self._http_version = http_version
