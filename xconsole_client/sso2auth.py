@@ -106,9 +106,7 @@ def _wait_device_code_slot(min_interval: float | None = None) -> None:
 def request_device_code(proxy: str = "", *, retries: int = 6) -> Optional[dict]:
     """Request device code with global throttle + 429/timeout backoff."""
     global _DEVICE_CODE_MIN_INTERVAL, _DEVICE_CODE_NEXT_OK
-    data = urllib.parse.urlencode(
-        {"client_id": DEFAULT_CLIENT_ID, "scope": DEVICE_SCOPES}
-    ).encode()
+    data = urllib.parse.urlencode({"client_id": DEFAULT_CLIENT_ID, "scope": DEVICE_SCOPES}).encode()
     backoff = 2.0
     for attempt in range(1, max(retries, 1) + 1):
         _wait_device_code_slot()
@@ -137,12 +135,8 @@ def request_device_code(proxy: str = "", *, retries: int = 6) -> Optional[dict]:
                 if e.code == 429 or err_name == "slow_down":
                     sleep_for = max(backoff, 8.0) * attempt
                     with _DEVICE_CODE_LOCK:
-                        _DEVICE_CODE_MIN_INTERVAL = min(
-                            _DEVICE_CODE_MIN_INTERVAL * 1.5, 2.5
-                        )
-                        _DEVICE_CODE_NEXT_OK = max(
-                            _DEVICE_CODE_NEXT_OK, time.time() + sleep_for
-                        )
+                        _DEVICE_CODE_MIN_INTERVAL = min(_DEVICE_CODE_MIN_INTERVAL * 1.5, 2.5)
+                        _DEVICE_CODE_NEXT_OK = max(_DEVICE_CODE_NEXT_OK, time.time() + sleep_for)
                 time.sleep(sleep_for)
                 backoff = min(backoff * 1.8, 60.0)
                 continue
@@ -484,9 +478,7 @@ def mint_cpa_from_sso(
                 if not rec.get("sub"):
                     pl = parse_jwt_payload(str(token.get("access_token") or "")) or {}
                     rec["sub"] = str(pl.get("sub") or token.get("userinfo_sub") or "")
-                path.write_text(
-                    json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
+                path.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
 

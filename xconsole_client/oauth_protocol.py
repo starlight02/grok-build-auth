@@ -48,13 +48,10 @@ from .xai_oauth import (
 
 TURNSTILE_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 CREATE_SESSION_RPC = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateSession"
-CREATE_COOKIE_SETTER_RPC = (
-    "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateCookieSetterLink"
-)
+CREATE_COOKIE_SETTER_RPC = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateCookieSetterLink"
 ACCOUNTS_ORIGIN = "https://accounts.x.ai"
 # Observed Next.js server action for the consent Allow button (may change on deploy).
 SUBMIT_OAUTH2_CONSENT_ACTION = "401b73e22a5e68737d0037e1aa449fef82cd1b35fb"
-
 
 
 def resolve_submit_oauth2_consent_action(
@@ -72,15 +69,9 @@ def resolve_submit_oauth2_consent_action(
     """
     html = page_html or ""
     patterns = (
-        re.compile(
-            r'createServerReference\)\("([a-f0-9]{40,44})"[^)]{0,400}submitOAuth2Consent'
-        ),
-        re.compile(
-            r'"([a-f0-9]{40,44})"[^"]{0,80}findSourceMapURL,"submitOAuth2Consent"'
-        ),
-        re.compile(
-            r'findSourceMapURL,"submitOAuth2Consent"[^"]{0,20}"([a-f0-9]{40,44})"'
-        ),
+        re.compile(r'createServerReference\)\("([a-f0-9]{40,44})"[^)]{0,400}submitOAuth2Consent'),
+        re.compile(r'"([a-f0-9]{40,44})"[^"]{0,80}findSourceMapURL,"submitOAuth2Consent"'),
+        re.compile(r'findSourceMapURL,"submitOAuth2Consent"[^"]{0,20}"([a-f0-9]{40,44})"'),
     )
     for pat in patterns:
         m = pat.search(html)
@@ -88,15 +79,9 @@ def resolve_submit_oauth2_consent_action(
             resolve_submit_oauth2_consent_action.last_source = "live"
             return m.group(1)
 
-    paths = list(
-        dict.fromkeys(re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', html))
-    )
+    paths = list(dict.fromkeys(re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', html)))
     if not paths:
-        paths = list(
-            dict.fromkeys(
-                re.findall(r'(/_next/static/chunks/[^"\'\\s)]+\.js)', html)
-            )
-        )
+        paths = list(dict.fromkeys(re.findall(r'(/_next/static/chunks/[^"\'\\s)]+\.js)', html)))
     if not paths or session is None:
         if not allow_fallback:
             raise RuntimeError(
@@ -136,8 +121,7 @@ def resolve_submit_oauth2_consent_action(
                 return hm.group(1)
     if not allow_fallback:
         raise RuntimeError(
-            "submitOAuth2Consent action id not found in consent chunks; "
-            "refusing hardcoded fallback"
+            "submitOAuth2Consent action id not found in consent chunks; refusing hardcoded fallback"
         )
     resolve_submit_oauth2_consent_action.last_source = "fallback"
     return SUBMIT_OAUTH2_CONSENT_ACTION
@@ -204,9 +188,7 @@ def _extract_urls_from_fields(fields: List[Dict[str, Any]]) -> List[str]:
     return urls
 
 
-def _parse_grpc_error(
-    headers: Dict[str, str], body: bytes
-) -> Tuple[Optional[int], str]:
+def _parse_grpc_error(headers: Dict[str, str], body: bytes) -> Tuple[Optional[int], str]:
     # Trailers may be in body frames or HTTP headers (connect/grpc-web).
     status = headers.get("grpc-status")
     message = unquote(headers.get("grpc-message") or "")
@@ -222,8 +204,6 @@ def _parse_grpc_error(
     if parsed.get("grpc_status") is not None:
         return int(parsed["grpc_status"]), message or str(parsed.get("trailers") or "")
     return None, message
-
-
 
 
 class _Resp:
@@ -366,7 +346,10 @@ class _UrllibOAuthSession:
                 resp = e
             status = int(resp.getcode() or 0)
             raw = resp.read() or b""
-            if resp.headers.get("content-encoding", "").lower() == "gzip" and raw[:2] == b"\x1f\x8b":
+            if (
+                resp.headers.get("content-encoding", "").lower() == "gzip"
+                and raw[:2] == b"\x1f\x8b"
+            ):
                 try:
                     import gzip
 
@@ -454,7 +437,9 @@ class ProtocolOAuthClient:
         mode = (os.environ.get("XCONSOLE_TRANSPORT") or "").strip().lower()
         if not mode:
             mode = "urllib" if _prefer_urllib_transport() else "curl_cffi"
-        self._transport_name = mode if mode in {"urllib", "stdlib", "curl_cffi", "curl", "cffi"} else "curl_cffi"
+        self._transport_name = (
+            mode if mode in {"urllib", "stdlib", "curl_cffi", "curl", "cffi"} else "curl_cffi"
+        )
         if self._transport_name in {"urllib", "stdlib"}:
             self._s = _UrllibOAuthSession(timeout=45.0, proxy=proxy or "")
             self._log("protocol OAuth transport=urllib")
@@ -557,9 +542,7 @@ class ProtocolOAuthClient:
         referer: str = f"{ACCOUNTS_ORIGIN}/sign-in",
     ) -> Dict[str, Any]:
         """Call CreateCookieSetterLink; returns cookie_setter_url for the multi-domain hop."""
-        msg = grpcweb.encode_string(1, success_url) + grpcweb.encode_string(
-            2, error_url
-        )
+        msg = grpcweb.encode_string(1, success_url) + grpcweb.encode_string(2, error_url)
         resp = self._s.post(
             CREATE_COOKIE_SETTER_RPC,
             headers=_grpc_headers(referer),
@@ -592,9 +575,7 @@ class ProtocolOAuthClient:
             "raw_fields": fields,
         }
 
-    def create_session(
-        self, email: str, password: str, *, referer: str
-    ) -> Dict[str, Any]:
+    def create_session(self, email: str, password: str, *, referer: str) -> Dict[str, Any]:
         """Call CreateSession; on success stores sso JWT on the session.
 
         CreateSession field 2 is a session JWT (not the cookie-setter URL).
@@ -656,9 +637,7 @@ class ProtocolOAuthClient:
             return {
                 "ok": False,
                 "error": grpc_msg
-                or (
-                    f"CreateSession failed (status={grpc_status}, fields={len(fields)})"
-                ),
+                or (f"CreateSession failed (status={grpc_status}, fields={len(fields)})"),
                 "grpc_status": grpc_status,
                 "session_jwt": session_jwt,
                 "raw_fields": fields,
@@ -893,7 +872,7 @@ class ProtocolOAuthClient:
                 self._log(f"set-cookie Location → {nxt[:160]}")
                 return nxt
             if success:
-                self._log(f"set-cookie no Location; using JWT success_url")
+                self._log("set-cookie no Location; using JWT success_url")
                 return success
             return success or setter_url
 
@@ -907,12 +886,8 @@ class ProtocolOAuthClient:
                 session=self._s,
                 timeout=20.0,
             )
-            src = getattr(
-                resolve_submit_oauth2_consent_action, "last_source", "unknown"
-            )
-            self._log(
-                f"resolved submitOAuth2Consent action={action_id} ({src})"
-            )
+            src = getattr(resolve_submit_oauth2_consent_action, "last_source", "unknown")
+            self._log(f"resolved submitOAuth2Consent action={action_id} ({src})")
 
             from urllib.parse import quote as _quote
 
@@ -962,9 +937,7 @@ class ProtocolOAuthClient:
             )
             # Some deployments post to the consent path with query string:
             if resp.status_code >= 400 or (
-                resp.text
-                and "error" in resp.text[:200].lower()
-                and "code" not in resp.text
+                resp.text and "error" in resp.text[:200].lower() and "code" not in resp.text
             ):
                 resp = self._s.post(page_url, headers=headers, data=body, timeout=45)
             text = resp.text or ""
@@ -988,9 +961,7 @@ class ProtocolOAuthClient:
 
             # Full HTML means next-action was ignored — re-resolve from response and retry once.
             if "<!DOCTYPE html>" in text[:200] or "<html" in text[:200].lower():
-                action2 = resolve_submit_oauth2_consent_action(
-                    text, session=self._s, timeout=20.0
-                )
+                action2 = resolve_submit_oauth2_consent_action(text, session=self._s, timeout=20.0)
                 if action2 and action2 != action_id:
                     headers["next-action"] = action2
                     self._log(f"retry consent with action={action2[:20]}...")
@@ -1001,23 +972,15 @@ class ProtocolOAuthClient:
                         timeout=45,
                     )
                     text = resp.text or ""
-                    self._log(
-                        f"consent retry HTTP {resp.status_code} body={text[:180]!r}"
-                    )
+                    self._log(f"consent retry HTTP {resp.status_code} body={text[:180]!r}")
                     code = _code_from_body(text)
                     if code:
                         return code
-                    loc = (
-                        resp.headers.get("location")
-                        or resp.headers.get("Location")
-                        or ""
-                    )
+                    loc = resp.headers.get("location") or resp.headers.get("Location") or ""
                     if "code=" in loc:
                         return self._code_from_url(urljoin(page_url, loc), state)
 
-            raise RuntimeError(
-                f"submitOAuth2Consent failed HTTP {resp.status_code}: {text[:300]}"
-            )
+            raise RuntimeError(f"submitOAuth2Consent failed HTTP {resp.status_code}: {text[:300]}")
 
         def _complete_via_cookie_setter(label: str) -> str:
             """Mint set-cookie chain with consent as success_url, then Allow consent."""
@@ -1029,9 +992,7 @@ class ProtocolOAuthClient:
                 referer=f"{ACCOUNTS_ORIGIN}/sign-in?redirect=oauth2-provider",
             )
             if not csl.get("ok"):
-                raise RuntimeError(
-                    f"{label}: CreateCookieSetterLink failed: {csl.get('error')}"
-                )
+                raise RuntimeError(f"{label}: CreateCookieSetterLink failed: {csl.get('error')}")
             setter = str(csl.get("cookie_setter_url") or "")
             self._log(f"{label}: cookie_setter={setter[:100]}...")
 
@@ -1062,19 +1023,19 @@ class ProtocolOAuthClient:
                 html = page.text or ""
                 # Real consent is logged-in Authorize UI. Sign-in shell also
                 # contains the word "consent" in return_to — do not POST there.
-                real = page.status_code == 200 and html and (
-                    "Authorize —" in html
-                    or '"c":["","oauth2"' in html
-                    or ("Allow" in html and "Deny" in html and "Signed in" in html)
+                real = (
+                    page.status_code == 200
+                    and html
+                    and (
+                        "Authorize —" in html
+                        or '"c":["","oauth2"' in html
+                        or ("Allow" in html and "Deny" in html and "Signed in" in html)
+                    )
                 )
                 if real:
                     return _submit_oauth2_consent(current, html)
-                self._log(
-                    "consent URL returned sign-in shell; session cookie missing/invalid"
-                )
-            return self._follow_for_code(
-                current, redirect_uri=redirect_uri, state=state
-            )
+                self._log("consent URL returned sign-in shell; session cookie missing/invalid")
+            return self._follow_for_code(current, redirect_uri=redirect_uri, state=state)
 
         self._log("OAuth PKCE start...")
         try:
@@ -1106,12 +1067,8 @@ class ProtocolOAuthClient:
             try:
                 code = _complete_via_cookie_setter("password-login")
             except Exception as csl_err:
-                self._log(
-                    f"cookie-setter path failed ({csl_err}); raw authorize follow"
-                )
-                code = self._follow_for_code(
-                    auth_url, redirect_uri=redirect_uri, state=state
-                )
+                self._log(f"cookie-setter path failed ({csl_err}); raw authorize follow")
+                code = self._follow_for_code(auth_url, redirect_uri=redirect_uri, state=state)
 
         self._log("exchanging authorization code...")
         return _finalize_oauth_code(

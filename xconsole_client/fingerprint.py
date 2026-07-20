@@ -17,6 +17,7 @@ You can swap to `urllib` (no fingerprint) by setting
 `XConsoleAuthClient(transport="urllib")` for offline code-only tests, but
 against the real `accounts.x.ai` you'll almost certainly be challenged.
 """
+
 from __future__ import annotations
 
 import gzip
@@ -25,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 
 try:
     from curl_cffi import requests as cc_requests  # type: ignore
+
     _HAS_CURL_CFFI = True
 except Exception:  # pragma: no cover
     cc_requests = None
@@ -59,9 +61,7 @@ class FingerprintTransport:
         proxy: Optional[str] = None,
     ):
         if not _HAS_CURL_CFFI:
-            raise RuntimeError(
-                "curl_cffi is not installed. Install with: pip install curl_cffi"
-            )
+            raise RuntimeError("curl_cffi is not installed. Install with: pip install curl_cffi")
         self._impersonate = impersonate
         self._http_version = http_version
         self._timeout = timeout
@@ -77,9 +77,15 @@ class FingerprintTransport:
         )
         # Make sure default Accept-Encoding is exactly the Chrome order.
         self._session.headers["accept-encoding"] = accept_encoding
+
     # ----------------------------------------------------------------- transport
     def request(
-        self, method: str, url: str, *, headers: Dict[str, str], body: Optional[bytes] = None
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Dict[str, str],
+        body: Optional[bytes] = None,
     ) -> Tuple[int, Dict[str, str], List[str], bytes]:
         # curl_cffi lowercases keys on send; we don't rely on case here.
         merged: Dict[str, str] = {}
@@ -87,9 +93,19 @@ class FingerprintTransport:
         # (c) sec-ch-* consistency. We still try to put `Host` first implicitly,
         # then `User-Agent`, then `Accept` family, then the rest — matching what
         # a real browser sends. curl_cffi fills in User-Agent, sec-ch-ua, etc.
-        priority_prefix = ("user-agent", "accept", "accept-language", "accept-encoding",
-                            "content-type", "content-length", "origin", "referer",
-                            "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform")
+        priority_prefix = (
+            "user-agent",
+            "accept",
+            "accept-language",
+            "accept-encoding",
+            "content-type",
+            "content-length",
+            "origin",
+            "referer",
+            "sec-ch-ua",
+            "sec-ch-ua-mobile",
+            "sec-ch-ua-platform",
+        )
         for k in priority_prefix:
             if k in headers:
                 merged[k] = headers[k]
@@ -123,8 +139,10 @@ class FingerprintTransport:
         set_cookies = _split_set_cookie(raw_sc) if raw_sc else []
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
         if self._debug:
-            print(f"  <- {status} {method} {url}  ({len(raw)} bytes, {len(set_cookies)} set-cookie, "
-                  f"impersonate={self._impersonate}, http={self._http_version})")
+            print(
+                f"  <- {status} {method} {url}  ({len(raw)} bytes, {len(set_cookies)} set-cookie, "
+                f"impersonate={self._impersonate}, http={self._http_version})"
+            )
         return status, hdrs, set_cookies, raw
 
     @property
@@ -162,12 +180,20 @@ def _split_set_cookie(joined: str) -> List[str]:
             out.append(cur.strip())
             break
         out.append(cur[:idx].strip())
-        cur = cur[idx + 1:].lstrip()
+        cur = cur[idx + 1 :].lstrip()
     return [c for c in out if c]
 
 
-_KNOWN_ATTRS = ("Path=", "Expires=", "Max-Age=", "Domain=", "Secure", "HttpOnly",
-                "SameSite=", "Partitioned")
+_KNOWN_ATTRS = (
+    "Path=",
+    "Expires=",
+    "Max-Age=",
+    "Domain=",
+    "Secure",
+    "HttpOnly",
+    "SameSite=",
+    "Partitioned",
+)
 
 
 def _next_cookie_boundary(joined: str) -> int:
@@ -183,7 +209,7 @@ def _next_cookie_boundary(joined: str) -> int:
         # Accept it as a split if the chunk after the comma is a new cookie
         # AND the previous segment ends with an attribute (or has at least
         # one ';' before the comma).
-        after = joined[comma + 1:].lstrip()
+        after = joined[comma + 1 :].lstrip()
         head = joined[:comma]
         if ";" in head and after:
             # Check if 'after' looks like the start of a new cookie (Name=Value)
