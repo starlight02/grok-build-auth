@@ -828,6 +828,7 @@ return box;
         *,
         premium: bool = False,  # noqa: ARG002
     ) -> str:
+        global _solve_count
         url = (website_url or "").strip()
         key = (website_key or "").strip()
         if not url or not key:
