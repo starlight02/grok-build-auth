@@ -24,6 +24,7 @@ Env:
 - ``TURNSTILE_BROWSER_CONCURRENCY`` — secondary parallel-solve cap (default 4; ``run.py`` also serializes Turnstile)
 - ``HTTPS_PROXY`` / ``HTTP_PROXY`` — browser proxy
 """
+
 from __future__ import annotations
 
 import atexit
@@ -42,7 +43,6 @@ _browser_sem_init = threading.Lock()
 _tls = threading.local()
 _tls_registry_lock = threading.Lock()
 _tls_browsers: list[Any] = []
-
 
 
 def _browser_concurrency() -> int:
@@ -156,9 +156,7 @@ def _playwright_proxy(proxy: str) -> Optional[dict[str, str]]:
 def _system_chrome_available() -> bool:
     """True when Playwright channel=chrome is likely to work on this host."""
     if sys.platform == "darwin":
-        return os.path.exists(
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        )
+        return os.path.exists("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
     if sys.platform.startswith("linux"):
         return bool(
             shutil.which("google-chrome")
@@ -202,9 +200,7 @@ def _stealth_user_agent() -> str:
 
 def _stealth_init_script() -> str:
     # Minimal automation leak patch — enough for managed Turnstile on accounts.x.ai.
-    return (
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-    )
+    return "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
 
 
 def _chromium_launch_kwargs(
@@ -271,9 +267,7 @@ class LocalBrowserTurnstileSolver:
                 "(Chrome headless=new, or TURNSTILE_HEADLESS=0 / TURNSTILE_INTERACTIVE=1)."
             )
         if eng != "chromium":
-            raise ValueError(
-                f"Unknown browser engine {engine!r}; use browser / chromium / chrome"
-            )
+            raise ValueError(f"Unknown browser engine {engine!r}; use browser / chromium / chrome")
         self._engine = eng
 
         if headless is None:
@@ -414,9 +408,7 @@ class LocalBrowserTurnstileSolver:
             browser = pw.chromium.launch(**launch_kwargs)
         except Exception as exc:
             if self._channel:
-                self._log(
-                    f"channel={self._channel} failed ({exc}); retry bundled chromium"
-                )
+                self._log(f"channel={self._channel} failed ({exc}); retry bundled chromium")
                 launch_kwargs = _chromium_launch_kwargs(
                     headless=self._headless,
                     channel=None,
@@ -469,21 +461,13 @@ class LocalBrowserTurnstileSolver:
             _tls_browsers.append(slot)
         return browser
 
-
-    def _mint_token_on_page(
-        self, page: Any, url: str, key: str, timeout_ms: int
-    ) -> str:
+    def _mint_token_on_page(self, page: Any, url: str, key: str, timeout_ms: int) -> str:
         token = self._solve_force_render(page, url, key, timeout_ms)
         if not token:
             token = self._solve_on_target_page(page, url, key, timeout_ms)
         if not token and self._interactive:
-            self._log(
-                "waiting for manual Turnstile click "
-                f"(up to {self._timeout:.0f}s)..."
-            )
-            print(
-                "  [BrowserTurnstile] 请在弹出的浏览器里完成 Turnstile 验证…"
-            )
+            self._log(f"waiting for manual Turnstile click (up to {self._timeout:.0f}s)...")
+            print("  [BrowserTurnstile] 请在弹出的浏览器里完成 Turnstile 验证…")
             token = self._wait_token(page, timeout_ms)
         return token or ""
 
@@ -528,9 +512,7 @@ class LocalBrowserTurnstileSolver:
                         browser = self._ensure_thread_browser()
                         page = self._new_page(browser)
                         try:
-                            token = self._mint_token_on_page(
-                                page, url, key, timeout_ms
-                            )
+                            token = self._mint_token_on_page(page, url, key, timeout_ms)
                         finally:
                             self._close_page(page)
                         if token:
@@ -539,7 +521,7 @@ class LocalBrowserTurnstileSolver:
                         last_err = RuntimeError("empty token")
                     except Exception as exc:
                         last_err = exc
-                        self._log(f"warm solve attempt {attempt+1} failed: {exc}")
+                        self._log(f"warm solve attempt {attempt + 1} failed: {exc}")
                         self._drop_thread_browser()
                 hint = (
                     "Need Google Chrome for terminal headless. "
@@ -547,8 +529,7 @@ class LocalBrowserTurnstileSolver:
                     "TURNSTILE_INTERACTIVE=1, HTTPS_PROXY=…"
                 )
                 raise RuntimeError(
-                    f"Local browser ({eng}) did not produce a Turnstile token "
-                    f"(warm path). {hint}"
+                    f"Local browser ({eng}) did not produce a Turnstile token (warm path). {hint}"
                 ) from last_err
 
             # Cold path: launch + close every solve.
@@ -576,7 +557,6 @@ class LocalBrowserTurnstileSolver:
                         browser.close()
                     except Exception:
                         pass
-
 
     def _extract_token_js(self) -> str:
         return """() => {
@@ -670,7 +650,12 @@ class LocalBrowserTurnstileSolver:
             fl = page.frame_locator(
                 "iframe[src*='challenges.cloudflare.com'], iframe[src*='turnstile']"
             )
-            for inner in ("input[type='checkbox']", "body", "#challenge-stage", "label"):
+            for inner in (
+                "input[type='checkbox']",
+                "body",
+                "#challenge-stage",
+                "label",
+            ):
                 try:
                     fl.locator(inner).first.click(timeout=2000)
                     self._log(f"clicked frame {inner}")
@@ -714,9 +699,7 @@ class LocalBrowserTurnstileSolver:
 
         # Only click email path if turnstile API is not already present.
         try:
-            has_ts = bool(
-                page.evaluate("() => !!(window.turnstile && window.turnstile.render)")
-            )
+            has_ts = bool(page.evaluate("() => !!(window.turnstile && window.turnstile.render)"))
         except Exception:
             has_ts = False
         if not has_ts:
@@ -892,58 +875,6 @@ class LocalBrowserTurnstileSolver:
 
         return self._wait_token(page, max(timeout_ms - half, 10000))
 
-    def _solve_injected_widget(
-        self, page: Any, website_url: str, website_key: str, timeout_ms: int
-    ) -> str:
-        """Navigate same origin, replace body with only the widget."""
-        try:
-            page.goto(
-                website_url,
-                wait_until="domcontentloaded",
-                timeout=min(timeout_ms, 60000),
-            )
-        except Exception as exc:
-            self._log(f"inject goto failed: {exc}")
-            return ""
-
-        try:
-            page.evaluate(
-                """(sitekey) => {
-                  window.__xaiTsToken = '';
-                  document.body.innerHTML =
-                    '<div id="xai-ts-host" style="margin:40px"></div>' +
-                    '<input type="hidden" name="cf-turnstile-response" id="cf-resp" value=""/>';
-                  function mount() {
-                    if (!window.turnstile) { setTimeout(mount, 50); return; }
-                    window.turnstile.render('#xai-ts-host', {
-                      sitekey,
-                      callback: (t) => {
-                        window.__xaiTsToken = t || '';
-                        const el = document.getElementById('cf-resp');
-                        if (el) el.value = t || '';
-                      },
-                    });
-                  }
-                  if (!window.turnstile) {
-                    const s = document.createElement('script');
-                    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-                    s.async = true;
-                    s.onload = mount;
-                    document.head.appendChild(s);
-                  } else {
-                    mount();
-                  }
-                }""",
-                website_key,
-            )
-        except Exception as exc:
-            self._log(f"inject failed: {exc}")
-            return ""
-
-        page.wait_for_timeout(1500)
-        self._click_turnstile_widget(page)
-        return self._wait_token(page, timeout_ms)
-
 
 # --------------------------------------------------------------------------- #
 # Factory
@@ -980,9 +911,7 @@ def resolve_turnstile_solver(
             "(local solvers only)."
         )
     if mode in {"obscura", "obscura-cdp", "cdp"}:
-        raise ValueError(
-            "TURNSTILE_SOLVER=obscura has been removed; use auto/drission/browser."
-        )
+        raise ValueError("TURNSTILE_SOLVER=obscura has been removed; use auto/drission/browser.")
 
     def _drission() -> TurnstileSolver:
         from xconsole_client.drission_solver import DrissionTurnstileSolver
@@ -1046,8 +975,7 @@ def resolve_turnstile_solver(
         except Exception:
             return _playwright()
     raise ValueError(
-        f"Unknown TURNSTILE_SOLVER={mode!r}; "
-        "use auto | drission | camoufox | safari | browser"
+        f"Unknown TURNSTILE_SOLVER={mode!r}; use auto | drission | camoufox | safari | browser"
     )
 
 

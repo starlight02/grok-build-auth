@@ -151,9 +151,7 @@ def parse_proxy_line(line: str) -> Optional[ProxyEntry]:
             region = _normalize_region(left)
             url_raw = right.strip()
             tagged = True
-    elif "," in s and not s.lower().startswith(
-        ("http://", "https://", "socks5://", "socks4://")
-    ):
+    elif "," in s and not s.lower().startswith(("http://", "https://", "socks5://", "socks4://")):
         left, right = s.split(",", 1)
         if right.strip() and ("://" in right or "." in right):
             region = _normalize_region(left)
@@ -161,8 +159,10 @@ def parse_proxy_line(line: str) -> Optional[ProxyEntry]:
             tagged = True
     else:
         parts = s.split(None, 1)
-        if len(parts) == 2 and "://" not in parts[0] and (
-            "://" in parts[1] or parts[1][0].isdigit() or "." in parts[1]
+        if (
+            len(parts) == 2
+            and "://" not in parts[0]
+            and ("://" in parts[1] or parts[1][0].isdigit() or "." in parts[1])
         ):
             # only treat as tag if left looks like a region code, not user:pass
             left = parts[0]
@@ -227,11 +227,7 @@ def load_proxy_entries(
     if deduped:
         return deduped
 
-    single = (
-        single_proxy
-        if single_proxy is not None
-        else single_proxy_from_env()
-    )
+    single = single_proxy if single_proxy is not None else single_proxy_from_env()
     if single:
         ent = parse_proxy_line(single)
         if ent is not None:
@@ -267,7 +263,10 @@ def _save_geo_cache(cache: Dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         tmp.replace(path)
     except Exception:
         pass
@@ -312,7 +311,9 @@ def _resolve_host_ip(host: str) -> str:
     return ""
 
 
-def _http_json(method: str, url: str, *, data: Optional[bytes] = None, timeout: float = 20.0) -> Any:
+def _http_json(
+    method: str, url: str, *, data: Optional[bytes] = None, timeout: float = 20.0
+) -> Any:
     req = urllib.request.Request(
         url,
         data=data,
@@ -400,8 +401,6 @@ def batch_lookup_host_countries(
     return out
 
 
-
-
 def _parse_country_from_body(body: str) -> Tuple[str, str]:
     body = (body or "").strip()
     if not body:
@@ -436,7 +435,10 @@ def probe_exit_region(
         try:
             req = urllib.request.Request(
                 probe,
-                headers={"User-Agent": "grok-build-auth-proxy-probe/1.1", "Accept": "application/json"},
+                headers={
+                    "User-Agent": "grok-build-auth-proxy-probe/1.1",
+                    "Accept": "application/json",
+                },
                 method="GET",
             )
             with opener.open(req, timeout=timeout) as resp:
@@ -473,13 +475,18 @@ def resolve_regions(
         mode_v = "host"
 
     try:
-        timeout_f = float(timeout if timeout is not None else (os.environ.get("PROXY_GEO_TIMEOUT") or "20"))
+        timeout_f = float(
+            timeout if timeout is not None else (os.environ.get("PROXY_GEO_TIMEOUT") or "20")
+        )
     except ValueError:
         timeout_f = 20.0
 
     if refresh is None:
         refresh = (os.environ.get("PROXY_GEO_REFRESH") or "").strip().lower() in {
-            "1", "true", "yes", "on"
+            "1",
+            "true",
+            "yes",
+            "on",
         }
 
     _log = log or (lambda msg: None)
@@ -553,7 +560,9 @@ def resolve_regions(
     else:
         # slow exit path
         try:
-            workers_n = int(workers if workers is not None else (os.environ.get("PROXY_GEO_WORKERS") or "32"))
+            workers_n = int(
+                workers if workers is not None else (os.environ.get("PROXY_GEO_WORKERS") or "32")
+            )
         except ValueError:
             workers_n = 32
         workers_n = max(1, min(64, workers_n))
@@ -585,7 +594,6 @@ def resolve_regions(
         _save_geo_cache(cache)
 
     return [e for e in out if e is not None]
-
 
 
 class ProxyPool:
@@ -718,15 +726,6 @@ class ProxyPool:
     def _active_list(self) -> List[ProxyEntry]:
         return [e for e in self._region_candidates() if e.url not in self._disabled]
 
-    def set_region(self, region: str) -> str:
-        with self._lock:
-            if self._scope == SCOPE_ALL:
-                return self._region
-            self._region = self._choose_region(region)
-            if not self._active_list():
-                raise RuntimeError(f"no proxies in region={self._region!r}")
-            return self._region
-
     def mark_bad(self, url: str, reason: str = "") -> bool:
         """Disable *url* for the rest of this process. True if newly disabled."""
         url = (url or "").strip()
@@ -773,21 +772,25 @@ class ProxyPool:
         if not items:
             return 0, 0
         try:
-            workers_n = int(workers if workers is not None else (os.environ.get("PROXY_PREFLIGHT_WORKERS") or "16"))
+            workers_n = int(
+                workers
+                if workers is not None
+                else (os.environ.get("PROXY_PREFLIGHT_WORKERS") or "16")
+            )
         except ValueError:
             workers_n = 16
         workers_n = max(1, min(64, workers_n))
         try:
             timeout_f = float(
-                timeout if timeout is not None else (os.environ.get("PROXY_PREFLIGHT_TIMEOUT") or "8")
+                timeout
+                if timeout is not None
+                else (os.environ.get("PROXY_PREFLIGHT_TIMEOUT") or "8")
             )
         except ValueError:
             timeout_f = 8.0
         timeout_f = max(2.0, min(30.0, timeout_f))
 
-        _log(
-            f"preflight {len(items)} proxies workers={workers_n} timeout={timeout_f:.0f}s"
-        )
+        _log(f"preflight {len(items)} proxies workers={workers_n} timeout={timeout_f:.0f}s")
         t0 = time.time()
         ok = 0
         fail = 0
@@ -806,10 +809,7 @@ class ProxyPool:
                     fail += 1
                     self.mark_bad(url, why)
 
-        _log(
-            f"preflight done ok={ok} fail={fail} live={self.size} "
-            f"in {time.time() - t0:.1f}s"
-        )
+        _log(f"preflight done ok={ok} fail={fail} live={self.size} in {time.time() - t0:.1f}s")
         if self.size == 0:
             raise RuntimeError(
                 f"proxy preflight: zero live proxies in region={self._region!r} "
@@ -912,7 +912,12 @@ def is_proxy_transport_error(exc: BaseException) -> bool:
         "cloudflare challenge",
         "cloudflare block",
         "cloudflare js challenge",
+        "cloudflare 硬拦截",
+        "cloudflare 挑战",
+        "cloudflare js 挑战",
+        "注册页抓取失败",
         "ip or proxy is",
+        "出口 ip 被",
         "signup page scrape failed",
         "could not scrape signup page metadata",
         "just a moment",
@@ -930,7 +935,6 @@ def proxy_retry_limit() -> int:
         except ValueError:
             pass
     return 8
-
 
 
 def single_proxy_from_env() -> str:

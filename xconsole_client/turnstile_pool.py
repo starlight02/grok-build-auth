@@ -151,7 +151,9 @@ class TurnstileTokenPool:
         self._solver = solver
         self._url = website_url
         self._key = website_key
-        self._size = int(size if size is not None else _env_int("TURNSTILE_POOL_SIZE", 4, lo=1, hi=32))
+        self._size = int(
+            size if size is not None else _env_int("TURNSTILE_POOL_SIZE", 4, lo=1, hi=32)
+        )
         self._max_age = float(
             max_age
             if max_age is not None
