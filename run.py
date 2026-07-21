@@ -3,10 +3,9 @@
 
 流程:
   1) 协议注册（邮箱验证 + Turnstile + create_account）
-  2) 提取 SSO
-  3) Build OAuth（快路径：协议 SSO session-reuse；失败回退 sso2auth Device Flow）
+  2) 提取 SSO 后立刻释放注册线程
+  3) 独立 OAuth worker 池：优先协议 SSO session-reuse 快路径；失败再回退 Device Flow
   4) 导出 CLIProxyAPI auth：cli-chat-proxy.grok.com + grok-cli headers
-     → 可直接用 grok-4.5 走 Build/CLI 编码通道
 
 环境变量（按需设置）:
     TURNSTILE_SOLVER       auto|drission|browser|safari (default auto → DrissionPage+turnstilePatch)
@@ -46,10 +45,17 @@
     PROXY_PREFLIGHT_WORKERS  预检并发（默认 32）
     PROXY_PREFLIGHT_TIMEOUT  单代理预检秒（默认 6）
     PROXY_RETRY              单号遇代理传输失败时换代理重试次数（默认 8）
-
+    OAUTH_ASYNC              1=SSO 后交独立 OAuth 池（默认 1）；0=注册线程内串行 OAuth
+    OAUTH_WORKERS            OAuth 池线程数（默认 = max(-t, 2)）
+    OAUTH_TRANSPORT_RETRIES  快路径 session-reuse 传输重试次数（默认 3）
+    OAUTH_ALLOW_DEVICE       1=快路径失败后回退 Device Flow（默认 1）
+    TRANSPORT_RETRY          无代理池时注册传输重试（默认 3）
+    VISIT_HOME               1=注册前 visit console home（默认 0 跳过）
 
 CLI 常用:
-    -n / -t                账号数 / 并发（默认 -t 4；池 size/minters 随 -t 自动）
+    -n / -t                注册并发（默认 -t 4；池 size/minters 随 -t 自动）
+    --oauth-workers        OAuth 池线程数（默认与 -t 相同，至少 2）
+    --no-oauth-async       关闭 OAuth 异步池，SSO 后同线程串行 Build
     --no-oauth-protocol    跳过协议 OAuth，直接 sso2auth Device Flow
     --check-quota          OAuth 后探测额度，无额度移到 failed 目录（默认关）
     --failed-auth-dir      无额度 auth 目录（默认 <auth-dir>_failed）
@@ -66,6 +72,7 @@ import base64
 import time
 import signal
 import threading
+import queue
 import argparse
 import shutil
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
@@ -247,6 +254,11 @@ _ok = 0  # successes toward -n target
 _total = 0  # target success count
 _t0 = 0.0
 _summary_ctx: dict = {"check_quota": False, "do_oauth": True}
+
+_oauth_q: Optional[queue.Queue] = None
+_oauth_inflight = 0
+_oauth_inflight_lock = threading.Lock()
+_oauth_workers: list[threading.Thread] = []
 
 
 def _acquire_proxy() -> str:
@@ -481,6 +493,7 @@ def register_one(
     email_backend: str = "tempmail",
     *,
     do_oauth: bool = True,
+    oauth_async: bool = True,
     oauth_protocol: bool = True,
     oauth_debug: bool = False,
     cliproxyapi_auth_dir: Optional[str | Path] = None,
@@ -498,17 +511,28 @@ def register_one(
     On proxy transport failures (timeout / CONNECT abort), mark the proxy bad
     and rotate to another from the pool (PROXY_RETRY times).
     """
-    max_attempts = proxy_retry_limit() if _proxy_pool is not None else 1
+    # Transport flakiness (SSL EOF / timeout) dominates long runs. Retry a few
+    # times even without a proxy pool; with a pool, also rotate exit IPs.
+    if _proxy_pool is not None:
+        max_attempts = proxy_retry_limit()
+    else:
+        try:
+            max_attempts = max(1, min(8, int(os.environ.get("TRANSPORT_RETRY") or "3")))
+        except ValueError:
+            max_attempts = 3
     last: dict = {
         "email": "",
         "password": "",
         "sso": None,
         "oauth_access_token": None,
         "cliproxyapi_auth": None,
-        "error": "proxy retries exhausted",
+        "error": "transport retries exhausted",
     }
     try:
         for attempt in range(1, max_attempts + 1):
+            if _stop.is_set():
+                last = {"error": "stopped", "email": None}
+                break
             try:
                 proxy = _acquire_proxy()
             except Exception as exc:
@@ -524,13 +548,16 @@ def register_one(
                 break
 
             if attempt > 1:
-                _log(index, f"retry with new proxy ({attempt}/{max_attempts})")
+                why = "proxy" if _proxy_pool is not None else "transport"
+                _log(index, f"retry ({why} {attempt}/{max_attempts})")
+                time.sleep(min(2.0, 0.25 * attempt))
 
             result = _register_one_attempt(
                 index,
                 email_backend,
                 proxy=proxy,
                 do_oauth=do_oauth,
+                oauth_async=oauth_async,
                 oauth_protocol=oauth_protocol,
                 oauth_debug=oauth_debug,
                 cliproxyapi_auth_dir=cliproxyapi_auth_dir,
@@ -544,10 +571,30 @@ def register_one(
             if not err:
                 return result
 
-            if _proxy_pool is not None and is_proxy_transport_error(Exception(str(err))):
-                _mark_proxy_bad(proxy, str(err))
+            # SSO already minted but OAuth died: do not burn another full signup
+            # in this worker; surface for offline retry_oauth_from_sso.
+            if result.get("sso") and err and "SSO" not in str(err):
                 last = result
-                if attempt < max_attempts and _proxy_pool.size > 0:
+                if is_proxy_transport_error(Exception(str(err))) and attempt < max_attempts:
+                    # One more OAuth-only style full attempt is expensive; prefer
+                    # returning partial so pool capacity goes to new signups.
+                    # Optional: set OAUTH_FULL_RETRY=1 to re-run whole attempt.
+                    if (os.environ.get("OAUTH_FULL_RETRY") or "").strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    }:
+                        if _proxy_pool is not None:
+                            _mark_proxy_bad(proxy, str(err))
+                        continue
+                return result
+
+            if is_proxy_transport_error(Exception(str(err))):
+                if _proxy_pool is not None:
+                    _mark_proxy_bad(proxy, str(err))
+                last = result
+                if attempt < max_attempts and (_proxy_pool is None or _proxy_pool.size > 0):
                     continue
             return result
         return last
@@ -557,12 +604,288 @@ def register_one(
             _done += 1
 
 
+def _oauth_async_enabled(do_oauth: bool) -> bool:
+    """SSO then hand off Build OAuth to a dedicated pool (default on)."""
+    if not do_oauth:
+        return False
+    raw = (os.environ.get("OAUTH_ASYNC") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _oauth_allow_device() -> bool:
+    """Device Flow fallback after fast-path failure (default on)."""
+    raw = (os.environ.get("OAUTH_ALLOW_DEVICE") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _oauth_transport_retries() -> int:
+    try:
+        return max(1, min(8, int(os.environ.get("OAUTH_TRANSPORT_RETRIES") or "3")))
+    except ValueError:
+        return 3
+
+
+def _finish_build_oauth(
+    *,
+    index: int,
+    email: str,
+    password: str,
+    sso: str,
+    session_cookies: Optional[dict[str, str]],
+    proxy: str,
+    oauth_protocol: bool = True,
+    oauth_debug: bool = False,
+    cliproxyapi_auth_dir: Optional[str | Path] = None,
+    cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
+    check_quota: bool = False,
+    failed_auth_dir: Optional[str | Path] = None,
+    check_quota_timeout: float = 45.0,
+    auth_client: Any = None,
+) -> dict:
+    """SSO → CLIProxyAPI Build. Prefer protocol session-reuse; optional Device fallback.
+
+    Fast path must work with *session_cookies* alone (async OAuth has no live client).
+    """
+    auth_dir = (
+        Path(cliproxyapi_auth_dir) if cliproxyapi_auth_dir else default_cliproxyapi_auth_dir()
+    )
+    cookies = dict(session_cookies or {})
+    if sso:
+        cookies.setdefault("sso", sso)
+    if not cookies.get("sso"):
+        return {
+            "email": email,
+            "password": password,
+            "sso": sso,
+            "oauth_access_token": None,
+            "cliproxyapi_auth": None,
+            "error": "Build OAuth needs sso cookie for session-reuse",
+        }
+
+    _log(
+        index,
+        f"OAuth Build path → {auth_dir}  (cookies={len(cookies)}, "
+        f"fast={'on' if oauth_protocol else 'off'})",
+    )
+
+    oauth: Optional[OAuthLoginResult] = None
+    protocol_err: Optional[BaseException] = None
+
+    if oauth_protocol:
+        from xconsole_client.oauth_protocol import login_with_protocol
+
+        tries = _oauth_transport_retries()
+        for o_try in range(1, tries + 1):
+            try:
+                # allow_create_session=False keeps this on pure session-reuse
+                # (no CreateSession+Turnstile). auth_client only when inline.
+                oauth = login_with_protocol(
+                    email,
+                    password,
+                    proxy=proxy,
+                    debug=oauth_debug,
+                    cliproxyapi_auth_dir=str(auth_dir),
+                    cliproxyapi_base_url=cliproxyapi_base_url,
+                    session_cookies=cookies,
+                    auth_client=auth_client,
+                    allow_create_session=False,
+                )
+                protocol_err = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                protocol_err = exc
+                if is_proxy_transport_error(exc) and o_try < tries:
+                    _log(
+                        index,
+                        f"session-reuse transport fail ({o_try}/{tries}): {exc}; retry",
+                    )
+                    time.sleep(0.35 * o_try)
+                    continue
+                _log(index, f"session-reuse failed ({exc})")
+                break
+
+    if oauth is None:
+        if not _oauth_allow_device() and oauth_protocol:
+            return {
+                "email": email,
+                "password": password,
+                "sso": sso,
+                "session_cookies": cookies,
+                "oauth_access_token": None,
+                "cliproxyapi_auth": None,
+                "error": (
+                    "session-reuse OAuth failed"
+                    + (f": {protocol_err}" if protocol_err else "")
+                    + " (device fallback disabled)"
+                ),
+            }
+        if not sso:
+            return {
+                "email": email,
+                "password": password,
+                "sso": None,
+                "oauth_access_token": None,
+                "cliproxyapi_auth": None,
+                "error": "OAuth needs SSO"
+                + (f"; protocol: {protocol_err}" if protocol_err else ""),
+            }
+        if protocol_err is not None:
+            _log(index, f"fallback Device Flow after session-reuse: {protocol_err}")
+        else:
+            _log(index, "Device Flow (protocol OAuth disabled)")
+        mint = mint_cpa_from_sso(
+            sso,
+            email=email,
+            auth_dir=auth_dir,
+            proxy=proxy,
+            base_url=cliproxyapi_base_url,
+            skip_existing=False,
+            log=lambda m, i=index: _log(i, m),
+        )
+        if not mint.get("ok"):
+            return {
+                "email": email,
+                "password": password,
+                "sso": sso,
+                "session_cookies": cookies,
+                "oauth_access_token": None,
+                "cliproxyapi_auth": None,
+                "error": f"sso2auth failed: {mint.get('error')}"
+                + (f"; protocol: {protocol_err}" if protocol_err else ""),
+            }
+        _mint_token = mint.get("token")
+        token: dict[str, Any] = (
+            _mint_token
+            if isinstance(_mint_token, dict)
+            else {
+                "access_token": mint.get("access_token") or "",
+                "refresh_token": mint.get("refresh_token") or "",
+            }
+        )
+        _mint_userinfo = mint.get("userinfo")
+        userinfo: dict[str, Any] = _mint_userinfo if isinstance(_mint_userinfo, dict) else {}
+        cpa_path = Path(str(mint["path"])) if mint.get("path") else None
+        oauth = OAuthLoginResult(
+            token=token,
+            userinfo=userinfo,
+            id_token_payload=None,
+            path=None,
+            cliproxyapi_path=cpa_path,
+        )
+
+    result: dict[str, Any] = {
+        "email": email,
+        "password": password,
+        "sso": sso,
+        "session_cookies": cookies,
+        "oauth_access_token": oauth.access_token,
+        "oauth_refresh_token": oauth.refresh_token,
+        "oauth_record": str(oauth.path) if oauth.path else None,
+        "cliproxyapi_auth": (str(oauth.cliproxyapi_path) if oauth.cliproxyapi_path else None),
+        "error": None,
+    }
+    _log(
+        index,
+        f"Build OAuth OK  access={oauth.access_token[:20]}...  "
+        f"cliproxy={oauth.cliproxyapi_path.name if oauth.cliproxyapi_path else '?'}",
+    )
+
+    if check_quota and oauth.cliproxyapi_path:
+        fail_dir = Path(failed_auth_dir) if failed_auth_dir else _default_failed_auth_dir(auth_dir)
+        gate = _check_and_gate_auth(
+            Path(oauth.cliproxyapi_path),
+            failed_dir=fail_dir,
+            timeout=check_quota_timeout,
+            index=index,
+        )
+        result["quota_usable"] = gate["usable"]
+        result["quota_remaining_tokens"] = gate.get("remaining_tokens")
+        result["quota_status"] = gate.get("status")
+        result["quota_reasons"] = gate.get("reasons")
+        result["chat_endpoint_denied"] = bool(gate.get("chat_endpoint_denied"))
+        if gate["usable"]:
+            result["cliproxyapi_auth"] = gate["path"]
+        else:
+            result["cliproxyapi_auth_failed"] = gate["path"]
+            result["cliproxyapi_auth"] = None
+            result["error"] = gate.get("error") or "quota unusable"
+    return result
+
+
+def _enqueue_oauth_job(job: dict) -> None:
+    global _oauth_inflight
+    q = _oauth_q
+    if q is None:
+        raise RuntimeError("OAuth queue not started")
+    with _oauth_inflight_lock:
+        _oauth_inflight += 1
+    q.put(job)
+
+
+def _oauth_worker_loop(record_fn) -> None:
+    """Consume SSO jobs; always prefer session-reuse fast path."""
+    global _oauth_inflight
+    q = _oauth_q
+    assert q is not None
+    while True:
+        try:
+            job = q.get(timeout=0.4)
+        except queue.Empty:
+            if _stop.is_set():
+                with _oauth_inflight_lock:
+                    # exit when no more work and stop requested
+                    if q.empty() and _oauth_inflight <= 0:
+                        return
+            continue
+        if job is None:
+            q.task_done()
+            return
+        try:
+            result = _finish_build_oauth(
+                index=int(job.get("index") or 0),
+                email=str(job.get("email") or ""),
+                password=str(job.get("password") or ""),
+                sso=str(job.get("sso") or ""),
+                session_cookies=job.get("session_cookies") or {},
+                proxy=str(job.get("proxy") or ""),
+                oauth_protocol=bool(job.get("oauth_protocol", True)),
+                oauth_debug=bool(job.get("oauth_debug", False)),
+                cliproxyapi_auth_dir=job.get("cliproxyapi_auth_dir"),
+                cliproxyapi_base_url=str(
+                    job.get("cliproxyapi_base_url") or CLIPROXYAPI_GROK_BASE_URL
+                ),
+                check_quota=bool(job.get("check_quota", False)),
+                failed_auth_dir=job.get("failed_auth_dir"),
+                check_quota_timeout=float(job.get("check_quota_timeout") or 45.0),
+                auth_client=None,  # async: cookies-only fast path
+            )
+            if job.get("email_channel"):
+                result.setdefault("email_channel", job.get("email_channel"))
+            record_fn(result)
+        except Exception as exc:  # noqa: BLE001
+            record_fn(
+                {
+                    "email": job.get("email"),
+                    "password": job.get("password"),
+                    "sso": job.get("sso"),
+                    "oauth_access_token": None,
+                    "cliproxyapi_auth": None,
+                    "error": f"oauth worker: {exc}",
+                }
+            )
+        finally:
+            with _oauth_inflight_lock:
+                _oauth_inflight = max(0, _oauth_inflight - 1)
+            q.task_done()
+
+
 def _register_one_attempt(
     index: int,
     email_backend: str,
     *,
     proxy: str,
     do_oauth: bool = True,
+    oauth_async: bool = True,
     oauth_protocol: bool = True,
     oauth_debug: bool = False,
     cliproxyapi_auth_dir: Optional[str | Path] = None,
@@ -609,8 +932,15 @@ def _register_one_attempt(
     sso = None
 
     try:
-        # 1. warm-up + scrape
-        c.visit_home()
+        # 1. scrape signup (visit_home is optional; default skip — saves 1 RTT
+        # and avoids an extra SSL failure surface that does not set signup cookies).
+        if (os.environ.get("VISIT_HOME") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            c.visit_home()
         c.load_signup_page()
         _log(index, "cookie + scrape OK")
 
@@ -758,7 +1088,7 @@ def _register_one_attempt(
         _log(index, "account created")
 
         # 5. SSO (retries + RSC chain + grok.com fallback inside client)
-        sso = c.fetch_sso_token(email=email, password=password, save=True, retries=3)
+        sso = c.fetch_sso_token(email=email, password=password, save=True, retries=2)
         if not sso:
             _log(index, "FAIL SSO extraction")
             return {
@@ -783,123 +1113,57 @@ def _register_one_attempt(
             "error": None,
         }
 
-        # 6. OAuth → CLIProxyAPI Grok Build path (coding-ready)
-        # Fast: protocol session-reuse (pure HTTP). Fallback: sso2auth Device Flow.
-        # No Playwright / system-browser OAuth in the register path.
+        # 6. Build OAuth — async pool (default) or inline same thread.
         if do_oauth:
-            auth_dir = (
-                Path(cliproxyapi_auth_dir)
-                if cliproxyapi_auth_dir
-                else default_cliproxyapi_auth_dir()
-            )
             session_cookies = extract_cookies_from_auth_client(c)
             if sso:
                 session_cookies = dict(session_cookies or {})
                 session_cookies.setdefault("sso", sso)
-            _log(
-                index,
-                f"OAuth Build path → {auth_dir}  (cookies={len(session_cookies)})",
-            )
 
-            oauth: Optional[OAuthLoginResult] = None
-            protocol_err: Optional[BaseException] = None
-
-            if oauth_protocol:
-                try:
-                    from xconsole_client.oauth_protocol import login_with_protocol
-
-                    oauth = login_with_protocol(
-                        email,
-                        password,
-                        proxy=proxy,
-                        debug=oauth_debug,
-                        cliproxyapi_auth_dir=str(auth_dir),
-                        cliproxyapi_base_url=cliproxyapi_base_url,
-                        session_cookies=session_cookies,
-                        auth_client=c,
-                        allow_create_session=False,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    protocol_err = exc
-                    _log(index, f"protocol OAuth failed ({exc}); sso2auth device flow")
-
-            if oauth is None:
-                if not sso:
-                    raise RuntimeError(
-                        "OAuth needs SSO for device flow"
-                        + (f"; protocol: {protocol_err}" if protocol_err else "")
-                    )
-                mint = mint_cpa_from_sso(
-                    sso,
-                    email=email,
-                    auth_dir=auth_dir,
-                    proxy=proxy,
-                    base_url=cliproxyapi_base_url,
-                    skip_existing=False,
-                    log=lambda m, i=index: _log(i, m),
-                )
-                if not mint.get("ok"):
-                    raise RuntimeError(
-                        f"sso2auth failed: {mint.get('error')}"
-                        + (f"; protocol: {protocol_err}" if protocol_err else "")
-                    )
-                _mint_token = mint.get("token")
-                token: dict[str, Any] = (
-                    _mint_token
-                    if isinstance(_mint_token, dict)
-                    else {
-                        "access_token": mint.get("access_token") or "",
-                        "refresh_token": mint.get("refresh_token") or "",
+            if oauth_async and _oauth_q is not None:
+                _log(index, f"SSO ready → OAuth queue (cookies={len(session_cookies or {})})")
+                _enqueue_oauth_job(
+                    {
+                        "index": index,
+                        "email": email,
+                        "password": password,
+                        "sso": sso,
+                        "session_cookies": session_cookies,
+                        "proxy": proxy,
+                        "oauth_protocol": oauth_protocol,
+                        "oauth_debug": oauth_debug,
+                        "cliproxyapi_auth_dir": (
+                            str(cliproxyapi_auth_dir) if cliproxyapi_auth_dir else None
+                        ),
+                        "cliproxyapi_base_url": cliproxyapi_base_url,
+                        "check_quota": check_quota,
+                        "failed_auth_dir": (str(failed_auth_dir) if failed_auth_dir else None),
+                        "check_quota_timeout": check_quota_timeout,
+                        "email_channel": code_box.get("channel") or "",
                     }
                 )
-                _mint_userinfo = mint.get("userinfo")
-                userinfo: dict[str, Any] = (
-                    _mint_userinfo if isinstance(_mint_userinfo, dict) else {}
-                )
-                cpa_path = Path(str(mint["path"])) if mint.get("path") else None
-                oauth = OAuthLoginResult(
-                    token=token,
-                    userinfo=userinfo,
-                    id_token_payload=None,
-                    path=None,
-                    cliproxyapi_path=cpa_path,
-                )
+                result["oauth_queued"] = True
+                # Registration thread frees here; OAuth worker records final result.
+                return result
 
-            result["oauth_access_token"] = oauth.access_token
-            result["oauth_refresh_token"] = oauth.refresh_token
-            result["oauth_record"] = str(oauth.path) if oauth.path else None
-            result["cliproxyapi_auth"] = (
-                str(oauth.cliproxyapi_path) if oauth.cliproxyapi_path else None
+            # Inline (OAUTH_ASYNC=0): same thread, keep live auth_client for cookies.
+            built = _finish_build_oauth(
+                index=index,
+                email=email,
+                password=password,
+                sso=sso,
+                session_cookies=session_cookies,
+                proxy=proxy,
+                oauth_protocol=oauth_protocol,
+                oauth_debug=oauth_debug,
+                cliproxyapi_auth_dir=cliproxyapi_auth_dir,
+                cliproxyapi_base_url=cliproxyapi_base_url,
+                check_quota=check_quota,
+                failed_auth_dir=failed_auth_dir,
+                check_quota_timeout=check_quota_timeout,
+                auth_client=c,
             )
-            _log(
-                index,
-                f"Build OAuth OK  access={oauth.access_token[:20]}...  "
-                f"cliproxy={oauth.cliproxyapi_path.name if oauth.cliproxyapi_path else '?'}",
-            )
-
-            # Optional: only keep auth files that still have Build free quota.
-            if check_quota and oauth.cliproxyapi_path:
-                fail_dir = (
-                    Path(failed_auth_dir) if failed_auth_dir else _default_failed_auth_dir(auth_dir)
-                )
-                gate = _check_and_gate_auth(
-                    Path(oauth.cliproxyapi_path),
-                    failed_dir=fail_dir,
-                    timeout=check_quota_timeout,
-                    index=index,
-                )
-                result["quota_usable"] = gate["usable"]
-                result["quota_remaining_tokens"] = gate.get("remaining_tokens")
-                result["quota_status"] = gate.get("status")
-                result["quota_reasons"] = gate.get("reasons")
-                result["chat_endpoint_denied"] = bool(gate.get("chat_endpoint_denied"))
-                if gate["usable"]:
-                    result["cliproxyapi_auth"] = gate["path"]
-                else:
-                    # Unusable → removed from live auth dir; surface as failure.
-                    result["cliproxyapi_auth_failed"] = gate["path"]
-                    result["cliproxyapi_auth"] = None
-                    result["error"] = gate.get("error") or "quota unusable"
+            result.update(built)
         return result
 
     except Exception as e:
@@ -1020,12 +1284,15 @@ def _print_run_summary(
     print(f"\n{'=' * 50}", flush=True)
     print("  |  ".join(parts), flush=True)
     print(f"{'=' * 50}", flush=True)
+    queued = [r for r in rows if r.get("oauth_queued") and not r.get("cliproxyapi_auth")]
     if ok_build:
         print(f"  已注册 BUILD: {len(ok_build)}  （明细见上）", flush=True)
     elif ok_sso:
         print(f"  已拿到 SSO: {len(ok_sso)}（尚未 BUILD 导出）", flush=True)
     else:
         print("  本轮无成功账号", flush=True)
+    if queued:
+        print(f"  OAuth 队列残留(未完成): {len(queued)}", flush=True)
 
 
 def main():
@@ -1046,7 +1313,18 @@ def main():
         "--threads",
         type=int,
         default=4,
-        help="并发线程数（注册 + OAuth；默认 4，对齐 Tempmail free 稳态上限）",
+        help="注册并发线程数（默认 4；OAuth 另见 --oauth-workers）",
+    )
+    p.add_argument(
+        "--oauth-workers",
+        type=int,
+        default=0,
+        help="Build OAuth 池线程数（默认 max(-t,2)；OAUTH_ASYNC=0 时忽略）",
+    )
+    p.add_argument(
+        "--no-oauth-async",
+        action="store_true",
+        help="关闭 SSO→OAuth 拆分，注册线程内串行 Build",
     )
     p.add_argument(
         "-e",
@@ -1108,9 +1386,15 @@ def main():
     _t0 = time.time()
     threads = max(1, int(args.threads))
     do_oauth = not args.no_oauth
+    if args.no_oauth_async:
+        os.environ["OAUTH_ASYNC"] = "0"
+    oauth_async = _oauth_async_enabled(do_oauth)
     check_quota = bool(args.check_quota) and do_oauth
     _summary_ctx["check_quota"] = check_quota
     _summary_ctx["do_oauth"] = do_oauth
+    oauth_workers_n = int(args.oauth_workers or 0)
+    if oauth_workers_n <= 0:
+        oauth_workers_n = max(2, threads) if oauth_async else 0
     if args.check_quota and not do_oauth:
         print("warn: --check-quota ignored with --no-oauth", file=sys.stderr)
 
@@ -1126,8 +1410,11 @@ def main():
     mail_channels = resolve_channels(args.email)
     mail_size, mail_target, mail_minters = suggest_mail_pool_params(threads)
     print(
-        f"grok-build-auth: target {_total} success, {threads} threads, email={args.email}, "
-        f"oauth={'on' if do_oauth else 'off'}, turnstile={ts_label}"
+        f"grok-build-auth: target {_total} success, reg-threads={threads}, email={args.email}, "
+        f"oauth={'on' if do_oauth else 'off'}"
+        f", oauth-async={'on' if oauth_async else 'off'}"
+        f"{('/workers=' + str(oauth_workers_n)) if oauth_async else ''}"
+        f", turnstile={ts_label}"
         f", pool={'on' if use_pool else 'off'}"
         f", mail-pool={'on' if use_mail_pool else 'off'}"
         f", check-quota={'on' if check_quota else 'off'}"
@@ -1228,6 +1515,7 @@ def main():
         accounts_dir = (args.accounts_output_dir or "").strip() or None
         common_kwargs: dict[str, Any] = dict(
             do_oauth=do_oauth,
+            oauth_async=oauth_async,
             oauth_protocol=not args.no_oauth_protocol,
             oauth_debug=args.oauth_debug,
             cliproxyapi_auth_dir=args.cliproxyapi_auth_dir,
@@ -1240,6 +1528,9 @@ def main():
 
         def _record(result: dict) -> None:
             global _ok
+            # Queued handoff is not a terminal row — OAuth worker records the real one.
+            if result and result.get("oauth_queued") and not result.get("cliproxyapi_auth"):
+                return
             with _results_lock:
                 _results.append(result)
                 if _result_is_success(result, do_oauth=do_oauth):
@@ -1249,6 +1540,25 @@ def main():
                     ok_now = _ok
             if ok_now >= _total and not _stop.is_set():
                 request_stop("target-reached")
+
+        global _oauth_q, _oauth_workers
+        _oauth_q = None
+        _oauth_workers = []
+        if oauth_async:
+            _oauth_q = queue.Queue()
+            for wi in range(oauth_workers_n):
+                t = threading.Thread(
+                    target=_oauth_worker_loop,
+                    args=(_record,),
+                    name=f"oauth-{wi + 1}",
+                    daemon=True,
+                )
+                t.start()
+                _oauth_workers.append(t)
+            print(
+                f"  oauth-pool:            workers={oauth_workers_n} (session-reuse first)",
+                flush=True,
+            )
 
         next_index = 1
         with ThreadPoolExecutor(max_workers=threads) as ex:
@@ -1292,6 +1602,24 @@ def main():
                     if need_more:
                         _submit_one()
     finally:
+        # Drain OAuth pool: wait for queued SSO→Build, then stop workers.
+        if _oauth_q is not None:
+            if not _stop.is_set() or _ok < _total:
+                # Normal finish or target-reached: finish in-flight OAuth.
+                deadline = time.time() + 180.0
+                while time.time() < deadline:
+                    with _oauth_inflight_lock:
+                        inflight = _oauth_inflight
+                        empty = _oauth_q.empty()
+                    if empty and inflight <= 0:
+                        break
+                    time.sleep(0.2)
+            for _ in _oauth_workers:
+                _oauth_q.put(None)
+            for t in _oauth_workers:
+                t.join(timeout=30.0)
+            _oauth_workers = []
+            _oauth_q = None
         if _mail_pool is not None:
             _mail_pool.stop(wait=2.0)
             _mail_pool = None

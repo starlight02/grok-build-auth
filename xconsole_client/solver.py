@@ -683,49 +683,38 @@ class LocalBrowserTurnstileSolver:
             self._log(f"force-render goto failed: {exc}")
             return ""
 
-        # Short settle only — long fixed sleeps were free-path dead weight.
-        page.wait_for_timeout(400)
-        # Cookie banners can cover widgets
+        # Minimal settle — paint CF as soon as api.js is ready.
+        page.wait_for_timeout(150)
         for sel in (
             "#onetrust-accept-btn-handler",
             "button#onetrust-accept-btn-handler",
         ):
             try:
-                page.locator(sel).first.click(timeout=800)
-                page.wait_for_timeout(200)
+                page.locator(sel).first.click(timeout=400)
+                page.wait_for_timeout(100)
                 break
             except Exception:
                 pass
 
-        # Only click email path if turnstile API is not already present.
+        # Inject / wait turnstile API FIRST (before email path) so force-render
+        # can show the challenge on the open homepage immediately.
         try:
             has_ts = bool(page.evaluate("() => !!(window.turnstile && window.turnstile.render)"))
         except Exception:
             has_ts = False
         if not has_ts:
-            for text in ("使用邮箱注册", "Sign up with email", "Continue with email"):
-                try:
-                    page.get_by_text(text, exact=False).first.click(timeout=1200)
-                    page.wait_for_timeout(400)
-                    break
-                except Exception:
-                    pass
-
-        # Wait for turnstile global (preloaded by the page or inject)
-        try:
-            page.wait_for_function(
-                "() => !!(window.turnstile && window.turnstile.render)",
-                timeout=min(20000, timeout_ms),
-            )
-        except Exception:
-            self._log("turnstile global missing; inject api.js")
+            self._log("early inject turnstile api.js")
             try:
                 page.evaluate(
                     """() => new Promise((resolve) => {
                       if (window.turnstile && window.turnstile.render) {
                         resolve(true); return;
                       }
+                      if (document.getElementById('xai-ts-api-early')) {
+                        resolve(false); return;
+                      }
                       const s = document.createElement('script');
+                      s.id = 'xai-ts-api-early';
                       s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
                       s.async = true;
                       s.onload = () => resolve(true);
@@ -733,10 +722,41 @@ class LocalBrowserTurnstileSolver:
                       document.head.appendChild(s);
                     })"""
                 )
-                page.wait_for_timeout(1000)
             except Exception as exc:
                 self._log(f"inject api.js failed: {exc}")
+            try:
+                page.wait_for_function(
+                    "() => !!(window.turnstile && window.turnstile.render)",
+                    timeout=min(12000, timeout_ms),
+                )
+            except Exception:
+                self._log("turnstile global still missing after inject")
                 return ""
+        else:
+            try:
+                page.wait_for_function(
+                    "() => !!(window.turnstile && window.turnstile.render)",
+                    timeout=min(8000, timeout_ms),
+                )
+            except Exception:
+                pass
+
+        # Email path optional; default skip for early CF (TURNSTILE_CLICK_EMAIL=1).
+        import os as _os
+
+        if (_os.environ.get("TURNSTILE_CLICK_EMAIL") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            for text in ("使用邮箱注册", "Sign up with email", "Continue with email"):
+                try:
+                    page.get_by_text(text, exact=False).first.click(timeout=600)
+                    page.wait_for_timeout(150)
+                    break
+                except Exception:
+                    pass
 
         # Explicit render into a fixed host (proven path on accounts.x.ai)
         try:
@@ -749,8 +769,8 @@ class LocalBrowserTurnstileSolver:
                     host = document.createElement('div');
                     host.id = hostId;
                     host.style.cssText =
-                      'width:300px;height:80px;position:fixed;top:100px;left:20px;'
-                      + 'z-index:999999;background:#fff;';
+                      'width:300px;height:80px;position:fixed;top:12px;left:12px;'
+                      + 'z-index:2147483647;background:#fff;border:1px solid #ddd;';
                     document.body.appendChild(host);
                   }
                   // hidden field some pages read
@@ -786,8 +806,8 @@ class LocalBrowserTurnstileSolver:
             self._log(f"force render evaluate failed: {exc}")
             return ""
 
-        # Give managed challenge time to auto-pass (observed ~1-12s)
-        page.wait_for_timeout(1500)
+        # Brief settle only — poll loop handles the rest
+        page.wait_for_timeout(350)
 
         # Prefer callback / getResponse polling
         deadline = time.time() + timeout_ms / 1000.0

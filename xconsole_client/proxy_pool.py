@@ -908,6 +908,18 @@ def is_proxy_transport_error(exc: BaseException) -> bool:
         "network is unreachable",
         "socks",
         "proxy_pool exhausted",
+        # Direct-path TLS / socket flakiness (dominant fail mode in long runs)
+        "unexpected_eof",
+        "ssl: unexpected_eof",
+        "ssleoferror",
+        "eof occurred in violation of protocol",
+        "urlopen error timed out",
+        "the read operation timed out",
+        "read timed out",
+        "max retries exceeded",
+        "remote end closed connection",
+        "broken pipe",
+        "connection aborted",
         # scrape got CF / block page through a bad exit IP
         "cloudflare challenge",
         "cloudflare block",

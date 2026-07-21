@@ -8,7 +8,9 @@ A **protocol-research client** for publicly observable **x.ai / Grok web authent
 
 for protocol analysis, interoperability research, and **authorized** local integration testing.
 
-Default path: signup/OAuth over pure HTTP (`curl_cffi`). Turnstile **token pool on by default**. Mailbox: **pluggable multi-channel registry + background mail pool on by default** (`-e auto` enables every configured channel — prefer high-RPM sources, overflow on rate limits; single channel → solo). OAuth: protocol session-reuse, Device Flow fallback.
+Default path: signup over pure HTTP (`curl_cffi`). Turnstile **token pool on by default**. Mailbox: **pluggable multi-channel registry + background mail pool on by default** (`-e auto` prefer+overflow; single channel → solo).
+
+**Pipelined by default:** `-t` only covers **signup through SSO**. After SSO is written, the registration thread is freed; a dedicated **OAuth worker pool** (`--oauth-workers`, default `max(-t,2)`) prefers the **session-reuse fast path**, then falls back to Device Flow. `-n` counts **BUILD exports**.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
@@ -48,17 +50,19 @@ A research-oriented protocol client, **not** an official SDK.
 |---|---|
 | **Signup** | Email code (gRPC-web) + Turnstile + Next.js Server Action on `accounts.x.ai` |
 | **SSO** | Session JWT extraction for OAuth session reuse |
-| **OAuth** | Fast path: `oauth_protocol` SSO session-reuse (PKCE + cookie-setter + consent); fallback: `sso2auth` Device Flow; pure HTTP end-to-end |
+| **OAuth** | Dedicated worker pool; prefer `oauth_protocol` SSO **session-reuse** (PKCE + cookie-setter + consent, with transport retries); then `sso2auth` Device Flow; pure HTTP |
 | **Export** | Local `type=xai` auth files compatible with [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (Grok Build channel) |
 
 Highlights:
 
 - **Protocol-first** pure HTTP (`curl_cffi`) for signup / OAuth
-- **Turnstile pool**: background mint, signup threads only consume; **on by default**; demand-driven (stop when stock covers demand)
-- **Mail pool + multi-channel**: pluggable `mail_channels` registry; background inbox create; **prefer + overflow** (tempmail keeps its RPM; yyds/CF fill gaps — not a full switch on rate limit)
-- **Auto-tune from `-t`**: token/mail pool size & minters scale with registration threads (env can pin values)
-- **OAuth dual path**: SSO session-reuse (`oauth_protocol`); Device Flow fallback (`sso2auth`)
-- **Lean outputs**: default writes `sso_output/` + `cliproxyapi_auth/`
+- **Signup / OAuth split**: `-t` = registration concurrency; `--oauth-workers` = Build concurrency; SSO no longer blocks reg slots
+- **Fast path first**: session-reuse with `OAUTH_TRANSPORT_RETRIES`; Device fallback remains default (`OAUTH_ALLOW_DEVICE=1`)
+- **Turnstile pool + early force-render**: background mint; CF widget painted ASAP (`TURNSTILE_CLICK_EMAIL=0` by default)
+- **Mail pool + multi-channel** prefer + overflow
+- **Auto-tune from `-t`** for token/mail pools
+- **Transport retries**: SSL EOF / timeout classified as retriable (`TRANSPORT_RETRY` without proxy pool)
+- **Lean outputs**: `sso_output/` + `cliproxyapi_auth/`
 
 CPA export needs OAuth `access_token` / `refresh_token` (protocol path or Device Flow).
 
@@ -69,37 +73,51 @@ CPA export needs OAuth `access_token` / `refresh_token` (protocol path or Device
 ```mermaid
 flowchart TB
     subgraph entry [run.py]
-      A["-n / -t / -e auto|channel"]
+      A["-n target / -t reg threads / --oauth-workers"]
     end
 
     subgraph pools [Background pools default on]
-      TP[TurnstileTokenPool<br/>turnstile_pool]
-      MP[MailboxPool<br/>mailbox_pool]
-      R[ChannelRouter<br/>mail_channels]
+      TP[TurnstileTokenPool]
+      MP[MailboxPool]
+      R[ChannelRouter]
       MP --> R
       R -->|prefer| TM[tempmail]
       R -->|overflow| YY[yyds]
       R -->|overflow| CF[cloudflare]
-      R -.->|register_channel| X[future channels…]
     end
 
-    subgraph browser [Turnstile browser backends]
-      S[drission / camoufox / browser]
+    subgraph reg [Registration pool -t]
+      B[signup client.py]
+      C[SSO sso_output]
+    end
+
+    subgraph oauthp [OAuth worker pool default on]
+      Q[SSO job queue]
+      D{session-reuse<br/>oauth_protocol}
+      F[sso2auth Device Flow]
+      E[token exchange]
+    end
+
+    subgraph browser [Turnstile]
+      S[drission early force-render]
     end
 
     A --> TP
     A --> MP
     TP -->|mint| S
-    A --> B[signup client.py]
+    A --> B
     TP -->|token| B
-    MP -->|Mailbox email+receiver+channel| B
-    B --> C[SSO sso_output]
-    C --> D{OAuth fast path<br/>oauth_protocol}
-    D -->|OK| E[token exchange]
-    D -->|fail| F[sso2auth Device Flow]
+    MP -->|inbox| B
+    B --> C
+    C -->|free reg thread| Q
+    Q --> D
+    D -->|OK| E
+    D -->|fail if allowed| F
     F --> E
     E --> G[cliproxyapi_auth/*.json]
 ```
+
+`-n` counts **BUILD exports** by default (`cliproxyapi_auth`); with `--no-oauth` it counts SSO.
 
 ---
 
@@ -172,6 +190,15 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 | `CLOUDFLARE_D1_DB_ID` | same | D1 database ID |
 | `ALIAS_MAIL_DOMAINS` | same | domains you control (comma-separated) |
 | `CLIPROXYAPI_AUTH_DIR` | no | default `./cliproxyapi_auth` |
+| `OAUTH_ASYNC` | no | **default `1`**: hand off to OAuth pool after SSO; `0` / `--no-oauth-async` = inline Build |
+| `OAUTH_WORKERS` | no | OAuth pool size (or `--oauth-workers`; default `max(-t, 2)`) |
+| `OAUTH_TRANSPORT_RETRIES` | no | session-reuse transport retries (default **3**) |
+| `OAUTH_ALLOW_DEVICE` | no | Device Flow after fast-path failure (default **`1`**; `0` = fast path only) |
+| `TRANSPORT_RETRY` | no | registration transport retries **without** proxy pool (default 3; SSL EOF / timeout) |
+| `VISIT_HOME` | no | `1` = visit console home before signup (**default 0** skip) |
+| `TURNSTILE_CLICK_EMAIL` | no | `1` = click email signup before mint (default **0**, early CF force-render) |
+| `TURNSTILE_NATIVE_POLL` | no | native assist seconds after force-render fails (default 4; `0` off) |
+| `TURNSTILE_FORCE_POLL` | no | poll budget after force-render (default 12s) |
 | `HTTPS_PROXY` / `HTTP_PROXY` | no | single proxy (when no pool file) |
 | `PROXY_POOL_FILE` | no | proxy list file, **one URL per line**; exit-IP geo probe on start |
 | `PROXY_POOL` | no | small inline list; use FILE for large pools |
@@ -179,17 +206,21 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 | `PROXY_POOL_SCOPE` | no | `same_region` (**default**) / `all` |
 | `PROXY_GEO_WORKERS` | no | concurrent probes (default 16) |
 | `PROXY_GEO_CACHE` | no | probe cache (default `./.proxy_geo_cache.json`) |
+| `PROXY_RETRY` | no | per-account proxy rotate on transport fail when pool is on (default 8; covers SSL EOF) |
 
 ### Run (research / accounts you own)
 
 ```bash
-# Zero-config batch: -t 4 + token pool + mail pool + -e auto (prefer+overflow)
+# Zero-config batch: -t 4 reg + OAuth pool (default max(-t,2)) + token/mail pools + -e auto
 python run.py -n 20
 
 # Single-account smoke
 python run.py -n 1
 
-# Concurrency (token/mail pools auto-retune; -t 8 → size=8 minters=2)
+# Tune reg vs OAuth pool separately (recommend oauth-workers ≥ -t)
+python run.py -n 20 -t 4 --oauth-workers 6
+
+# Registration concurrency (token/mail follow -t; OAuth workers default max(-t,2))
 python run.py -n 20 -t 8
 
 # Force a single channel (solo: may block on wait/retry)
@@ -225,8 +256,18 @@ PROXY_POOL_FILE=./proxies.txt PROXY_REGION=us python run.py -n 10 -t 4
 touch /tmp/grok-turnstile.pause
 rm    /tmp/grok-turnstile.pause
 
+# SSO only (no Build)
 python run.py -n 1 --no-oauth
+
+# Disable OAuth async pool: Build inline on the registration thread
+python run.py -n 4 -t 2 --no-oauth-async
+
+# Force Device Flow for the whole OAuth step (skips session-reuse; slower)
 python run.py -n 1 --no-oauth-protocol
+
+# Fast path only (no Device fallback) — useful when debugging session-reuse
+OAUTH_ALLOW_DEVICE=0 python run.py -n 5 -t 2 --oauth-workers 4
+
 python run.py -n 1 --cliproxyapi-auth-dir /path/to/CLIProxyAPI/data/auth
 python run.py -n 1 --accounts-output-dir ./accounts_output
 python run.py -n 1 --oauth-debug
@@ -431,10 +472,10 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 
 Notes:
 
-1. Signup / mail / SSO / OAuth use protocol HTTP; Turnstile mint is only needed before create-account.  
-2. **Token pool is default**: background mint; signup threads take `from pool`. `TURNSTILE_PARALLEL` applies only when pool is off.  
-3. Drission warm-page ≈ 2.4s/token; first cold mint is slower.  
-4. OAuth: SSO session-reuse first, Device Flow on failure.  
+1. Signup / mail / SSO use protocol HTTP; Turnstile mint is only before create-account. OAuth runs on a dedicated worker pool by default.  
+2. **Token pool is default**: background mint; signup threads take `from pool`. `TURNSTILE_PARALLEL` only when pool is off.  
+3. Drission warm-page ≈ 2.4s/token; **early force-render** by default (`TURNSTILE_CLICK_EMAIL=0`).  
+4. OAuth: **session-reuse first** (with retries) → Device Flow fallback; tune `-t` and `--oauth-workers` separately.  
 5. Prefer **headed + minimized/off-screen + warm reuse + pool** for batches.
 
 ### How to tell which path ran
