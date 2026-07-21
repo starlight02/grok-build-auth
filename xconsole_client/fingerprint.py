@@ -68,11 +68,11 @@ class FingerprintTransport:
         self._debug = debug
         proxy = (proxy or "").strip() or None
         self._proxy = proxy
-        # A new Session per client. The browser-equivalent fingerprint is
-        # established by `impersonate=`; it is fixed for the session's life.
+        # curl_cffi stubs use narrow BrowserTypeLiteral / HttpVersionLiteral;
+        # we keep runtime strings configurable and suppress the stub noise here.
         self._session = cc_requests.Session(
-            impersonate=impersonate,
-            http_version=http_version,
+            impersonate=impersonate,  # type: ignore[arg-type]
+            http_version=http_version,  # type: ignore[arg-type]
             ja3=DEFAULT_JA3,
         )
         # Make sure default Accept-Encoding is exactly the Chrome order.
@@ -112,18 +112,21 @@ class FingerprintTransport:
         for k, v in headers.items():
             if k not in merged:
                 merged[k] = v
-        req_kwargs = dict(
-            method=method,
+        # Explicit kwargs (not **dict) so pyright does not explode on curl_cffi stubs.
+        proxies: Optional[Dict[str, str]] = None
+        if self._proxy:
+            proxies = {"http": self._proxy, "https": self._proxy}
+        resp = self._session.request(
+            method=method,  # type: ignore[arg-type]
             url=url,
             headers=merged,
             data=body,
             timeout=self._timeout,
-            allow_redirects=False,  # we want to see 3xx, like the real browser
+            allow_redirects=False,
+            proxies=proxies,  # type: ignore[arg-type]
         )
-        if self._proxy:
-            # curl_cffi accepts proxies= like requests
-            req_kwargs["proxies"] = {"http": self._proxy, "https": self._proxy}
-        resp = self._session.request(**req_kwargs)
+        if resp is None:
+            raise RuntimeError(f"curl_cffi returned no response for {method} {url}")
         status = resp.status_code
         raw = resp.content
         # Defensive: if server sent gzip but curl didn't decode, do it here.

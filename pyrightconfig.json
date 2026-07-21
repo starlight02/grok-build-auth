@@ -14,6 +14,8 @@
     "sso_output"
   ],
   "pythonVersion": "3.11",
+  "venvPath": ".",
+  "venv": ".venv",
   "typeCheckingMode": "basic",
   "reportMissingImports": "none",
   "reportMissingModuleSource": "none",
