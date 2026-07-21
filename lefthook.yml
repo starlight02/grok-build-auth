@@ -1,0 +1,44 @@
+# lefthook.yml
+# Pre-commit quality gate for grok-build-auth
+# Auto-installs hooks on first run: lefthook install
+
+pre-commit:
+  parallel: true
+  commands:
+    ruff-format:
+      glob: "*.py"
+      run: |
+        if command -v ruff >/dev/null 2>&1; then
+          ruff format --check {staged_files}
+        elif command -v uvx >/dev/null 2>&1; then
+          uvx ruff format --check {staged_files}
+        else
+          echo "❌ neither 'ruff' nor 'uvx' found on PATH" >&2
+          exit 1
+        fi
+      stage_fixed: true
+
+    ruff-check:
+      glob: "*.py"
+      run: |
+        if command -v ruff >/dev/null 2>&1; then
+          ruff check {staged_files}
+        elif command -v uvx >/dev/null 2>&1; then
+          uvx ruff check {staged_files}
+        else
+          echo "❌ neither 'ruff' nor 'uvx' found on PATH" >&2
+          exit 1
+        fi
+
+    pyright:
+      glob: "*.py"
+      run: pyright {staged_files} || echo "⚠️  pyright reported issues (advisory, not blocking)"
+      fail_text: "pyright check failed (non-blocking)"
+      skip:
+        - run: "! command -v pyright >/dev/null 2>&1"
+          reason: "pyright not installed"
+
+commit-msg:
+  commands:
+    conventional-commits:
+      run: bash scripts/commit-msg-check.sh {1}
