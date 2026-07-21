@@ -1,12 +1,8 @@
 {
   "include": [
     "run.py",
-    "check_accounts.py",
-    "xai_build_quota_probe.py",
-    "retry_oauth_from_sso.py",
-    "xai_oauth_export_cliproxyapi.py",
-    "xai_oauth_login.py",
-    "alias_mail",
+    "tools",
+    "contrib/alias_mail",
     "xconsole_client"
   ],
   "exclude": [

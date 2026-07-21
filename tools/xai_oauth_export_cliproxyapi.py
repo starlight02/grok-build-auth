@@ -13,7 +13,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from xconsole_client.xai_oauth import (
     CLIPROXYAPI_GROK_BASE_URL,
@@ -22,7 +27,9 @@ from xconsole_client.xai_oauth import (
 
 
 def newest_oauth_record() -> Path:
-    records = sorted(Path("oauth_output").glob("xai_oauth_*.json"))
+    from xconsole_client.paths import oauth_output_dir
+
+    records = sorted(oauth_output_dir().glob("xai_oauth_*.json"))
     if not records:
         raise FileNotFoundError("no oauth_output/xai_oauth_*.json records found")
     return records[-1]

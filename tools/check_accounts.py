@@ -11,10 +11,10 @@ Accepts either:
 
 Examples:
 
-  python check_accounts.py cliproxyapi_auth/
-  python check_accounts.py accounts_output/account_*.json
-  python check_accounts.py cliproxyapi_auth/user@example.com.json --json
-  HTTPS_PROXY=http://127.0.0.1:7890 python check_accounts.py cliproxyapi_auth/
+  python tools/check_accounts.py cliproxyapi_auth/
+  python tools/check_accounts.py accounts_output/account_*.json
+  python tools/check_accounts.py cliproxyapi_auth/user@example.com.json --json
+  HTTPS_PROXY=http://127.0.0.1:7890 python tools/check_accounts.py cliproxyapi_auth/
 """
 
 from __future__ import annotations
@@ -25,10 +25,14 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 

@@ -286,10 +286,10 @@ python run.py -n 5 -t 4 --check-quota --failed-auth-dir ./cliproxyapi_auth_faile
 | `accounts_output/` | off | pipeline ledger (`--accounts-output-dir`) |
 
 Helpers:
-- `check_accounts.py` — auth usability / Build quota
-- `retry_oauth_from_sso.py` — SSO → CPA Device Flow
-- `xai_oauth_login.py` — interactive browser OAuth
-- `xai_oauth_export_cliproxyapi.py` — export oauth_output → CPA auth
+- `tools/check_accounts.py` — auth usability / Build quota
+- `tools/retry_oauth_from_sso.py` — SSO → CPA Device Flow
+- `tools/xai_oauth_login.py` — interactive browser OAuth
+- `tools/xai_oauth_export_cliproxyapi.py` — export oauth_output → CPA auth
 
 ---
 
@@ -407,7 +407,7 @@ Select a backend with `TURNSTILE_SOLVER` (or `resolve_turnstile_solver(backend=.
 | `TURNSTILE_SOLVER` | Stack | Headed by default? | When to use |
 |---|---|---|---|
 | **`auto` (default)** | DrissionPage installed → **drission**; else → **browser** | follows backend | daily default |
-| **`drission`** | DrissionPage + system **Chrome** + `turnstilePatch/` | **yes** (`0`) | **recommended** for warm-page pool batches |
+| **`drission`** | DrissionPage + system **Chrome** + `extensions/turnstilePatch/` | **yes** (`0`) | **recommended** for warm-page pool batches |
 | **`camoufox`** | **Camoufox** anti-detect Firefox (via Playwright) | **yes** (`0`) | Firefox / anti-detect; needs `camoufox fetch` |
 | **`browser`** | Playwright Chromium/Chrome | **no** (`1`) | fallback without Drission |
 | **`safari`** | system Safari (macOS) | steals focus | manual/single path; pool minters fixed at 1 |
@@ -425,7 +425,7 @@ Aliases:
 pip install -r requirements.txt
 
 # drission (default path): system Google Chrome required
-# turnstilePatch/ ships in-repo
+# extensions/turnstilePatch/ ships in-repo
 
 # camoufox extra:
 pip install camoufox
@@ -490,6 +490,19 @@ Notes:
 ```
 
 ---
+
+## Repository layout
+
+```text
+.
+├── run.py                 # main entry (signup → SSO → Build OAuth)
+├── xconsole_client/       # protocol library (`paths.py` resolves runtime dirs)
+├── tools/                 # helper CLIs (check / retry OAuth / probe / export)
+├── extensions/turnstilePatch/
+├── contrib/alias_mail/
+├── scripts/ + githooks/   # quality gate
+└── (gitignored) sso_output/ cliproxyapi_auth/ oauth_output/ …
+```
 
 ## Contributing
 

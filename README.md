@@ -293,17 +293,17 @@ python run.py -n 5 -t 4 --check-quota --failed-auth-dir ./cliproxyapi_auth_faile
 
 ```bash
 # 检查 cliproxyapi_auth 可用性 / Build 额度
-python check_accounts.py cliproxyapi_auth/
+python tools/check_accounts.py cliproxyapi_auth/
 
 # SSO → CPA（Device Flow）
-python retry_oauth_from_sso.py
-# SSO2AUTH_WORKERS=4 python retry_oauth_from_sso.py
+python tools/retry_oauth_from_sso.py
+# SSO2AUTH_WORKERS=4 python tools/retry_oauth_from_sso.py
 
 # 交互式浏览器 OAuth
-python xai_oauth_login.py
+python tools/xai_oauth_login.py
 
 # oauth_output → CPA auth
-python xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyapi_auth
+python tools/xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyapi_auth
 ```
 
 ### 导出文件形态（本地文件，非官方密钥）
@@ -444,7 +444,7 @@ register_channel(ChannelSpec(
 | `TURNSTILE_SOLVER` | 栈 | 默认有头？ | 何时用 |
 |---|---|---|---|
 | **`auto`（默认）** | 有 DrissionPage → **drission**；否则 → **browser** | 随所选后端 | 日常默认，不用改 |
-| **`drission`** | DrissionPage + 本机 **Chrome** + `turnstilePatch/` | **是**（`0`） | **推荐主力**；暖页池 + 终端批量 |
+| **`drission`** | DrissionPage + 本机 **Chrome** + `extensions/turnstilePatch/` | **是**（`0`） | **推荐主力**；暖页池 + 终端批量 |
 | **`camoufox`** | **Camoufox** 反检测 Firefox（经 Playwright 启动） | **是**（`0`） | 想换 Firefox / 反检测；需额外 `camoufox fetch` |
 | **`browser`** | Playwright Chromium/Chrome | **否**（`1`） | 没装 Drission 时的回退；本机 IP 上往往不如前两者稳 |
 | **`safari`** | 系统 Safari（macOS） | 会抢焦点 | 手动/单路；池 minters 固定 1 |
@@ -463,7 +463,7 @@ register_channel(ChannelSpec(
 pip install -r requirements.txt
 
 # drission（默认路径）额外需要：本机已装 Google Chrome
-# turnstilePatch/ 扩展已随仓库提供，无需手装
+# extensions/turnstilePatch/ 扩展已随仓库提供，无需手装
 
 # camoufox 额外：
 pip install camoufox
@@ -561,40 +561,35 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 
 ```text
 .
-├── NOTICE                         # 具有约束力的使用须知（必读）
-├── LICENSE                        # MIT
+├── NOTICE / LICENSE / SECURITY.md
 ├── README.md / README.en.md
-├── SECURITY.md
-├── run.py                         # 主入口
-├── check_accounts.py              # auth 可用性 / Build 额度
-├── retry_oauth_from_sso.py        # SSO → CPA Device Flow
-├── xai_oauth_login.py             # 交互式浏览器 OAuth
-├── xai_oauth_export_cliproxyapi.py
-├── requirements.txt
-├── .env.example
-├── xconsole_client/               # 协议库（Python 包名，历史命名）
+├── requirements.txt / .env.example
+├── ruff.toml / pyrightconfig.json
+├── run.py                         # 主入口：注册 → SSO → Build OAuth
+├── xconsole_client/               # 协议库（可 import 的包）
+│   ├── paths.py                   # 仓库根 / 运行时目录 / 扩展路径
 │   ├── client.py                  # 注册
-│   ├── oauth_protocol.py          # 协议 OAuth（SSO session-reuse）
-│   ├── sso2auth.py                # SSO Device Flow → CPA
-│   ├── xai_oauth.py               # PKCE / 导出 / 浏览器登录
-│   ├── mail_channels.py           # 邮箱渠道 registry + prefer/overflow 路由
-│   ├── mailbox_pool.py            # 后台邮箱预创建池（默认 on）
-│   ├── tempmail_transport.py      # Tempmail.lol（free create 节流）
-│   ├── yyds_transport.py          # YYDS / maliapi 邮箱
-│   ├── turnstile_pool.py          # 后台 token 池（默认 on，随 -t 自动）
-│   ├── solver.py                  # Turnstile 工厂
-│   ├── drission_solver.py         # Drission + turnstilePatch（暖页复用）
-│   ├── camoufox_solver.py         # Camoufox
-│   └── sso.py / mailbox.py / ...
-├── turnstilePatch/                # Chrome 扩展（Drission 用）
-└── alias_mail/                    # 可选：Cloudflare 邮箱助手
+│   ├── oauth_protocol.py          # SSO session-reuse OAuth
+│   ├── sso2auth.py                # Device Flow → CPA
+│   ├── xai_oauth.py / sso.py / ...
+│   ├── mail_channels.py / mailbox_pool.py / ...
+│   ├── turnstile_pool.py / solver.py
+│   └── drission_solver.py         # Drission + extensions/turnstilePatch
+├── tools/                         # 辅助 CLI（非主路径）
+│   ├── check_accounts.py
+│   ├── retry_oauth_from_sso.py
+│   ├── xai_build_quota_probe.py
+│   ├── xai_oauth_login.py
+│   └── xai_oauth_export_cliproxyapi.py
+├── extensions/
+│   └── turnstilePatch/            # Chrome MV2 扩展（Drission）
+├── contrib/
+│   └── alias_mail/                # 可选：Cloudflare 邮箱助手
+├── scripts/quality-check.sh       # pre-commit 质量门
+└── githooks/pre-commit
 
-# 运行时（gitignore）
-# sso_output/               默认写（sso_*.json + sso_tokens.txt）
-# cliproxyapi_auth/         默认写（OAuth 成功）
-# cliproxyapi_auth_failed/  仅 --check-quota 时
-# oauth_output/             可选
-# accounts_output/          可选
+# 运行时产物（gitignore，默认写在仓库根，路径由 xconsole_client.paths 解析）
+# sso_output/  cliproxyapi_auth/  cliproxyapi_auth_failed/  oauth_output/  accounts_output/
 ```
 
 运行产物：默认 **`sso_output/` + `cliproxyapi_auth/`**。`--check-quota` 开启时无额度文件进 `cliproxyapi_auth_failed/`。`oauth_output/` 仅独立 OAuth 工具/显式指定时写；`accounts_output/` 仅 `--accounts-output-dir <path>` 时写。

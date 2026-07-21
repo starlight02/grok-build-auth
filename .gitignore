@@ -31,6 +31,8 @@ cliproxyapi_auth_failed/
 .alias_domain_state.json
 alias_mail/.alias_domain_health.json
 alias_mail/.alias_domain_state.json
+contrib/alias_mail/.alias_domain_health.json
+contrib/alias_mail/.alias_domain_state.json
 
 # Local debug leftovers
 _dbg_*.py

@@ -327,7 +327,9 @@ class SSOExtractor:
 
 # Default output directory, resolved relative to the xconsole repo root.
 def _default_output_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "sso_output"
+    from .paths import sso_output_dir
+
+    return sso_output_dir()
 
 
 # Serialize appends to sso_tokens.txt under concurrent -t N workers.

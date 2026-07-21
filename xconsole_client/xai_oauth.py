@@ -88,7 +88,9 @@ def parse_jwt_payload(jwt_token: str) -> Optional[Dict[str, Any]]:
 
 
 def default_output_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "oauth_output"
+    from .paths import oauth_output_dir
+
+    return oauth_output_dir()
 
 
 @dataclass
@@ -789,7 +791,9 @@ def default_cliproxyapi_auth_dir() -> Path:
     env = (os.environ.get("CLIPROXYAPI_AUTH_DIR") or "").strip()
     if env:
         return Path(env).expanduser()
-    return Path(__file__).resolve().parent.parent / "cliproxyapi_auth"
+    from .paths import cliproxyapi_auth_dir as _default_cpa_dir
+
+    return _default_cpa_dir()
 
 
 def main() -> None:

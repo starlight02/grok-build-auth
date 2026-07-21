@@ -30,11 +30,12 @@ import os
 import subprocess
 import threading
 import time
-from pathlib import Path
 from typing import Any, Optional
+
+from .paths import turnstile_extension_dir
 from urllib.parse import urlparse
 
-_EXT_DIR = Path(__file__).resolve().parent.parent / "turnstilePatch"
+_EXT_DIR = turnstile_extension_dir()
 
 _CHROMIUM_SLIM_FLAGS = [
     "--disable-gpu",

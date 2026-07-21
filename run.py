@@ -8,7 +8,7 @@
   4) 导出 CLIProxyAPI auth：cli-chat-proxy.grok.com + grok-cli headers
 
 环境变量（按需设置）:
-    TURNSTILE_SOLVER       auto|drission|browser|safari (default auto → DrissionPage+turnstilePatch)
+    TURNSTILE_SOLVER       auto|drission|browser|safari (default auto → DrissionPage+extensions/turnstilePatch)
     TURNSTILE_HEADLESS     drission 默认 0（有头自动点）；browser/playwright 默认 1
     TURNSTILE_BROWSER_CHANNEL  playwright only (chrome auto when available)
     TURNSTILE_INTERACTIVE  1=手动点 Turnstile（仅 playwright；强制有头）
@@ -32,7 +32,7 @@
     MAIL_POOL_MAX_AGE       池内邮箱最大年龄秒（默认 600）
     MAIL_CODE_TIMEOUT     Seconds to wait for verification code before rotating inbox (default 30)
     MAIL_MAX_ATTEMPTS     Fresh inboxes to try when mail is silent (default 3)
-    CLOUDFLARE_API_TOKEN   Cloudflare API token (alias_mail 邮箱后端)
+    CLOUDFLARE_API_TOKEN   Cloudflare API token (contrib/alias_mail 邮箱后端)
     CLIPROXYAPI_AUTH_DIR   CLIProxyAPI data/auth 目录（可选）
     HTTPS_PROXY / HTTP_PROXY  单代理（无池文件时）
     PROXY_POOL_FILE          代理池文件（每行一个 URL；启动时探测出口地区）
@@ -81,6 +81,7 @@ from typing import Any, Optional
 
 _ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_ROOT / "tools"))
 
 # Load local .env if present (optional dependency).
 try:

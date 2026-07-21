@@ -64,11 +64,12 @@ from typing import Any, Optional
 # --------------------------------------------------------------------------- #
 # alias_mail import shim
 # --------------------------------------------------------------------------- #
-# The canonical location of the alias_mail module is the local alias_mail/ directory.
+# The canonical location of the alias_mail module is contrib/alias_mail/.
 # We inject that directory into sys.path the first time this file is imported
 # so callers don't have to think about it.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ALIAS_MAIL_DIR = os.path.normpath(os.path.join(_HERE, "..", "alias_mail"))
+from .paths import alias_mail_dir as _alias_mail_dir_fn
+
+_ALIAS_MAIL_DIR = str(_alias_mail_dir_fn())
 if _ALIAS_MAIL_DIR not in sys.path and os.path.isdir(_ALIAS_MAIL_DIR):
     sys.path.insert(0, _ALIAS_MAIL_DIR)
 
@@ -85,7 +86,7 @@ def _load_alias_mail() -> Any:
 
         return alias_mail
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("alias_mail backend not available; see alias_mail\\README.md") from exc
+        raise RuntimeError("alias_mail backend not available; see contrib/alias_mail") from exc
 
 
 # --------------------------------------------------------------------------- #
