@@ -18,18 +18,16 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urljoin
 
 import requests
 
 _ROOT = Path(__file__).resolve().parent.parent
-_TOOLS = Path(__file__).resolve().parent
-for _p in (_ROOT, _TOOLS):
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-from check_accounts import (
+from xconsole_client.account_check import (
     BUILD_USAGE_BALANCE_EXHAUSTED,
     CHAT_ENDPOINT_DENIED,
     SPENDING_LIMIT_EXHAUSTED,
@@ -80,13 +78,13 @@ def build_url(base_url: str) -> str:
     return urljoin(base, "responses")
 
 
-def header_int(headers: requests.structures.CaseInsensitiveDict[str], name: str) -> int | None:
+def header_int(headers: Mapping[str, Any], name: str) -> int | None:
     raw = headers.get(name)
     if raw is None:
         return None
     try:
         return int(raw)
-    except ValueError:
+    except (TypeError, ValueError):
         return None
 
 

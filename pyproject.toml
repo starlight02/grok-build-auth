@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grok-build-auth"
+version = "0.1.0"
+description = "Protocol research client for x.ai / Grok web authentication flows"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "grok-build-auth contributors" }]
+dependencies = [
+    "curl_cffi>=0.7.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+    "DrissionPage>=4.1",
+    "playwright>=1.40.0",
+]
+
+[project.optional-dependencies]
+camoufox = ["camoufox>=0.4.11"]
+safari = [
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+]
+dev = [
+    "ruff>=0.8.0",
+    "pyright>=1.1.390",
+    "pytest>=8.0",
+]
+all = [
+    "grok-build-auth[camoufox,safari,dev]",
+]
+
+[project.scripts]
+grok-build-auth = "run:main"
+xai-check-accounts = "xconsole_client.account_check.cli:main"
+xai-oauth-login = "xconsole_client.xai_oauth:main"
+
+[project.urls]
+Homepage = "https://github.com/starlight02/grok-build-auth"
+Security = "https://github.com/starlight02/grok-build-auth/security"
+
+[tool.setuptools]
+py-modules = ["run"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["xconsole_client*", "contrib*"]
+exclude = ["tests*", "tools*", "scripts*", "extensions*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+ignore = [
+    # run.py bootstraps dotenv before local imports; some modules register atexit late.
+    "E402",
+]

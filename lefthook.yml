@@ -32,11 +32,29 @@ pre-commit:
 
     pyright:
       glob: "*.py"
-      run: pyright {staged_files} || echo "⚠️  pyright reported issues (advisory, not blocking)"
-      fail_text: "pyright check failed (non-blocking)"
-      skip:
-        - run: "! command -v pyright >/dev/null 2>&1"
-          reason: "pyright not installed"
+      run: |
+        if command -v pyright >/dev/null 2>&1; then
+          pyright {staged_files}
+        else
+          echo "❌ pyright not found on PATH (pip install -e '.[dev]')" >&2
+          exit 1
+        fi
+
+    pytest:
+      glob: "*.{py,toml}"
+      run: |
+        if command -v pytest >/dev/null 2>&1; then
+          pytest
+        elif command -v python3 >/dev/null 2>&1 && python3 -m pytest --version >/dev/null 2>&1; then
+          python3 -m pytest
+        elif [ -x .venv/bin/python ] && .venv/bin/python -m pytest --version >/dev/null 2>&1; then
+          .venv/bin/python -m pytest
+        elif command -v uvx >/dev/null 2>&1; then
+          uvx pytest
+        else
+          echo "❌ pytest not found (pip install -e '.[dev]')" >&2
+          exit 1
+        fi
 
 commit-msg:
   commands:

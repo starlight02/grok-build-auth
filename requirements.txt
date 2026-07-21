@@ -1,11 +1,13 @@
+# Runtime dependencies (canonical pins live in pyproject.toml).
+# Prefer: pip install -e ".[dev]"
 curl_cffi>=0.7.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 
-# Turnstile: prefer DrissionPage + extensions/turnstilePatch/ (terminal CLI, like grok_reg_clean).
+# Turnstile: prefer DrissionPage + extensions/turnstilePatch/ (terminal CLI).
 DrissionPage>=4.1
 # Fallback: Playwright Chromium/Chrome (TURNSTILE_SOLVER=browser).
 playwright>=1.40.0
 # Optional: Camoufox anti-detect Firefox (TURNSTILE_SOLVER=camoufox)
 # After install: camoufox fetch
-camoufox>=0.4.11
+# camoufox>=0.4.11

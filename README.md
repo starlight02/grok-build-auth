@@ -11,7 +11,7 @@
 **流水线拆分（默认）**：`-t` 只管**注册到 SSO**；SSO 落盘后立刻释放注册线程，由独立 **OAuth worker 池**（`--oauth-workers`，默认 `max(-t,2)`）优先跑 **session-reuse 快路径**，失败再回退 Device Flow。目标成功数 `-n` 按 **BUILD 导出** 计数。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![Use](https://img.shields.io/badge/use-research%20%2F%20authorized%20only-red)](#法律边界)
 
 ---
@@ -122,7 +122,7 @@ flowchart TB
 
 这不是「零配置即用」的产品。至少需要：
 
-- Python 3.9+
+- Python 3.11+
 - Turnstile：本机浏览器后端（默认 Drission + Chrome 有头；可选 Camoufox / Playwright）
 - 邮箱：默认 `-e auto` —— 启用**所有已配置**渠道（tempmail 始终可用；yyds / cloudflare 有凭证才进池）；也可 `-e tempmail|yyds|cloudflare` 强制单渠道
 - （可选）HTTP(S) 代理
@@ -146,12 +146,13 @@ python -m venv .venv
 # macOS / Linux
 # source .venv/bin/activate
 
-pip install -r requirements.txt
+pip install -e ".[dev]"
+# 或仅运行依赖：
+# pip install -r requirements.txt
 # 可选：Camoufox 后端还要拉浏览器二进制
-# pip install camoufox && camoufox fetch
+# pip install -e ".[camoufox]" && camoufox fetch
 cp .env.example .env
 # 可选编辑 .env；通常只需代理，无需 TEMPMAIL key
-```
 
 ### 配置
 

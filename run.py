@@ -77,11 +77,11 @@ import argparse
 import shutil
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional, Protocol
 
 _ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
-sys.path.insert(0, str(_ROOT / "tools"))
 
 # Load local .env if present (optional dependency).
 try:
@@ -90,6 +90,11 @@ try:
     load_dotenv(_ROOT / ".env")
 except Exception:
     pass
+
+
+class _CodeReceiver(Protocol):
+    def wait_for_code(self, timeout: float | None = None) -> str: ...
+
 
 from xconsole_client import XConsoleAuthClient, config as C
 from xconsole_client.solver import resolve_turnstile_solver
@@ -143,10 +148,33 @@ def _mail_max_attempts() -> int:
         return 3
 
 
-_results_lock = threading.Lock()
-_cf_lock = threading.Lock()
-_stop = threading.Event()
-_sigint_count = 0
+@dataclass
+class PipelineState:
+    """Process-wide pipeline orchestration state for one CLI run."""
+
+    results_lock: threading.Lock = field(default_factory=threading.Lock)
+    cf_lock: threading.Lock = field(default_factory=threading.Lock)
+    stop: threading.Event = field(default_factory=threading.Event)
+    sigint_count: int = 0
+    turnstile_lock: threading.Semaphore = field(default_factory=lambda: threading.Semaphore(2))
+    token_pool: Optional["TurnstileTokenPool"] = None
+    mail_pool: Optional["MailboxPool"] = None
+    mail_router: Optional["ChannelRouter"] = None
+    shared_solver: Any = None
+    proxy_pool: Optional["ProxyPool"] = None
+    results: list[dict] = field(default_factory=list)
+    done: int = 0  # attempts finished
+    ok: int = 0  # successes toward -n target
+    total: int = 0  # target success count
+    t0: float = 0.0
+    summary_ctx: dict = field(default_factory=lambda: {"check_quota": False, "do_oauth": True})
+    oauth_q: Optional[queue.Queue] = None
+    oauth_inflight: int = 0
+    oauth_inflight_lock: threading.Lock = field(default_factory=threading.Lock)
+    oauth_workers: list[threading.Thread] = field(default_factory=list)
+
+
+_S = PipelineState()
 
 
 def request_stop(reason: str = "stop") -> None:
@@ -155,15 +183,15 @@ def request_stop(reason: str = "stop") -> None:
     Full stats are printed only at process end (or second Ctrl+C),
     so they stay at the bottom of the log — not buried by worker FAIL lines.
     """
-    first = not _stop.is_set()
+    first = not _S.stop.is_set()
     if first:
-        with _results_lock:
-            n = len(_results)
+        with _S.results_lock:
+            n = len(_S.results)
         print(
-            f"\n  [{reason}] 正在停止… 已完成 {n}/{_total or '?'}，收尾后打印统计；再按一次 Ctrl+C 强制退出并立即打印统计",
+            f"\n  [{reason}] 正在停止… 已完成 {n}/{_S.total or '?'}，收尾后打印统计；再按一次 Ctrl+C 强制退出并立即打印统计",
             flush=True,
         )
-    _stop.set()
+    _S.stop.set()
     try:
         from xconsole_client.drission_solver import _close_all_drission_browsers
 
@@ -178,13 +206,13 @@ def request_stop(reason: str = "stop") -> None:
             close_fn()
     except Exception:
         pass
-    pool = _token_pool
+    pool = _S.token_pool
     if pool is not None:
         try:
             pool.stop(wait=0.2)
         except Exception:
             pass
-    mpool = _mail_pool
+    mpool = _S.mail_pool
     if mpool is not None:
         try:
             mpool.stop(wait=0.2)
@@ -194,11 +222,10 @@ def request_stop(reason: str = "stop") -> None:
 
 def _install_sigint_handler() -> None:
     def _handler(signum, frame):  # noqa: ARG001
-        global _sigint_count
-        _sigint_count += 1
-        if _sigint_count >= 2:
+        _S.sigint_count += 1
+        if _S.sigint_count >= 2:
             print("\n  [SIGINT] 强制退出 — 统计如下（应在日志最底部）", flush=True)
-            _stop.set()
+            _S.stop.set()
             try:
                 # brief pause so in-flight prints that already started can finish
                 time.sleep(0.15)
@@ -206,8 +233,8 @@ def _install_sigint_handler() -> None:
                 pass
             try:
                 _print_run_summary(
-                    check_quota=bool(_summary_ctx.get("check_quota")),
-                    do_oauth=bool(_summary_ctx.get("do_oauth", True)),
+                    check_quota=bool(_S.summary_ctx.get("check_quota")),
+                    do_oauth=bool(_S.summary_ctx.get("do_oauth", True)),
                     title="Forced stop",
                 )
             except Exception:
@@ -243,35 +270,16 @@ def _turnstile_parallel(reg_threads: int = 2) -> int:
     return max(1, min(8, int(reg_threads or 1)))
 
 
-_turnstile_lock = threading.Semaphore(2)
-_token_pool: Optional[TurnstileTokenPool] = None
-_mail_pool: Optional[MailboxPool] = None
-_mail_router: Optional[ChannelRouter] = None
-_shared_solver = None
-_proxy_pool: Optional[ProxyPool] = None
-_results: list[dict] = []
-_done = 0  # attempts finished
-_ok = 0  # successes toward -n target
-_total = 0  # target success count
-_t0 = 0.0
-_summary_ctx: dict = {"check_quota": False, "do_oauth": True}
-
-_oauth_q: Optional[queue.Queue] = None
-_oauth_inflight = 0
-_oauth_inflight_lock = threading.Lock()
-_oauth_workers: list[threading.Thread] = []
-
-
 def _acquire_proxy() -> str:
     """Next proxy URL for this registration (pool) or legacy single PROXY."""
-    pool = _proxy_pool
+    pool = _S.proxy_pool
     if pool is not None:
         return pool.acquire().url
     return PROXY
 
 
 def _mark_proxy_bad(proxy: str, reason: str) -> None:
-    pool = _proxy_pool
+    pool = _S.proxy_pool
     if pool is None or not proxy:
         return
     if pool.mark_bad(proxy, reason):
@@ -283,9 +291,9 @@ def _mark_proxy_bad(proxy: str, reason: str) -> None:
 
 
 def _log(i: int, msg: str):
-    elapsed = time.time() - _t0 if _t0 else 0
-    with _results_lock:
-        ok, done, total = _ok, _done, _total
+    elapsed = time.time() - _S.t0 if _S.t0 else 0
+    with _S.results_lock:
+        ok, done, total = _S.ok, _S.done, _S.total
     if total > 1:
         bar = f"[ok {ok}/{total} att {done}]"
     elif total == 1:
@@ -307,8 +315,7 @@ def _pool_enabled(solver_mode: str) -> bool:
 
 def _acquire_turnstile(index: int, turnstile_solver) -> tuple[str, float]:
     """Return (token, minted_at). Uses background pool when enabled."""
-    global _token_pool
-    pool = _token_pool
+    pool = _S.token_pool
     if pool is not None:
         item = pool.acquire(
             timeout=max(120.0, float(os.environ.get("TURNSTILE_TIMEOUT") or 60) * 4)
@@ -318,7 +325,7 @@ def _acquire_turnstile(index: int, turnstile_solver) -> tuple[str, float]:
             f"Turnstile {len(item.token)} chars from pool (age={item.age:.0f}s q={pool.qsize()})",
         )
         return item.token, item.minted_at
-    with _turnstile_lock:
+    with _S.turnstile_lock:
         token = turnstile_solver.solve_turnstile(
             website_url=SIGNUP_URL,
             website_key=C.TURNSTILE_SITEKEY,
@@ -342,10 +349,9 @@ def _build_mail_router(channels: list[str], *, log=None) -> ChannelRouter:
     return build_router(channels, log=log)
 
 
-def _acquire_email(backend: str = "auto", index: int = 0) -> tuple[str, object, str]:
+def _acquire_email(backend: str = "auto", index: int = 0) -> tuple[str, _CodeReceiver, str]:
     """Return (email, receiver, channel). Pool preferred; else router/single."""
-    global _mail_pool, _mail_router
-    pool = _mail_pool
+    pool = _S.mail_pool
     if pool is not None:
         item = pool.acquire(
             timeout=max(120.0, float(os.environ.get("MAIL_CODE_TIMEOUT") or 30) * 4)
@@ -358,7 +364,7 @@ def _acquire_email(backend: str = "auto", index: int = 0) -> tuple[str, object, 
             )
         return item.email, item.receiver, item.channel
 
-    router = _mail_router
+    router = _S.mail_router
     if router is not None:
         box = router.create()
         if index:
@@ -411,7 +417,7 @@ def _check_and_gate_auth(
       usable, remaining_tokens, status, reasons, path (final location), error?
     """
     # Lazy import so --check-quota-off path never pays the cost.
-    from check_accounts import CHAT_ENDPOINT_DENIED, check_one
+    from xconsole_client.account_check import CHAT_ENDPOINT_DENIED, check_one
 
     # Propagation delay after OAuth write (observed: immediate probe → 403,
     # re-check a few seconds later → 200 + full free quota).
@@ -504,7 +510,7 @@ def register_one(
     failed_auth_dir: Optional[str | Path] = None,
     check_quota_timeout: float = 45.0,
 ) -> dict:
-    if _stop.is_set():
+    if _S.stop.is_set():
         return {"error": "stopped", "email": None}
 
     """Run signup (+ optional Build OAuth export). Thread-safe.
@@ -514,7 +520,7 @@ def register_one(
     """
     # Transport flakiness (SSL EOF / timeout) dominates long runs. Retry a few
     # times even without a proxy pool; with a pool, also rotate exit IPs.
-    if _proxy_pool is not None:
+    if _S.proxy_pool is not None:
         max_attempts = proxy_retry_limit()
     else:
         try:
@@ -531,7 +537,7 @@ def register_one(
     }
     try:
         for attempt in range(1, max_attempts + 1):
-            if _stop.is_set():
+            if _S.stop.is_set():
                 last = {"error": "stopped", "email": None}
                 break
             try:
@@ -549,7 +555,7 @@ def register_one(
                 break
 
             if attempt > 1:
-                why = "proxy" if _proxy_pool is not None else "transport"
+                why = "proxy" if _S.proxy_pool is not None else "transport"
                 _log(index, f"retry ({why} {attempt}/{max_attempts})")
                 time.sleep(min(2.0, 0.25 * attempt))
 
@@ -586,23 +592,22 @@ def register_one(
                         "yes",
                         "on",
                     }:
-                        if _proxy_pool is not None:
+                        if _S.proxy_pool is not None:
                             _mark_proxy_bad(proxy, str(err))
                         continue
                 return result
 
             if is_proxy_transport_error(Exception(str(err))):
-                if _proxy_pool is not None:
+                if _S.proxy_pool is not None:
                     _mark_proxy_bad(proxy, str(err))
                 last = result
-                if attempt < max_attempts and (_proxy_pool is None or _proxy_pool.size > 0):
+                if attempt < max_attempts and (_S.proxy_pool is None or _S.proxy_pool.size > 0):
                     continue
             return result
         return last
     finally:
-        with _results_lock:
-            global _done, _ok
-            _done += 1
+        with _S.results_lock:
+            _S.done += 1
 
 
 def _oauth_async_enabled(do_oauth: bool) -> bool:
@@ -814,28 +819,26 @@ def _finish_build_oauth(
 
 
 def _enqueue_oauth_job(job: dict) -> None:
-    global _oauth_inflight
-    q = _oauth_q
+    q = _S.oauth_q
     if q is None:
         raise RuntimeError("OAuth queue not started")
-    with _oauth_inflight_lock:
-        _oauth_inflight += 1
+    with _S.oauth_inflight_lock:
+        _S.oauth_inflight += 1
     q.put(job)
 
 
 def _oauth_worker_loop(record_fn) -> None:
     """Consume SSO jobs; always prefer session-reuse fast path."""
-    global _oauth_inflight
-    q = _oauth_q
+    q = _S.oauth_q
     assert q is not None
     while True:
         try:
             job = q.get(timeout=0.4)
         except queue.Empty:
-            if _stop.is_set():
-                with _oauth_inflight_lock:
+            if _S.stop.is_set():
+                with _S.oauth_inflight_lock:
                     # exit when no more work and stop requested
-                    if q.empty() and _oauth_inflight <= 0:
+                    if q.empty() and _S.oauth_inflight <= 0:
                         return
             continue
         if job is None:
@@ -875,8 +878,8 @@ def _oauth_worker_loop(record_fn) -> None:
                 }
             )
         finally:
-            with _oauth_inflight_lock:
-                _oauth_inflight = max(0, _oauth_inflight - 1)
+            with _S.oauth_inflight_lock:
+                _S.oauth_inflight = max(0, _S.oauth_inflight - 1)
             q.task_done()
 
 
@@ -898,9 +901,8 @@ def _register_one_attempt(
 ) -> dict:
     """Single registration attempt on a fixed proxy."""
     # Turnstile: local browser only (shared solver when pool is on).
-    global _shared_solver
     try:
-        turnstile_solver = _shared_solver or resolve_turnstile_solver(
+        turnstile_solver = _S.shared_solver or resolve_turnstile_solver(
             proxy=proxy,
             debug=oauth_debug,
         )
@@ -1041,11 +1043,11 @@ def _register_one_attempt(
 
         # Token TTL safety: if mint finished long before mail, re-acquire.
         age = time.time() - ts_t0
-        max_age = float(getattr(_token_pool, "max_age", 200.0) if _token_pool else 240.0)
+        max_age = float(getattr(_S.token_pool, "max_age", 200.0) if _S.token_pool else 240.0)
         if age > max_age:
             _log(index, f"Turnstile token age {age:.0f}s; re-acquire")
             turnstile, ts_t0 = _acquire_turnstile(index, turnstile_solver)
-        if _token_pool is None:
+        if _S.token_pool is None:
             _log(
                 index,
                 f"Turnstile {len(turnstile)} chars via {type(turnstile_solver).__name__}",
@@ -1121,7 +1123,7 @@ def _register_one_attempt(
                 session_cookies = dict(session_cookies or {})
                 session_cookies.setdefault("sso", sso)
 
-            if oauth_async and _oauth_q is not None:
+            if oauth_async and _S.oauth_q is not None:
                 _log(index, f"SSO ready → OAuth queue (cookies={len(session_cookies or {})})")
                 _enqueue_oauth_job(
                     {
@@ -1192,8 +1194,8 @@ def _print_run_summary(
     *, check_quota: bool = False, do_oauth: bool = True, title: str = "Done"
 ) -> None:
     """Print per-account lines first, aggregate stats LAST (always at log bottom)."""
-    with _results_lock:
-        rows = list(_results)
+    with _S.results_lock:
+        rows = list(_S.results)
     ok_sso = [r for r in rows if r.get("sso")]
     ok_build = [r for r in rows if r.get("cliproxyapi_auth")]
     denied = [r for r in rows if r.get("chat_endpoint_denied")]
@@ -1204,7 +1206,7 @@ def _print_run_summary(
         r for r in rows if r.get("error") and not r.get("cliproxyapi_auth") and not r.get("sso")
     ]
     stopped = [r for r in rows if str(r.get("error") or "").startswith("stopped")]
-    elapsed = time.time() - _t0 if _t0 else 0.0
+    elapsed = time.time() - _S.t0 if _S.t0 else 0.0
 
     # Successes first (what user cares about), then failures (truncated errors).
     print(f"\n----- 账号明细 ({len(rows)}) -----", flush=True)
@@ -1271,7 +1273,7 @@ def _print_run_summary(
 
     parts = [
         f"{title} in {elapsed:.0f}s",
-        f"ok={len(ok_build) if _summary_ctx.get('do_oauth') else len(ok_sso)}/{_total or '?'}",
+        f"ok={len(ok_build) if _S.summary_ctx.get('do_oauth') else len(ok_sso)}/{_S.total or '?'}",
         f"attempts={len(rows)}",
         f"SSO OK: {len(ok_sso)}",
         f"BUILD OK: {len(ok_build)}",
@@ -1297,7 +1299,6 @@ def _print_run_summary(
 
 
 def main():
-    global _total, _t0
     default_auth = str(default_cliproxyapi_auth_dir())
     p = argparse.ArgumentParser(
         description="grok-build-auth: x.ai register + SSO + Grok Build OAuth (CLIProxyAPI-ready)",
@@ -1383,16 +1384,16 @@ def main():
     args = p.parse_args()
     _install_sigint_handler()
 
-    _total = max(1, int(args.count))
-    _t0 = time.time()
+    _S.total = max(1, int(args.count))
+    _S.t0 = time.time()
     threads = max(1, int(args.threads))
     do_oauth = not args.no_oauth
     if args.no_oauth_async:
         os.environ["OAUTH_ASYNC"] = "0"
     oauth_async = _oauth_async_enabled(do_oauth)
     check_quota = bool(args.check_quota) and do_oauth
-    _summary_ctx["check_quota"] = check_quota
-    _summary_ctx["do_oauth"] = do_oauth
+    _S.summary_ctx["check_quota"] = check_quota
+    _S.summary_ctx["do_oauth"] = do_oauth
     oauth_workers_n = int(args.oauth_workers or 0)
     if oauth_workers_n <= 0:
         oauth_workers_n = max(2, threads) if oauth_async else 0
@@ -1411,7 +1412,7 @@ def main():
     mail_channels = resolve_channels(args.email)
     mail_size, mail_target, mail_minters = suggest_mail_pool_params(threads)
     print(
-        f"grok-build-auth: target {_total} success, reg-threads={threads}, email={args.email}, "
+        f"grok-build-auth: target {_S.total} success, reg-threads={threads}, email={args.email}, "
         f"oauth={'on' if do_oauth else 'off'}"
         f", oauth-async={'on' if oauth_async else 'off'}"
         f"{('/workers=' + str(oauth_workers_n)) if oauth_async else ''}"
@@ -1452,32 +1453,30 @@ def main():
         par = _turnstile_parallel(threads)
         print(f"  turnstile-parallel:   {par} (pool off; auto from -t={threads})")
 
-    global _token_pool, _mail_pool, _mail_router, _shared_solver, _turnstile_lock, _proxy_pool
-
     def _proxy_log(msg: str) -> None:
         print(f"  [proxy-pool] {msg}", flush=True)
 
     try:
-        _proxy_pool = ProxyPool.from_env(log=_proxy_log)
+        _S.proxy_pool = ProxyPool.from_env(log=_proxy_log)
     except Exception as exc:
         print(f"error: proxy pool failed: {exc}", file=sys.stderr)
         sys.exit(2)
-    if _proxy_pool is not None:
-        print(f"  proxy-pool:           {_proxy_pool.summary()}")
+    if _S.proxy_pool is not None:
+        print(f"  proxy-pool:           {_S.proxy_pool.summary()}")
     elif PROXY:
         print("  proxy:                single (HTTPS_PROXY/HTTP_PROXY)")
     print()
 
-    _token_pool = None
-    _mail_pool = None
-    _mail_router = None
-    _shared_solver = None
+    _S.token_pool = None
+    _S.mail_pool = None
+    _S.mail_router = None
+    _S.shared_solver = None
     # Shared turnstile minters stick to one proxy from the active region.
     mint_proxy = PROXY
-    if _proxy_pool is not None:
-        mint_proxy = _proxy_pool.acquire().url
+    if _S.proxy_pool is not None:
+        mint_proxy = _S.proxy_pool.acquire().url
     if use_pool:
-        _shared_solver = resolve_turnstile_solver(
+        _S.shared_solver = resolve_turnstile_solver(
             proxy=mint_proxy,
             debug=args.oauth_debug,
         )
@@ -1485,8 +1484,8 @@ def main():
         def _pool_log(msg: str) -> None:
             print(f"  [ts-pool] {msg}", flush=True)
 
-        _token_pool = TurnstileTokenPool(
-            _shared_solver,
+        _S.token_pool = TurnstileTokenPool(
+            _S.shared_solver,
             website_url=SIGNUP_URL,
             website_key=C.TURNSTILE_SITEKEY,
             size=pool_size,
@@ -1494,24 +1493,24 @@ def main():
             minters=pool_minters,
             log=_pool_log,
         )
-        _token_pool.start()
+        _S.token_pool.start()
     else:
         # Non-pool path: rebind mint semaphore to match registration concurrency.
-        _turnstile_lock = threading.Semaphore(_turnstile_parallel(threads))
+        _S.turnstile_lock = threading.Semaphore(_turnstile_parallel(threads))
 
     def _mail_log(msg: str) -> None:
         print(f"  [mail] {msg}", flush=True)
 
-    _mail_router = _build_mail_router(mail_channels, log=_mail_log)
+    _S.mail_router = _build_mail_router(mail_channels, log=_mail_log)
     if use_mail_pool:
-        _mail_pool = MailboxPool(
-            _mail_router,
+        _S.mail_pool = MailboxPool(
+            _S.mail_router,
             size=mail_size,
             target=mail_target,
             minters=mail_minters,
             log=lambda m: print(f"  [mail-pool] {m}", flush=True),
         )
-        _mail_pool.start()
+        _S.mail_pool.start()
     try:
         accounts_dir = (args.accounts_output_dir or "").strip() or None
         common_kwargs: dict[str, Any] = dict(
@@ -1528,25 +1527,23 @@ def main():
         )
 
         def _record(result: dict) -> None:
-            global _ok
             # Queued handoff is not a terminal row — OAuth worker records the real one.
             if result and result.get("oauth_queued") and not result.get("cliproxyapi_auth"):
                 return
-            with _results_lock:
-                _results.append(result)
+            with _S.results_lock:
+                _S.results.append(result)
                 if _result_is_success(result, do_oauth=do_oauth):
-                    _ok += 1
-                    ok_now = _ok
+                    _S.ok += 1
+                    ok_now = _S.ok
                 else:
-                    ok_now = _ok
-            if ok_now >= _total and not _stop.is_set():
+                    ok_now = _S.ok
+            if ok_now >= _S.total and not _S.stop.is_set():
                 request_stop("target-reached")
 
-        global _oauth_q, _oauth_workers
-        _oauth_q = None
-        _oauth_workers = []
+        _S.oauth_q = None
+        _S.oauth_workers = []
         if oauth_async:
-            _oauth_q = queue.Queue()
+            _S.oauth_q = queue.Queue()
             for wi in range(oauth_workers_n):
                 t = threading.Thread(
                     target=_oauth_worker_loop,
@@ -1555,7 +1552,7 @@ def main():
                     daemon=True,
                 )
                 t.start()
-                _oauth_workers.append(t)
+                _S.oauth_workers.append(t)
             print(
                 f"  oauth-pool:            workers={oauth_workers_n} (session-reuse first)",
                 flush=True,
@@ -1567,10 +1564,10 @@ def main():
 
             def _submit_one() -> None:
                 nonlocal next_index
-                if _stop.is_set():
+                if _S.stop.is_set():
                     return
-                with _results_lock:
-                    if _ok >= _total:
+                with _S.results_lock:
+                    if _S.ok >= _S.total:
                         return
                 idx = next_index
                 next_index += 1
@@ -1580,7 +1577,7 @@ def main():
                 _submit_one()
 
             while futures:
-                if _stop.is_set():
+                if _S.stop.is_set():
                     for f in list(futures):
                         f.cancel()
                     done, _not_done = wait(set(futures), timeout=2.0)
@@ -1598,43 +1595,43 @@ def main():
                         _record(f.result())
                     except Exception as exc:
                         _record({"error": str(exc), "email": None})
-                    with _results_lock:
-                        need_more = _ok < _total and not _stop.is_set()
+                    with _S.results_lock:
+                        need_more = _S.ok < _S.total and not _S.stop.is_set()
                     if need_more:
                         _submit_one()
     finally:
         # Drain OAuth pool: wait for queued SSO→Build, then stop workers.
-        if _oauth_q is not None:
-            if not _stop.is_set() or _ok < _total:
+        if _S.oauth_q is not None:
+            if not _S.stop.is_set() or _S.ok < _S.total:
                 # Normal finish or target-reached: finish in-flight OAuth.
                 deadline = time.time() + 180.0
                 while time.time() < deadline:
-                    with _oauth_inflight_lock:
-                        inflight = _oauth_inflight
-                        empty = _oauth_q.empty()
+                    with _S.oauth_inflight_lock:
+                        inflight = _S.oauth_inflight
+                        empty = _S.oauth_q.empty()
                     if empty and inflight <= 0:
                         break
                     time.sleep(0.2)
-            for _ in _oauth_workers:
-                _oauth_q.put(None)
-            for t in _oauth_workers:
+            for _ in _S.oauth_workers:
+                _S.oauth_q.put(None)
+            for t in _S.oauth_workers:
                 t.join(timeout=30.0)
-            _oauth_workers = []
-            _oauth_q = None
-        if _mail_pool is not None:
-            _mail_pool.stop(wait=2.0)
-            _mail_pool = None
-        _mail_router = None
-        if _token_pool is not None:
-            _token_pool.stop(wait=2.0)
-            _token_pool = None
+            _S.oauth_workers = []
+            _S.oauth_q = None
+        if _S.mail_pool is not None:
+            _S.mail_pool.stop(wait=2.0)
+            _S.mail_pool = None
+        _S.mail_router = None
+        if _S.token_pool is not None:
+            _S.token_pool.stop(wait=2.0)
+            _S.token_pool = None
 
     # summary (also printed on Ctrl+C via request_stop / forced exit)
     title = "Done"
-    if _stop.is_set():
+    if _S.stop.is_set():
         # target-reached is success stop; Ctrl+C / other reasons stay Stopped
         # request_stop sets event only; distinguish via ok count
-        title = "Done" if _ok >= _total else "Stopped"
+        title = "Done" if _S.ok >= _S.total else "Stopped"
     _print_run_summary(check_quota=check_quota, do_oauth=do_oauth, title=title)
 
 

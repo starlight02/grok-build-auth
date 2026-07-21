@@ -113,20 +113,15 @@ class TurnstileSolver(Protocol):
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
-    raw = (os.environ.get(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on", "y"}
+    from .envutil import env_truthy
+
+    return env_truthy(name, default)
 
 
 def _proxy_from_env(explicit: str = "") -> str:
-    return (
-        (explicit or "").strip()
-        or (os.environ.get("HTTPS_PROXY") or "").strip()
-        or (os.environ.get("HTTP_PROXY") or "").strip()
-        or (os.environ.get("https_proxy") or "").strip()
-        or (os.environ.get("http_proxy") or "").strip()
-    )
+    from .envutil import proxy_from_env
+
+    return proxy_from_env(explicit)
 
 
 def _playwright_proxy(proxy: str) -> Optional[dict[str, str]]:

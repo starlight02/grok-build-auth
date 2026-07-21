@@ -3,7 +3,8 @@
     "run.py",
     "tools",
     "contrib/alias_mail",
-    "xconsole_client"
+    "xconsole_client",
+    "tests"
   ],
   "exclude": [
     "**/__pycache__",

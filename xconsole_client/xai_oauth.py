@@ -77,14 +77,14 @@ def code_challenge_s256(code_verifier: str) -> str:
 
 
 def parse_jwt_payload(jwt_token: str) -> Optional[Dict[str, Any]]:
-    try:
-        parts = jwt_token.split(".")
-        if len(parts) < 2:
-            return None
-        payload = parts[1] + "=" * (-len(parts[1]) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload))
-    except Exception:
-        return None
+    """Decode a JWT payload segment (no signature verification).
+
+    Canonical implementation lives in :mod:`xconsole_client.sso`; re-exported
+    here for callers that already import OAuth helpers.
+    """
+    from .sso import parse_jwt_payload as _parse
+
+    return _parse(jwt_token)
 
 
 def default_output_dir() -> Path:

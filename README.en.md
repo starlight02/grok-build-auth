@@ -13,7 +13,7 @@ Default path: signup over pure HTTP (`curl_cffi`). Turnstile **token pool on by 
 **Pipelined by default:** `-t` only covers **signup through SSO**. After SSO is written, the registration thread is freed; a dedicated **OAuth worker pool** (`--oauth-workers`, default `max(-t,2)`) prefers the **session-reuse fast path**, then falls back to Device Flow. `-n` counts **BUILD exports**.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![Use](https://img.shields.io/badge/use-research%20%2F%20authorized%20only-red)](#legal-boundary)
 
 ---
@@ -125,7 +125,7 @@ flowchart TB
 
 This is **not** a zero-config product. At minimum you need:
 
-- Python 3.9+
+- Python 3.11+
 - Turnstile: local browser backend (default Drission + headed Chrome; optional Camoufox / Playwright)
 - Mailbox: default `-e auto` — **all configured** channels (tempmail always; yyds/cloudflare when credentials exist); or force one with `-e tempmail|yyds|cloudflare`
 - Optional HTTP(S) proxy
@@ -144,9 +144,11 @@ git clone https://github.com/<you>/grok-build-auth.git
 cd grok-build-auth
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
+# or runtime-only:
+# pip install -r requirements.txt
 # optional Camoufox backend:
-# pip install camoufox && camoufox fetch
+# pip install -e ".[camoufox]" && camoufox fetch
 cp .env.example .env
 # put only your own secrets in .env — never commit it
 ```

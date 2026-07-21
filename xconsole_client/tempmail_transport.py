@@ -27,13 +27,15 @@ Usage:
 from __future__ import annotations
 
 import os
-import re
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
+
+from xconsole_client.codes import extract_xai_code
+from xconsole_client.envutil import proxy_from_env
 
 
 BASE_URL = "https://api.tempmail.lol"
@@ -110,13 +112,7 @@ class TempmailInbox:
     _created: bool = field(default=False, init=False)
 
     def _proxies(self) -> Optional[dict]:
-        p = (
-            (self.proxy or "").strip()
-            or (os.environ.get("HTTPS_PROXY") or "").strip()
-            or (os.environ.get("HTTP_PROXY") or "").strip()
-            or (os.environ.get("https_proxy") or "").strip()
-            or (os.environ.get("http_proxy") or "").strip()
-        )
+        p = proxy_from_env(self.proxy)
         if not p:
             return None
         return {"http": p, "https": p}
@@ -299,7 +295,7 @@ class TempmailInbox:
                         email.get("from", "") or "",
                     ]
                 )
-                code = _extract_code(text)
+                code = extract_xai_code(text)
                 if code:
                     if self.debug:
                         print(f"  [Tempmail] code found: {code} (from: {email.get('from')})")
@@ -318,31 +314,3 @@ class TempmailInbox:
                     f"{remaining:.0f}s left)"
                 )
             time.sleep(min(self.interval, remaining))
-
-
-# --------------------------------------------------------------------------- #
-# Code extractor — same logic as mailbox.py, kept standalone for this module.
-# --------------------------------------------------------------------------- #
-_CODE_PATTERNS = (
-    # x.ai current format: "LSQ-OPU" (3 alphanum + dash + 3 alphanum = 7 chars)
-    re.compile(r"(?<![A-Z0-9])([A-Z0-9]{3}-[A-Z0-9]{3})(?![A-Z0-9])"),
-    # x.ai legacy format: 6 uppercase alphanumeric, no dash (e.g. "XAI0X1")
-    re.compile(r"(?<![A-Z0-9])([A-Z0-9]{6})(?![A-Z0-9])"),
-    # keyword-anchored fallbacks
-    re.compile(r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{3}-[A-Z0-9]{3})"),
-    re.compile(r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{6})"),
-)
-
-
-def _extract_code(text: str) -> Optional[str]:
-    if not text:
-        return None
-    for pat in _CODE_PATTERNS:
-        m = pat.search(text)
-        if m:
-            raw = m.group(1) if m.groups() else m.group(0)
-            # x.ai codes are uppercase alphanumeric (+ dash), not pure digits
-            if raw.replace("-", "").isdigit():
-                continue
-            return raw.upper()
-    return None

@@ -97,6 +97,16 @@ class _UrllibTransport:
         set_cookies = resp.headers.get_all("set-cookie") or []
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
         if self._debug:
+            from .logutil import get_logger
+
+            get_logger("client").debug(
+                "<- %s %s %s (%s bytes, %s set-cookie, transport=urllib)",
+                status,
+                method,
+                url,
+                len(raw),
+                len(set_cookies),
+            )
             print(
                 f"  <- {status} {method} {url}  ({len(raw)} bytes, {len(set_cookies)} set-cookie, transport=urllib)"
             )

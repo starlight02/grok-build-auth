@@ -6,12 +6,20 @@ set -euo pipefail
 commit_msg_file="$1"
 # Read first line only (Git commit message format)
 commit_msg=$(head -n 1 "$commit_msg_file")
+# Non-empty body lines after the subject (project: single-line commits only)
+body_lines=$(tail -n +2 "$commit_msg_file" | tr -d '[:space:]')
 
 # Skip merge commits
 if echo "$commit_msg" | grep -qE '^Merge (branch|pull request|remote-tracking branch)'; then
     exit 0
 fi
 
+# Project convention: single-line English subject only (no body)
+if [ -n "$body_lines" ]; then
+    echo "ERROR: Commit message must be a single line (no body)" >&2
+    echo "Your message has a body after the subject line." >&2
+    exit 1
+fi
 # Check Conventional Commits format
 if ! echo "$commit_msg" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .+$'; then
     echo "ERROR: Commit message does not follow Conventional Commits format" >&2

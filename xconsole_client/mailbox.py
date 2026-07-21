@@ -54,143 +54,31 @@ Running tests::
 
 from __future__ import annotations
 
-import os
-import re
-import sys
 import time
 from typing import Any, Optional
 
 
 # --------------------------------------------------------------------------- #
-# alias_mail import shim
+# alias_mail import
 # --------------------------------------------------------------------------- #
-# The canonical location of the alias_mail module is contrib/alias_mail/.
-# We inject that directory into sys.path the first time this file is imported
-# so callers don't have to think about it.
-from .paths import alias_mail_dir as _alias_mail_dir_fn
-
-_ALIAS_MAIL_DIR = str(_alias_mail_dir_fn())
-if _ALIAS_MAIL_DIR not in sys.path and os.path.isdir(_ALIAS_MAIL_DIR):
-    sys.path.insert(0, _ALIAS_MAIL_DIR)
-
-
 def _load_alias_mail() -> Any:
-    """Return the imported ``alias_mail`` module.
+    """Return the ``contrib.alias_mail`` package.
 
     Raises ``RuntimeError`` (NOT ``SystemExit``) with a clear remediation
-    message if the module is not discoverable.  Callers (e.g. ``__main__.py``
-    of xconsole_client) catch this and fall back to manual code input.
+    message if the module is not discoverable.
     """
     try:
-        import alias_mail  # type: ignore  # noqa: WPS433
+        from contrib import alias_mail as mod
 
-        return alias_mail
+        return mod
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError("alias_mail backend not available; see contrib/alias_mail") from exc
 
 
 # --------------------------------------------------------------------------- #
-# extract_xai_code
+# extract_xai_code — canonical implementation in codes.py
 # --------------------------------------------------------------------------- #
-# The captured x.ai samples are 6-character uppercase alphanumeric.  The default
-# alias_mail.extract_code wants pure digits and would silently miss them.
-#
-# Order of patterns tried (return first match):
-#   1. (?i)\b[A-Z0-9]{6}\b                          <- generic 6-char alnum
-#   2. (?i)\b[A-Z0-9]{8}\b                          <- generic 8-char (some flows)
-#   3. (?i)(?:code|otp|验证码|verification|verify|code is|your code)[^A-Za-z0-9]{0,40}([A-Z0-9]{4,8})
-#                                                   <- keyword-anchored 4-8 chars
-#
-# Pure-digit matches (e.g. "123456") are explicitly rejected per the spec —
-# the captured sample is uppercase alphanumeric, not all-digits, and
-# alias_mail.extract_code already covers the pure-digit case if anyone
-# genuinely needs it.
-#
-# Fallback: if none of the \b-based patterns match (e.g. the email body is
-# a long unspaced alnum string like "AB12CD34EF", which has no internal
-# word boundary), we use a length-based run detector that returns:
-#   - the run itself if it is exactly 6 or 8 chars
-#   - the first 8 chars of a run longer than 8
-# This is necessary to pass the spec's "AB12CD34EF" -> "AB12CD34" test.
-_XAI_CODE_PATTERNS = (
-    # x.ai current format: "LSQ-OPU" (3 alphanum + dash + 3 alphanum = 7 chars)
-    re.compile(r"(?<![A-Z0-9])([A-Z0-9]{3}-[A-Z0-9]{3})(?![A-Z0-9])"),
-    # x.ai legacy format: 6-char uppercase alphanumeric, no dash (e.g. "XAI0X1")
-    re.compile(r"(?i)\b[A-Z0-9]{6}\b"),
-    re.compile(r"(?i)\b[A-Z0-9]{8}\b"),
-    re.compile(
-        r"(?i)(?:code|otp|验证码|verification|verify|code is|your code)"
-        r"[^A-Za-z0-9]{0,40}([A-Z0-9]{4,8})"
-    ),
-)
-
-# Token shape constants (kept here for documentation; not enforced by
-# the regexes — the keyword-anchored fallback accepts 4..8 chars).
-XAI_CODE_LENGTH_PRIMARY = 6
-XAI_CODE_LENGTH_FALLBACK = 8
-
-# A separate pattern for length-based fallback.  We compile once.
-_XAI_RUN_RE = re.compile(r"[A-Za-z0-9]+")
-
-
-def _is_pure_digits(s: str) -> bool:
-    return bool(s) and s.isdigit()
-
-
-def extract_xai_code(text: str) -> Optional[str]:
-    """Return the first plausible x.ai email verification code in *text*.
-
-    The captured x.ai sample is a six-character uppercase alphanumeric code
-    (e.g. ``"XAI0X1"``).  ``alias_mail.extract_code`` will NOT match that
-    (it only looks for pure-digit codes or digit codes anchored by
-    ``code/otp/...``).  This helper extends the rule set to the captured
-    alphanumeric shape.
-
-    Strategy:
-
-      1. Try the three ``\\b``-anchored patterns from the spec, in order.
-         Pure-digit captures are rejected (the captured x.ai sample is
-         uppercase alphanumeric, not pure digits).
-      2. If none of those match, fall back to a length-based run detector
-         that handles long unspaced alnum strings like ``"AB12CD34EF"``
-         (no internal word boundary, so ``\\b`` patterns miss them).
-
-    Returns the matched string (uppercased) or ``None`` if nothing fits.
-
-    >>> extract_xai_code("Your code is XAI0X1") == "XAI0X1"
-    True
-    >>> extract_xai_code("123456") is None
-    True
-    """
-    if not text:
-        return None
-
-    # Phase 1: spec patterns (word-boundary based).
-    for pat in _XAI_CODE_PATTERNS:
-        m = pat.search(text)
-        if not m:
-            continue
-        # Keyword-anchored pattern has the code in group 1; the bare
-        # 6/8-char patterns have it in group 0.
-        raw = m.group(1) if m.groups() else m.group(0)
-        if _is_pure_digits(raw):
-            continue
-        return raw.upper()
-
-    # Phase 2: length-based fallback for long alnum runs.
-    # The spec test "AB12CD34EF" -> "AB12CD34" requires this.
-    for m in _XAI_RUN_RE.finditer(text):
-        run = m.group(0)
-        n = len(run)
-        if _is_pure_digits(run):
-            continue
-        if n == XAI_CODE_LENGTH_PRIMARY:
-            return run.upper()
-        if n == XAI_CODE_LENGTH_FALLBACK:
-            return run.upper()
-        if n > XAI_CODE_LENGTH_FALLBACK:
-            return run[:XAI_CODE_LENGTH_FALLBACK].upper()
-    return None
+from .codes import extract_xai_code  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
