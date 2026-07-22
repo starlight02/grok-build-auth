@@ -56,6 +56,17 @@ pre-commit:
           exit 1
         fi
 
+    secret-check:
+      run: |
+        if [ -x .venv/bin/python ]; then
+          .venv/bin/python scripts/secret_check.py {staged_files}
+        elif command -v python3 >/dev/null 2>&1; then
+          python3 scripts/secret_check.py {staged_files}
+        else
+          echo "❌ python3 not found on PATH" >&2
+          exit 1
+        fi
+
 commit-msg:
   commands:
     conventional-commits:
