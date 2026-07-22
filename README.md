@@ -6,10 +6,12 @@
 `注册 → SSO → OAuth PKCE（Grok Build / CLI scope）→ 导出本地 auth JSON`  
 整条链路，便于协议分析、互操作性研究与本地集成测试。
 
-默认：注册/OAuth 走纯 HTTP（`curl_cffi`）；Turnstile **后台 token 池默认开**；邮箱 **多渠道 registry + 后台邮箱池默认开**（`-e auto` 用上所有已配置渠道：优先高吞吐、限速溢出补量；单渠道自动 solo）。OAuth：协议 session-reuse，失败回退 Device Flow。
+默认：注册走纯 HTTP（`curl_cffi`）；Turnstile **后台 token 池默认开**；邮箱 **多渠道 registry + 后台邮箱池默认开**（`-e auto` 用上所有已配置渠道：优先高吞吐、限速溢出补量；单渠道自动 solo）。
+
+**流水线拆分（默认）**：`-t` 只管**注册到 SSO**；SSO 落盘后立刻释放注册线程，由独立 **OAuth worker 池**（`--oauth-workers`，默认 `max(-t,2)`）优先跑 **session-reuse 快路径**，失败再回退 Device Flow。目标成功数 `-n` 按 **BUILD 导出** 计数。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![Use](https://img.shields.io/badge/use-research%20%2F%20authorized%20only-red)](#法律边界)
 
 ---
@@ -46,17 +48,19 @@
 |---|---|
 | **注册** | `accounts.x.ai` 邮箱验证码（gRPC-web）+ Turnstile + Next.js Server Action 建号 |
 | **SSO** | 从建号响应 / set-cookie 链提取 session JWT，供 OAuth 复用 |
-| **OAuth** | 快路径：`oauth_protocol` SSO session-reuse（PKCE + CookieSetter + consent）；失败回退 `sso2auth` Device Flow；全程纯 HTTP |
+| **OAuth** | 独立 worker 池；优先 `oauth_protocol` SSO **session-reuse**（PKCE + CookieSetter + consent，可重试）；失败再回退 `sso2auth` Device Flow；纯 HTTP |
 | **导出** | 写出与 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 兼容的本地 `type=xai` auth 文件（Grok Build 通道） |
 
 值得看的点：
 
 - **协议优先**：注册 / OAuth 默认纯 HTTP（`curl_cffi` 指纹会话）
-- **Turnstile 池**：后台 mint、注册线程只消费；**默认开启**；按需产 token（够用即停）
-- **邮箱池 + 多渠道**：`mail_channels` 可插拔 registry；后台预建 inbox；**prefer + overflow**（tempmail 按 RPM 持续产，yyds/CF 补量，不是一限速就全切）
-- **随 `-t` 自动调参**：token/mail 池深度与 minter 随注册并发缩放（也可 env 固定）
-- **OAuth 双路径**：快路径 SSO session-reuse（`oauth_protocol`）；回退 Device Flow（`sso2auth`）
-- **精简落盘**：默认写 `sso_output/` + `cliproxyapi_auth/`（CPA 可加载）
+- **注册 / OAuth 解耦**：`-t` = 注册并发；`--oauth-workers` = Build 并发；SSO 后不堵注册槽位
+- **OAuth 快路径优先**：session-reuse 带传输重试（`OAUTH_TRANSPORT_RETRIES`）；默认仍允许 Device 兜底（`OAUTH_ALLOW_DEVICE=1`）
+- **Turnstile 池 + 尽早 force-render**：后台 mint；进页后尽早刷 CF（默认跳过邮箱路径按钮，`TURNSTILE_CLICK_EMAIL=0`）
+- **邮箱池 + 多渠道**：`mail_channels` registry；**prefer + overflow**
+- **随 `-t` 自动调参**：token/mail 池深度与 minter 随注册并发缩放
+- **传输毛刺重试**：SSL EOF / timeout 归入可重试错误（无代理池也有 `TRANSPORT_RETRY`）
+- **精简落盘**：默认写 `sso_output/` + `cliproxyapi_auth/`
 
 ---
 
@@ -65,39 +69,54 @@
 ```mermaid
 flowchart TB
     subgraph entry [run.py]
-      A["-n / -t / -e auto|渠道"]
+      A["-n 成功目标 / -t 注册并发 / --oauth-workers"]
     end
 
     subgraph pools [后台池 默认 on]
-      TP[TurnstileTokenPool<br/>turnstile_pool]
-      MP[MailboxPool<br/>mailbox_pool]
-      R[ChannelRouter<br/>mail_channels]
+      TP[TurnstileTokenPool]
+      MP[MailboxPool]
+      R[ChannelRouter]
       MP --> R
       R -->|prefer| TM[tempmail]
+      R -->|overflow| TS[tempmailspot]
+      R -->|overflow| MD[maildrop]
       R -->|overflow| YY[yyds]
       R -->|overflow| CF[cloudflare]
-      R -.->|register_channel| X[未来渠道…]
     end
 
-    subgraph browser [Turnstile 浏览器后端]
-      S[drission / camoufox / browser]
+    subgraph reg [注册线程池 -t]
+      B[signup client.py]
+      C[SSO sso_output]
+    end
+
+    subgraph oauthp [OAuth worker 池 默认 on]
+      Q[SSO 任务队列]
+      D{session-reuse<br/>oauth_protocol}
+      F[sso2auth Device Flow]
+      E[token 交换]
+    end
+
+    subgraph browser [Turnstile]
+      S[drission early force-render]
     end
 
     A --> TP
     A --> MP
     TP -->|mint| S
-    A --> B[注册 client.py]
+    A --> B
     TP -->|token| B
-    MP -->|Mailbox email+receiver+channel| B
-    B --> C[SSO sso_output]
-    C --> D{OAuth 快路径<br/>oauth_protocol}
-    D -->|OK| E[token 交换]
-    D -->|失败| F[sso2auth Device Flow]
+    MP -->|inbox| B
+    B --> C
+    C -->|释放注册线程| Q
+    Q --> D
+    D -->|OK| E
+    D -->|失败且允许| F
     F --> E
     E --> G[cliproxyapi_auth/*.json]
 ```
 
-导出 CPA auth 需要 OAuth 拿到的 `access_token` / `refresh_token`（协议路径或 Device Flow）。
+`-n` 默认按 **BUILD 导出成功**（`cliproxyapi_auth`）计数；`--no-oauth` 时按 SSO 计数。  
+导出 CPA auth 需要 OAuth 的 `access_token` / `refresh_token`（快路径或 Device Flow）。
 
 ---
 
@@ -105,9 +124,9 @@ flowchart TB
 
 这不是「零配置即用」的产品。至少需要：
 
-- Python 3.9+
+- Python 3.11+
 - Turnstile：本机浏览器后端（默认 Drission + Chrome 有头；可选 Camoufox / Playwright）
-- 邮箱：默认 `-e auto` —— 启用**所有已配置**渠道（tempmail 始终可用；yyds / cloudflare 有凭证才进池）；也可 `-e tempmail|yyds|cloudflare` 强制单渠道
+- 邮箱：默认 `-e auto` —— 启用**所有已配置**渠道（tempmail / tempmailspot / maildrop 始终可用；yyds / cloudflare 有凭证才进池）；也可 `-e tempmail|tempmailspot|maildrop|yyds|cloudflare` 强制单渠道
 - （可选）HTTP(S) 代理
 - （可选）本地已安装的 CLIProxyAPI，用于加载导出的 auth 目录
 
@@ -129,12 +148,13 @@ python -m venv .venv
 # macOS / Linux
 # source .venv/bin/activate
 
-pip install -r requirements.txt
+pip install -e ".[dev]"
+# 或仅运行依赖：
+# pip install -r requirements.txt
 # 可选：Camoufox 后端还要拉浏览器二进制
-# pip install camoufox && camoufox fetch
+# pip install -e ".[camoufox]" && camoufox fetch
 cp .env.example .env
 # 可选编辑 .env；通常只需代理，无需 TEMPMAIL key
-```
 
 ### 配置
 
@@ -157,11 +177,17 @@ cp .env.example .env
 | `TURNSTILE_BROWSER_REUSE` | 否 | `1` = 热复用浏览器（默认 1；drission 暖页复用） |
 | `TEMPMAIL_API_KEY` | 否 | Tempmail.lol Plus/Ultra（**免费层无需 key**） |
 | `TEMPMAIL_FREE_CREATE_INTERVAL` | 否 | 无 key 时 create 最小间隔秒（默认 **3 ≈ 20/min**） |
+| `TEMPMAILSPOT_API_BASE` | 否 | 默认 `https://tempmailspot.com` |
+| `TEMPMAILSPOT_CREATE_INTERVAL` | 否 | create 最小间隔秒（默认 **6 ≈ 10/min**） |
+| `MAILDROP_API_URL` | 否 | 默认 `https://api.maildrop.cc/graphql` |
+| `MAILDROP_DOMAIN` | 否 | 默认 `maildrop.cc` |
+| `MAILDROP_USE_ALIAS` | 否 | `1` = 用 altinbox 别名注册，仍轮询原 mailbox |
+| `MAILDROP_POLL_INTERVAL` | 否 | 轮询间隔秒（默认 5） |
 | `YYDS_API_KEY` / `YYDS_JWT` | 否 | YYDS 邮箱（二选一；有则 `-e auto` 自动纳入） |
 | `YYDS_API_BASE` | 否 | 默认 `https://maliapi.215.im/v1` |
 | `YYDS_DOMAINS` | 否 | 域名白名单（空 = **全部已验证域名**，域名侧负载均衡） |
-| `MAIL_BACKENDS` | 否 | 显式渠道列表，覆盖 `-e auto`（如 `tempmail,yyds`） |
-| `MAIL_CHANNEL_WEIGHTS` | 否 | 优先级，如 `tempmail:100,yyds:40,cloudflare:60` |
+| `MAIL_BACKENDS` | 否 | 显式渠道列表，覆盖 `-e auto`（如 `tempmail,tempmailspot,maildrop`） |
+| `MAIL_CHANNEL_WEIGHTS` | 否 | 优先级，如 `tempmail:100,tempmailspot:70,maildrop:65` |
 | `MAIL_CHANNEL_CAPACITY` | 否 | 每渠道并发 create 容量，满则溢出 |
 | `MAIL_POOL` | 否 | 后台邮箱预创建池（**默认开**；`0` 关） |
 | `MAIL_POOL_SIZE` / `_TARGET` / `_MINTERS` | 否 | 同 turnstile 池语义（默认随 `-t`） |
@@ -173,6 +199,15 @@ cp .env.example .env
 | `CLOUDFLARE_D1_DB_ID` | 同上 | D1 库 ID |
 | `ALIAS_MAIL_DOMAINS` | 同上 | 你控制的邮箱域名（逗号分隔） |
 | `CLIPROXYAPI_AUTH_DIR` | 否 | 默认 `./cliproxyapi_auth` |
+| `OAUTH_ASYNC` | 否 | **默认 `1`**：SSO 后交 OAuth 池；`0` / `--no-oauth-async` = 同线程串行 Build |
+| `OAUTH_WORKERS` | 否 | OAuth 池线程数（也可用 `--oauth-workers`；默认 `max(-t, 2)`） |
+| `OAUTH_TRANSPORT_RETRIES` | 否 | session-reuse 快路径传输重试次数（默认 **3**） |
+| `OAUTH_ALLOW_DEVICE` | 否 | 快路径失败后是否 Device Flow（默认 **`1`**；`0` = 只快路径） |
+| `TRANSPORT_RETRY` | 否 | **无代理池**时注册侧传输重试（默认 3；含 SSL EOF / timeout） |
+| `VISIT_HOME` | 否 | `1` = 注册前 visit console home（**默认 0 跳过**，少 1 RTT） |
+| `TURNSTILE_CLICK_EMAIL` | 否 | `1` = mint 前点「邮箱注册」（默认 **0**，尽早 force-render CF） |
+| `TURNSTILE_NATIVE_POLL` | 否 | force-render 失败后 native 补刀秒数（默认 4；`0` 关） |
+| `TURNSTILE_FORCE_POLL` | 否 | force-render 后轮询上限秒（默认 12） |
 | `HTTPS_PROXY` / `HTTP_PROXY` | 否 | 单代理（无池文件时） |
 | `PROXY_POOL_FILE` | 否 | 代理池文件，**每行一个 URL**；启动时探测出口地区 |
 | `PROXY_POOL` | 否 | 内联小列表（逗号/换行）；大池用 FILE |
@@ -180,31 +215,37 @@ cp .env.example .env
 | `PROXY_POOL_SCOPE` | 否 | `same_region`（**默认**）/ `all` |
 | `PROXY_GEO_WORKERS` | 否 | 并发探测数（默认 16） |
 | `PROXY_GEO_CACHE` | 否 | 探测缓存（默认 `./.proxy_geo_cache.json`） |
+| `PROXY_RETRY` | 否 | 有代理池时单号传输失败换代理重试（默认 8；已覆盖 SSL EOF 等） |
 
 **永远不要**把 `.env`、token 目录提交进 Git。详见 [`SECURITY.md`](SECURITY.md)。
 
 ### 运行（研究 / 自有账号场景）
 
 ```bash
-# 零配置批量：默认 -t 4 + token 池 + mail 池 + -e auto（已配置渠道 prefer+overflow）
+# 零配置批量：-t 4 注册 + OAuth 池(默认 max(-t,2)) + token/mail 池 + -e auto
 python run.py -n 20
 
 # 单号冒烟
 python run.py -n 1
 
-# 改并发（token/mail 池参数自动跟着变；-t 8 → size=8 minters=2）
+# 注册并发与 OAuth 池分开调（推荐：OAuth workers ≥ 注册 -t）
+python run.py -n 20 -t 4 --oauth-workers 6
+
+# 改注册并发（token/mail 池随 -t；OAuth workers 默认 max(-t,2)）
 python run.py -n 20 -t 8
 
 # 强制单渠道（solo：可阻塞 wait/retry，无多渠溢出）
 python run.py -n 10 -e yyds
 python run.py -n 10 -e tempmail
+python run.py -n 10 -e tempmailspot
+python run.py -n 10 -e maildrop
 python run.py -n 1 -e cloudflare
 
 # 显式多渠道列表（覆盖 auto 检测）
-MAIL_BACKENDS=tempmail,yyds python run.py -n 20 -t 8
+MAIL_BACKENDS=tempmail,tempmailspot,maildrop,yyds python run.py -n 20 -t 8
 
-# 调权重 / 容量（tempmail 优先；满 slot 才溢出 yyds）
-MAIL_CHANNEL_WEIGHTS=tempmail:100,yyds:40 MAIL_CHANNEL_CAPACITY=tempmail:3,yyds:2 \
+# 调权重 / 容量（tempmail 优先；满 slot 才溢出）
+MAIL_CHANNEL_WEIGHTS=tempmail:100,tempmailspot:70,maildrop:65 MAIL_CHANNEL_CAPACITY=tempmail:3,maildrop:3 \
   python run.py -n 20 -t 8
 
 # 关邮箱池（注册时现场 create；路由仍可用）
@@ -228,9 +269,18 @@ PROXY_POOL_FILE=./proxies.txt PROXY_REGION=us python run.py -n 10 -t 4
 touch /tmp/grok-turnstile.pause   # 暂停
 rm    /tmp/grok-turnstile.pause   # 恢复
 
-# 仅 SSO / Device Flow / 台账 / 调试
+# 仅 SSO（不跑 Build）
 python run.py -n 1 --no-oauth
+
+# 关闭 OAuth 异步池：SSO 后同线程串行 Build（旧行为）
+python run.py -n 4 -t 2 --no-oauth-async
+
+# 强制全程 Device Flow（跳过 session-reuse；更慢）
 python run.py -n 1 --no-oauth-protocol
+
+# 只允许快路径、失败不 Device（便于排查 session-reuse）
+OAUTH_ALLOW_DEVICE=0 python run.py -n 5 -t 2 --oauth-workers 4
+
 python run.py -n 1 --cliproxyapi-auth-dir /path/to/CLIProxyAPI/data/auth
 python run.py -n 1 --accounts-output-dir ./accounts_output
 python run.py -n 1 --oauth-debug
@@ -254,17 +304,17 @@ python run.py -n 5 -t 4 --check-quota --failed-auth-dir ./cliproxyapi_auth_faile
 
 ```bash
 # 检查 cliproxyapi_auth 可用性 / Build 额度
-python check_accounts.py cliproxyapi_auth/
+python tools/check_accounts.py cliproxyapi_auth/
 
 # SSO → CPA（Device Flow）
-python retry_oauth_from_sso.py
-# SSO2AUTH_WORKERS=4 python retry_oauth_from_sso.py
+python tools/retry_oauth_from_sso.py
+# SSO2AUTH_WORKERS=4 python tools/retry_oauth_from_sso.py
 
 # 交互式浏览器 OAuth
-python xai_oauth_login.py
+python tools/xai_oauth_login.py
 
 # oauth_output → CPA auth
-python xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyapi_auth
+python tools/xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyapi_auth
 ```
 
 ### 导出文件形态（本地文件，非官方密钥）
@@ -324,25 +374,25 @@ python xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyapi_auth
 - 之后同页 `force-render` + CDP 点击，暖 mint 约 **2.3–2.5s/枚**（冷启动首枚约 10–16s）
 - 有头默认 **最小化 + 离屏**，尽量不抢系统焦点
 
-### 与 Tempmail free 对齐
+### 与免费邮箱层对齐
 
-- CLI 默认 **`-t 4`**：贴近 free 层稳态吞吐
-- 无 `TEMPMAIL_API_KEY` 时，`create` 进程级节流默认 **3s/次（≈20/min）**，减轻 429
-- 有 Plus/Ultra key 时跳过 free create 节流；可自行提高 `-t`
-- **多渠道时**：free pacing / 429 只让 tempmail「这一拍」不可用，yyds 等立即补量；slot 恢复后仍优先 tempmail（不是全切）
+- CLI 默认 **`-t 4`**：贴近 tempmail free 稳态吞吐
+- 无 `TEMPMAIL_API_KEY` 时，tempmail `create` 进程级节流默认 **3s/次（≈20/min）**，减轻 429
+- 有 Plus/Ultra key 时跳过 tempmail free create 节流；可自行提高 `-t`
+- **多渠道时**：任一渠道的 free pacing / 429 只挡「这一拍」；`tempmailspot` / `maildrop` / `yyds` / CF 等 ready 渠道立刻补量；slot 恢复后仍优先高 weight（不是全切）
 
 ### 启动日志怎么读
 
 ```text
 grok-build-auth: 20 accounts, 4 threads, email=auto, ... pool=on, mail-pool=on
-  mail-channels:        tempmail,yyds (prefer+overflow; weights via MAIL_CHANNEL_WEIGHTS)
+  mail-channels:        tempmail,tempmailspot,maildrop (prefer+overflow; weights via MAIL_CHANNEL_WEIGHTS)
   turnstile-pool:       size=4 target=2 minters=1 max_age=200s (auto from -t=4)
   mail-pool:            size=4 target=2 minters=1 max_age=600s (auto from -t=4)
   [ts-pool] pool +1 len=837 q=1/4 want=2 wait=0
   [mail-pool] mail pool +1 [tempmail] xai…@… q=2/4
   [mail] mail channel tempmail rate: … (next_slot≈3.0s; overflow/retry)
-  [mail] mail create via yyds: xai…@…
-  [3/20] [#2] email [yyds]: xai…@…
+  [mail] mail create via tempmailspot: …@…
+  [3/20] [#2] email [tempmailspot]: …@…
   [3/20] [#2] Turnstile 837 chars from pool (age=6s q=1)
 ```
 
@@ -356,9 +406,11 @@ grok-build-auth: 20 accounts, 4 threads, email=auto, ... pool=on, mail-pool=on
 
 | 渠道 | 默认 weight | 何时 available | 说明 |
 |---|---|---|---|
-| **tempmail** | 100 | 始终（free 或 `TEMPMAIL_API_KEY`） | 通常最高 create RPM；优先 |
-| **yyds** | 40 | `YYDS_API_KEY` 或 `YYDS_JWT` | 溢出补量；域名可全量 LB |
+| **tempmail** | 100 | 始终（free 或 `TEMPMAIL_API_KEY`） | Tempmail.lol；通常最高 create RPM；优先 |
+| **tempmailspot** | 70 | 始终（无需 key） | 站点真实接口 `POST /api/mailbox/new|fetch`（公开 v1 文档不完整）；≈10 create/min |
+| **maildrop** | 65 | 始终（无需 key） | [Maildrop](https://docs.maildrop.cc) GraphQL；本地生成 `*@maildrop.cc`；50 req/10s；陌生 MTA 可能 greylist |
 | **cloudflare** | 60 | `CLOUDFLARE_*` + `ALIAS_MAIL_DOMAINS` | 自建 D1 别名邮箱 |
+| **yyds** | 40 | `YYDS_API_KEY` 或 `YYDS_JWT` | 溢出补量；域名可全量 LB |
 | **自定义** | 自定 | `configured()` | `register_channel(ChannelSpec(...))`，CLI/`auto` 自动带上 |
 
 ```python
@@ -405,7 +457,7 @@ register_channel(ChannelSpec(
 | `TURNSTILE_SOLVER` | 栈 | 默认有头？ | 何时用 |
 |---|---|---|---|
 | **`auto`（默认）** | 有 DrissionPage → **drission**；否则 → **browser** | 随所选后端 | 日常默认，不用改 |
-| **`drission`** | DrissionPage + 本机 **Chrome** + `turnstilePatch/` | **是**（`0`） | **推荐主力**；暖页池 + 终端批量 |
+| **`drission`** | DrissionPage + 本机 **Chrome** + `extensions/turnstilePatch/` | **是**（`0`） | **推荐主力**；暖页池 + 终端批量 |
 | **`camoufox`** | **Camoufox** 反检测 Firefox（经 Playwright 启动） | **是**（`0`） | 想换 Firefox / 反检测；需额外 `camoufox fetch` |
 | **`browser`** | Playwright Chromium/Chrome | **否**（`1`） | 没装 Drission 时的回退；本机 IP 上往往不如前两者稳 |
 | **`safari`** | 系统 Safari（macOS） | 会抢焦点 | 手动/单路；池 minters 固定 1 |
@@ -424,7 +476,7 @@ register_channel(ChannelSpec(
 pip install -r requirements.txt
 
 # drission（默认路径）额外需要：本机已装 Google Chrome
-# turnstilePatch/ 扩展已随仓库提供，无需手装
+# extensions/turnstilePatch/ 扩展已随仓库提供，无需手装
 
 # camoufox 额外：
 pip install camoufox
@@ -476,10 +528,10 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 
 说明：
 
-1. 注册 / 验码 / SSO / OAuth 走协议 HTTP；Turnstile 只在注册建号前 mint。  
-2. **默认 token 池**：后台 mint、注册线程 `from pool` 取用；池关才走 `TURNSTILE_PARALLEL`。  
-3. drission 暖页约 2.4s/枚；冷启动首枚更慢。  
-4. OAuth：优先 SSO session-reuse，失败 Device Flow。  
+1. 注册 / 验码 / SSO 走协议 HTTP；Turnstile 只在建号前 mint。OAuth 默认在独立 worker 池跑。  
+2. **默认 token 池**：后台 mint、注册线程 `from pool`；池关才走 `TURNSTILE_PARALLEL`。  
+3. drission 暖页约 2.4s/枚；默认 **尽早 force-render**（`TURNSTILE_CLICK_EMAIL=0`）。  
+4. OAuth：**session-reuse 快路径优先**（可重试）→ Device Flow 兜底；`-t` 与 `--oauth-workers` 分开调。  
 5. headless 更容易被 CF 拦；批量优先 **有头 + 最小化/离屏 + 暖复用 + 池**。
 
 ### 日志里怎么认后端 / 池
@@ -506,12 +558,13 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 3. Turnstile（本机浏览器后端 / token 池，见 [Turnstile 后端](#turnstile-后端)）  
 4. `create_account` + 提取 SSO → `sso_output/sso_*.json` + 追加 `sso_tokens.txt`  
 
-**Build OAuth**（`run.py` 注册后）
+**Build OAuth**（`run.py`：SSO 后默认进独立 OAuth 池）
 
-1. **快路径** `oauth_protocol`：注册 SSO → CookieSetter + consent → code → token  
-2. **回退** `sso2auth`：SSO cookie → Device Flow（device/code → verify/approve → poll token）→ 写 CPA JSON  
-3. 默认写出 `cliproxyapi_auth/`  
-4. `--no-oauth-protocol`：只走 Device Flow  
+1. 注册线程拿到 SSO 后 `SSO ready -> OAuth queue`，**立即释放**（默认 `OAUTH_ASYNC=1`）  
+2. **快路径** `oauth_protocol`：SSO cookies → CookieSetter + consent → code → token（`OAUTH_TRANSPORT_RETRIES`）  
+3. **回退** `sso2auth` Device Flow（`OAUTH_ALLOW_DEVICE=1` 时）→ 写 CPA JSON  
+4. 默认写出 `cliproxyapi_auth/`；`-n` 按 BUILD 成功计数  
+5. `--no-oauth-async`：同线程串行 Build；`--no-oauth-protocol`：只走 Device Flow  
 
 接口与额度策略以平台实时行为为准，文档数值仅供研究参考。
 
@@ -521,40 +574,38 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 
 ```text
 .
-├── NOTICE                         # 具有约束力的使用须知（必读）
-├── LICENSE                        # MIT
+├── NOTICE / LICENSE / SECURITY.md
 ├── README.md / README.en.md
-├── SECURITY.md
-├── run.py                         # 主入口
-├── check_accounts.py              # auth 可用性 / Build 额度
-├── retry_oauth_from_sso.py        # SSO → CPA Device Flow
-├── xai_oauth_login.py             # 交互式浏览器 OAuth
-├── xai_oauth_export_cliproxyapi.py
-├── requirements.txt
-├── .env.example
-├── xconsole_client/               # 协议库（Python 包名，历史命名）
+├── requirements.txt / .env.example
+├── ruff.toml / pyrightconfig.json
+├── run.py                         # 主入口：注册 → SSO → Build OAuth
+├── xconsole_client/               # 协议库（可 import 的包）
+│   ├── paths.py                   # 仓库根 / 运行时目录 / 扩展路径
 │   ├── client.py                  # 注册
-│   ├── oauth_protocol.py          # 协议 OAuth（SSO session-reuse）
-│   ├── sso2auth.py                # SSO Device Flow → CPA
-│   ├── xai_oauth.py               # PKCE / 导出 / 浏览器登录
-│   ├── mail_channels.py           # 邮箱渠道 registry + prefer/overflow 路由
-│   ├── mailbox_pool.py            # 后台邮箱预创建池（默认 on）
-│   ├── tempmail_transport.py      # Tempmail.lol（free create 节流）
-│   ├── yyds_transport.py          # YYDS / maliapi 邮箱
-│   ├── turnstile_pool.py          # 后台 token 池（默认 on，随 -t 自动）
-│   ├── solver.py                  # Turnstile 工厂
-│   ├── drission_solver.py         # Drission + turnstilePatch（暖页复用）
-│   ├── camoufox_solver.py         # Camoufox
-│   └── sso.py / mailbox.py / ...
-├── turnstilePatch/                # Chrome 扩展（Drission 用）
-└── alias_mail/                    # 可选：Cloudflare 邮箱助手
+│   ├── oauth_protocol.py          # SSO session-reuse OAuth
+│   ├── sso2auth.py                # Device Flow → CPA
+│   ├── xai_oauth.py / sso.py / ...
+│   ├── mail_channels.py / mailbox_pool.py
+│   ├── tempmail_transport.py
+│   ├── tempmailspot_transport.py / maildrop_transport.py
+│   ├── yyds_transport.py / mailbox.py
+│   ├── turnstile_pool.py / solver.py
+│   └── drission_solver.py         # Drission + extensions/turnstilePatch
+├── tools/                         # 辅助 CLI（非主路径）
+│   ├── check_accounts.py
+│   ├── retry_oauth_from_sso.py
+│   ├── xai_build_quota_probe.py
+│   ├── xai_oauth_login.py
+│   └── xai_oauth_export_cliproxyapi.py
+├── extensions/
+│   └── turnstilePatch/            # Chrome MV2 扩展（Drission）
+├── contrib/
+│   └── alias_mail/                # 可选：Cloudflare 邮箱助手
+├── scripts/quality-check.sh       # pre-commit 质量门
+└── githooks/pre-commit
 
-# 运行时（gitignore）
-# sso_output/               默认写（sso_*.json + sso_tokens.txt）
-# cliproxyapi_auth/         默认写（OAuth 成功）
-# cliproxyapi_auth_failed/  仅 --check-quota 时
-# oauth_output/             可选
-# accounts_output/          可选
+# 运行时产物（gitignore，默认写在仓库根，路径由 xconsole_client.paths 解析）
+# sso_output/  cliproxyapi_auth/  cliproxyapi_auth_failed/  oauth_output/  accounts_output/
 ```
 
 运行产物：默认 **`sso_output/` + `cliproxyapi_auth/`**。`--check-quota` 开启时无额度文件进 `cliproxyapi_auth_failed/`。`oauth_output/` 仅独立 OAuth 工具/显式指定时写；`accounts_output/` 仅 `--accounts-output-dir <path>` 时写。
@@ -566,8 +617,8 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 - 依赖第三方公开接口，部署变更可能导致链路失效
 - Turnstile 仍是瓶颈之一：冷启动首枚约 10–16s；**暖页约 2.4s/枚**；默认池按需生产，避免空闲狂 mint
 - headless / 脏 IP 更容易空 token；优先 `drission` 或 `camoufox` 有头
-- Tempmail **free** 有 RPM 上限：默认 `-t 4` + create 3s 节流；多渠道时 yyds/CF **补量**（非全切）；冲更高吞吐可 Plus key 或提高 tempmail capacity
-- 邮箱 / 代理 SSL 抖动会影响成功率；默认 30s 无码即换箱（换箱仍走路由/池）
+- 免费邮箱各有限额：tempmail free ≈20 create/min；tempmailspot ≈10 create/min；maildrop 50 req/10s。默认 `-t 4` + 多渠道 **prefer+overflow** 补量（非全切）；冲更高吞吐可 Plus key / 调 `MAIL_CHANNEL_CAPACITY`
+- Maildrop 对陌生发信服务器可能 greylist（首封延迟数分钟）；默认 30s 无码即换箱（换箱仍走路由/池）
 - 并发过高可能触发平台风控；研究用途请保持克制
 - 导出 CPA auth 需要完成 OAuth（协议或 Device Flow）
 - 注册 Turnstile 使用本机浏览器后端；OAuth 使用协议 session-reuse 与 Device Flow

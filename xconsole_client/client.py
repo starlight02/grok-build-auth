@@ -97,6 +97,16 @@ class _UrllibTransport:
         set_cookies = resp.headers.get_all("set-cookie") or []
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
         if self._debug:
+            from .logutil import get_logger
+
+            get_logger("client").debug(
+                "<- %s %s %s (%s bytes, %s set-cookie, transport=urllib)",
+                status,
+                method,
+                url,
+                len(raw),
+                len(set_cookies),
+            )
             print(
                 f"  <- {status} {method} {url}  ({len(raw)} bytes, {len(set_cookies)} set-cookie, transport=urllib)"
             )
@@ -747,6 +757,7 @@ class XConsoleAuthClient:
 
         rsc_text = getattr(self, "_last_rsc_body", "") or ""
         attempts = max(1, int(retries))
+        last_err = ""
         for attempt in range(1, attempts + 1):
             if token:
                 break
@@ -763,6 +774,8 @@ class XConsoleAuthClient:
                     password="",
                     save=False,
                 )
+                if not token:
+                    last_err = getattr(extractor, "last_error", "") or last_err
             if not token:
                 token = self._fetch_sso_via_grok_home()
             if not token:
@@ -776,6 +789,13 @@ class XConsoleAuthClient:
 
         if token and (save or email):
             save_sso(token, email=email, password=password, output_dir=output_dir)
+        if not token:
+            if last_err:
+                print(f"  [sso] extract failed: {last_err}", flush=True)
+            elif not rsc_text:
+                print("  [sso] extract failed: empty create_account RSC body", flush=True)
+            else:
+                print("  [sso] extract failed: no sso after jar+grok home", flush=True)
         return token
 
     def close(self):

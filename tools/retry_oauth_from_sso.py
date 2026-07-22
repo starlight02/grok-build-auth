@@ -17,7 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent
+_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from xconsole_client.sso2auth import mint_cpa_from_sso  # noqa: E402
@@ -139,7 +139,7 @@ def retry_one(item: dict, auth_dir: Path, proxy: str) -> dict:
 
 
 def main() -> int:
-    root = Path(__file__).resolve().parent
+    root = _ROOT
     list_path = root / "oauth_retry_list.json"
     sso_dir = root / "sso_output"
     auth_dir = default_cliproxyapi_auth_dir()

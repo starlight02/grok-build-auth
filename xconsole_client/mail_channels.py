@@ -3,8 +3,8 @@
 
 Design goals
 ------------
-1. **Single channel** (only tempmail, or ``-e yyds``): zero multi-LB overhead;
-   create may block on free-tier pacing / retries like before.
+1. **Single channel** (``-e tempmail`` / ``-e maildrop`` / only one configured):
+   zero multi-LB overhead; create may block on free-tier pacing / retries like before.
 2. **Multi channel** (``-e auto`` with 2+ configured): prefer high-weight
    channels when they have a free slot; overflow to others for *this* create
    only. Rate limits are capacity, not "channel dead".
@@ -12,7 +12,7 @@ Design goals
    detection, weights, capacity, and create all pick it up. No edits to
    ``run.py`` if/else trees required for new backends.
 
-Built-ins: ``tempmail``, ``yyds``, ``cloudflare``.
+Built-ins: ``tempmail``, ``tempmailspot``, ``maildrop``, ``yyds``, ``cloudflare``.
 """
 
 from __future__ import annotations
@@ -179,6 +179,44 @@ def _tempmail_capacity() -> int:
     return 1
 
 
+def _create_tempmailspot() -> Tuple[str, Any]:
+    from xconsole_client.tempmailspot_transport import TempmailspotInbox
+
+    inbox = TempmailspotInbox(debug=False)
+    email = inbox.create()
+    return email, inbox
+
+
+def _tempmailspot_ready_in() -> float:
+    from xconsole_client.tempmailspot_transport import create_ready_in
+
+    return float(create_ready_in())
+
+
+def _tempmailspot_capacity() -> int:
+    # Documented generate ≈10/min; keep single in-flight create by default.
+    return 1
+
+
+def _create_maildrop() -> Tuple[str, Any]:
+    from xconsole_client.maildrop_transport import MaildropInbox
+
+    inbox = MaildropInbox(prefix="xai", debug=False)
+    email = inbox.create()
+    return email, inbox
+
+
+def _maildrop_ready_in() -> float:
+    from xconsole_client.maildrop_transport import create_ready_in
+
+    return float(create_ready_in())
+
+
+def _maildrop_capacity() -> int:
+    # Create is local (no API); allow a few parallel allocations.
+    return 3
+
+
 def _create_yyds() -> Tuple[str, Any]:
     from xconsole_client.yyds_transport import YydsInbox
 
@@ -228,6 +266,28 @@ def _register_builtins() -> None:
             ready_in=_tempmail_ready_in,
             capacity_fn=_tempmail_capacity,
             help="Tempmail.lol (free or TEMPMAIL_API_KEY)",
+        ),
+        ChannelSpec(
+            name="tempmailspot",
+            weight=70,
+            capacity=1,
+            always_available=True,
+            configured=lambda: True,
+            create=_create_tempmailspot,
+            ready_in=_tempmailspot_ready_in,
+            capacity_fn=_tempmailspot_capacity,
+            help="TempMailSpot free API (no key; site /api/mailbox/*)",
+        ),
+        ChannelSpec(
+            name="maildrop",
+            weight=65,
+            capacity=3,
+            always_available=True,
+            configured=lambda: True,
+            create=_create_maildrop,
+            ready_in=_maildrop_ready_in,
+            capacity_fn=_maildrop_capacity,
+            help="Maildrop.cc GraphQL (no key; https://docs.maildrop.cc)",
         ),
         ChannelSpec(
             name="yyds",

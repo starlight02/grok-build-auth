@@ -1,13 +1,10 @@
 {
   "include": [
     "run.py",
-    "check_accounts.py",
-    "xai_build_quota_probe.py",
-    "retry_oauth_from_sso.py",
-    "xai_oauth_export_cliproxyapi.py",
-    "xai_oauth_login.py",
-    "alias_mail",
-    "xconsole_client"
+    "tools",
+    "contrib/alias_mail",
+    "xconsole_client",
+    "tests"
   ],
   "exclude": [
     "**/__pycache__",
@@ -17,6 +14,8 @@
     "sso_output"
   ],
   "pythonVersion": "3.11",
+  "venvPath": ".",
+  "venv": ".venv",
   "typeCheckingMode": "basic",
   "reportMissingImports": "none",
   "reportMissingModuleSource": "none",

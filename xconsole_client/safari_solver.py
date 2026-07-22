@@ -758,41 +758,38 @@ return "sys-events"
 
     def _solve_once(self, url: str, key: str, deadline: float) -> str:
         self._open(url)
-        for _ in range(40):
+        # Wait only until body exists — do not burn seconds on full readyState.
+        for _ in range(24):
             if time.time() >= deadline:
                 break
-            if self._page_ready():
-                try:
-                    ready = self._js("String(document.readyState || '')", timeout=5.0)
-                except Exception:
-                    ready = ""
-                if ready.strip().lower() in {"interactive", "complete"}:
-                    break
-            time.sleep(0.35)
-        time.sleep(0.5)
+            try:
+                body = self._js(
+                    "String(!!(document.body && document.documentElement))",
+                    timeout=3.0,
+                )
+            except Exception:
+                body = "false"
+            if body.strip().lower() in {"true", "1"}:
+                break
+            time.sleep(0.12)
 
-        # Drop any residual token/host from a previous mint in this profile.
+        # Drop residual token/host, then inject API ASAP for early CF paint.
         try:
-            self._js(_CLEAN_TS_JS, timeout=8.0)
+            self._js(_CLEAN_TS_JS, timeout=5.0)
         except Exception as exc:
             self._log(f"clean skip: {exc}")
 
-        # Email path is optional and often wrong for minting.
+        # Email path optional (default off) — never block first CF paint.
         if _env_truthy("TURNSTILE_SAFARI_EMAIL", False):
             try:
-                clicked = self._js(_CLICK_EMAIL_JS, timeout=10.0)
+                clicked = self._js(_CLICK_EMAIL_JS, timeout=4.0)
                 self._log(f"email path click: {clicked!r}")
-                time.sleep(0.7)
+                time.sleep(0.2)
             except Exception as exc:
                 self._log(f"email click skip: {exc}")
         else:
-            self._log("skip email path (TURNSTILE_SAFARI_EMAIL=0)")
+            self._log("skip email path (TURNSTILE_SAFARI_EMAIL=0; early CF)")
 
-        # Always force-render a fresh explicit widget.
-        # Preferring "native" homepage boxes was wrong: after one HID solve the
-        # dead/solved card still matches geometry, we skipped re-render, and the
-        # next mint never showed a new challenge.
-        # Opt out only with TURNSTILE_SAFARI_FORCE_RENDER=0 (legacy native path).
         force_render = _env_truthy("TURNSTILE_SAFARI_FORCE_RENDER", True)
         if not force_render:
             self._log("FORCE_RENDER=0: legacy native-only path (may stick on solved widget)")
@@ -804,40 +801,41 @@ return "sys-events"
                     break
                 time.sleep(0.35)
         else:
+            # Start api.js inject immediately; poll briefly.
             try:
                 has_ts = self._js(
                     "String(!!(window.turnstile && window.turnstile.render))",
-                    timeout=10.0,
+                    timeout=4.0,
                 )
             except Exception:
                 has_ts = "false"
             if has_ts.strip().lower() not in {"true", "1"}:
                 try:
-                    inj = self._js(_INJECT_API_JS, timeout=10.0)
-                    self._log(f"turnstile api: {inj}")
+                    inj = self._js(_INJECT_API_JS, timeout=6.0)
+                    self._log(f"turnstile api early inject: {inj}")
                 except Exception as exc:
                     self._log(f"inject skip: {exc}")
-                for _ in range(20):
+                for _ in range(16):
                     if time.time() >= deadline:
                         break
                     try:
                         ready = self._js(
                             "String(!!(window.turnstile && window.turnstile.render))",
-                            timeout=5.0,
+                            timeout=3.0,
                         )
                     except Exception:
                         ready = "false"
                     if ready.strip().lower() in {"true", "1"}:
                         break
-                    time.sleep(0.35)
+                    time.sleep(0.2)
 
             render_js = _FORCE_RENDER_JS.replace("%SITEKEY%", repr(key))
             try:
-                meta = self._js(render_js, timeout=15.0)
-                self._log(f"force render: {meta}")
+                meta = self._js(render_js, timeout=12.0)
+                self._log(f"early force render: {meta}")
             except Exception as exc:
                 self._log(f"force render failed: {exc}")
-            time.sleep(1.2)
+            time.sleep(0.35)
         # HID click (optional).
         if not self._hid_enabled:
             self._log("HID disabled (TURNSTILE_SAFARI_HID=0); no click path")

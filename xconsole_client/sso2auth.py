@@ -13,7 +13,6 @@ Flow:
 from __future__ import annotations
 
 import json
-import os
 import re
 import threading
 import time
@@ -50,15 +49,9 @@ _DEVICE_CODE_MIN_INTERVAL = 0.35
 
 
 def _proxy_from_env(explicit: str = "") -> str:
-    p = (explicit or "").strip()
-    if p:
-        return p
-    return (
-        os.environ.get("HTTPS_PROXY")
-        or os.environ.get("HTTP_PROXY")
-        or os.environ.get("ALL_PROXY")
-        or ""
-    ).strip()
+    from .envutil import proxy_from_env
+
+    return proxy_from_env(explicit, include_all=True)
 
 
 def _is_transient_error(exc: BaseException | str) -> bool:

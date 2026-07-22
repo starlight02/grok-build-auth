@@ -34,8 +34,8 @@ import requests
 
 
 try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
 except Exception:
     pass
 
@@ -437,7 +437,9 @@ def decode_raw(raw: str) -> dict[str, str]:
                 except Exception:
                     payload = part.get_payload(decode=True) or b""
                     charset = part.get_content_charset() or "utf-8"
-                    text = payload.decode(charset, errors="replace")
+                    if not isinstance(payload, (bytes, bytearray)):
+                        payload = str(payload).encode(charset, errors="replace")
+                    text = bytes(payload).decode(charset, errors="replace")
                 if ctype == "text/html":
                     text = re.sub(r"<[^>]+>", " ", html.unescape(text))
                 parts.append(text)
@@ -447,7 +449,9 @@ def decode_raw(raw: str) -> dict[str, str]:
         except Exception:
             payload = msg.get_payload(decode=True) or b""
             charset = msg.get_content_charset() or "utf-8"
-            parts.append(payload.decode(charset, errors="replace"))
+            if not isinstance(payload, (bytes, bytearray)):
+                payload = str(payload).encode(charset, errors="replace")
+            parts.append(bytes(payload).decode(charset, errors="replace"))
 
     body = "\n".join(parts)
     body = re.sub(r"\s+", " ", body).strip()

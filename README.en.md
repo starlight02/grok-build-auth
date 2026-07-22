@@ -8,10 +8,12 @@ A **protocol-research client** for publicly observable **x.ai / Grok web authent
 
 for protocol analysis, interoperability research, and **authorized** local integration testing.
 
-Default path: signup/OAuth over pure HTTP (`curl_cffi`). Turnstile **token pool on by default**. Mailbox: **pluggable multi-channel registry + background mail pool on by default** (`-e auto` enables every configured channel — prefer high-RPM sources, overflow on rate limits; single channel → solo). OAuth: protocol session-reuse, Device Flow fallback.
+Default path: signup over pure HTTP (`curl_cffi`). Turnstile **token pool on by default**. Mailbox: **pluggable multi-channel registry + background mail pool on by default** (`-e auto` prefer+overflow; single channel → solo).
+
+**Pipelined by default:** `-t` only covers **signup through SSO**. After SSO is written, the registration thread is freed; a dedicated **OAuth worker pool** (`--oauth-workers`, default `max(-t,2)`) prefers the **session-reuse fast path**, then falls back to Device Flow. `-n` counts **BUILD exports**.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![Use](https://img.shields.io/badge/use-research%20%2F%20authorized%20only-red)](#legal-boundary)
 
 ---
@@ -48,17 +50,19 @@ A research-oriented protocol client, **not** an official SDK.
 |---|---|
 | **Signup** | Email code (gRPC-web) + Turnstile + Next.js Server Action on `accounts.x.ai` |
 | **SSO** | Session JWT extraction for OAuth session reuse |
-| **OAuth** | Fast path: `oauth_protocol` SSO session-reuse (PKCE + cookie-setter + consent); fallback: `sso2auth` Device Flow; pure HTTP end-to-end |
+| **OAuth** | Dedicated worker pool; prefer `oauth_protocol` SSO **session-reuse** (PKCE + cookie-setter + consent, with transport retries); then `sso2auth` Device Flow; pure HTTP |
 | **Export** | Local `type=xai` auth files compatible with [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (Grok Build channel) |
 
 Highlights:
 
 - **Protocol-first** pure HTTP (`curl_cffi`) for signup / OAuth
-- **Turnstile pool**: background mint, signup threads only consume; **on by default**; demand-driven (stop when stock covers demand)
-- **Mail pool + multi-channel**: pluggable `mail_channels` registry; background inbox create; **prefer + overflow** (tempmail keeps its RPM; yyds/CF fill gaps — not a full switch on rate limit)
-- **Auto-tune from `-t`**: token/mail pool size & minters scale with registration threads (env can pin values)
-- **OAuth dual path**: SSO session-reuse (`oauth_protocol`); Device Flow fallback (`sso2auth`)
-- **Lean outputs**: default writes `sso_output/` + `cliproxyapi_auth/`
+- **Signup / OAuth split**: `-t` = registration concurrency; `--oauth-workers` = Build concurrency; SSO no longer blocks reg slots
+- **Fast path first**: session-reuse with `OAUTH_TRANSPORT_RETRIES`; Device fallback remains default (`OAUTH_ALLOW_DEVICE=1`)
+- **Turnstile pool + early force-render**: background mint; CF widget painted ASAP (`TURNSTILE_CLICK_EMAIL=0` by default)
+- **Mail pool + multi-channel** prefer + overflow
+- **Auto-tune from `-t`** for token/mail pools
+- **Transport retries**: SSL EOF / timeout classified as retriable (`TRANSPORT_RETRY` without proxy pool)
+- **Lean outputs**: `sso_output/` + `cliproxyapi_auth/`
 
 CPA export needs OAuth `access_token` / `refresh_token` (protocol path or Device Flow).
 
@@ -69,37 +73,53 @@ CPA export needs OAuth `access_token` / `refresh_token` (protocol path or Device
 ```mermaid
 flowchart TB
     subgraph entry [run.py]
-      A["-n / -t / -e auto|channel"]
+      A["-n target / -t reg threads / --oauth-workers"]
     end
 
     subgraph pools [Background pools default on]
-      TP[TurnstileTokenPool<br/>turnstile_pool]
-      MP[MailboxPool<br/>mailbox_pool]
-      R[ChannelRouter<br/>mail_channels]
+      TP[TurnstileTokenPool]
+      MP[MailboxPool]
+      R[ChannelRouter]
       MP --> R
       R -->|prefer| TM[tempmail]
+      R -->|overflow| TS[tempmailspot]
+      R -->|overflow| MD[maildrop]
       R -->|overflow| YY[yyds]
       R -->|overflow| CF[cloudflare]
-      R -.->|register_channel| X[future channels…]
     end
 
-    subgraph browser [Turnstile browser backends]
-      S[drission / camoufox / browser]
+    subgraph reg [Registration pool -t]
+      B[signup client.py]
+      C[SSO sso_output]
+    end
+
+    subgraph oauthp [OAuth worker pool default on]
+      Q[SSO job queue]
+      D{session-reuse<br/>oauth_protocol}
+      F[sso2auth Device Flow]
+      E[token exchange]
+    end
+
+    subgraph browser [Turnstile]
+      S[drission early force-render]
     end
 
     A --> TP
     A --> MP
     TP -->|mint| S
-    A --> B[signup client.py]
+    A --> B
     TP -->|token| B
-    MP -->|Mailbox email+receiver+channel| B
-    B --> C[SSO sso_output]
-    C --> D{OAuth fast path<br/>oauth_protocol}
-    D -->|OK| E[token exchange]
-    D -->|fail| F[sso2auth Device Flow]
+    MP -->|inbox| B
+    B --> C
+    C -->|free reg thread| Q
+    Q --> D
+    D -->|OK| E
+    D -->|fail if allowed| F
     F --> E
     E --> G[cliproxyapi_auth/*.json]
 ```
+
+`-n` counts **BUILD exports** by default (`cliproxyapi_auth`); with `--no-oauth` it counts SSO.
 
 ---
 
@@ -107,9 +127,9 @@ flowchart TB
 
 This is **not** a zero-config product. At minimum you need:
 
-- Python 3.9+
+- Python 3.11+
 - Turnstile: local browser backend (default Drission + headed Chrome; optional Camoufox / Playwright)
-- Mailbox: default `-e auto` — **all configured** channels (tempmail always; yyds/cloudflare when credentials exist); or force one with `-e tempmail|yyds|cloudflare`
+- Mailbox: default `-e auto` — **all configured** channels (tempmail/tempmailspot/maildrop always; yyds/cloudflare when credentials exist); or force one with `-e tempmail|tempmailspot|maildrop|yyds|cloudflare`
 - Optional HTTP(S) proxy
 - Optional local CLIProxyAPI install to load exported auth files
 
@@ -126,9 +146,11 @@ git clone https://github.com/<you>/grok-build-auth.git
 cd grok-build-auth
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
+# or runtime-only:
+# pip install -r requirements.txt
 # optional Camoufox backend:
-# pip install camoufox && camoufox fetch
+# pip install -e ".[camoufox]" && camoufox fetch
 cp .env.example .env
 # put only your own secrets in .env — never commit it
 ```
@@ -156,11 +178,17 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 | `TURNSTILE_BROWSER_REUSE` | no | `1` = warm browser reuse (default 1; drission warm-page) |
 | `TEMPMAIL_API_KEY` | no | Tempmail.lol Plus/Ultra (**free tier needs no key**) |
 | `TEMPMAIL_FREE_CREATE_INTERVAL` | no | free-tier create min interval seconds (default **3 ≈ 20/min**) |
+| `TEMPMAILSPOT_API_BASE` | no | default `https://tempmailspot.com` |
+| `TEMPMAILSPOT_CREATE_INTERVAL` | no | create min interval seconds (default **6 ≈ 10/min**) |
+| `MAILDROP_API_URL` | no | default `https://api.maildrop.cc/graphql` |
+| `MAILDROP_DOMAIN` | no | default `maildrop.cc` |
+| `MAILDROP_USE_ALIAS` | no | `1` = signup with altinbox alias, poll original mailbox |
+| `MAILDROP_POLL_INTERVAL` | no | poll interval seconds (default 5) |
 | `YYDS_API_KEY` / `YYDS_JWT` | no | YYDS mailbox (either; included by `-e auto` when set) |
 | `YYDS_API_BASE` | no | default `https://maliapi.215.im/v1` |
 | `YYDS_DOMAINS` | no | domain allow-list (empty = **all verified**, domain-level LB) |
-| `MAIL_BACKENDS` | no | explicit channel list, overrides `-e auto` (e.g. `tempmail,yyds`) |
-| `MAIL_CHANNEL_WEIGHTS` | no | preference, e.g. `tempmail:100,yyds:40,cloudflare:60` |
+| `MAIL_BACKENDS` | no | explicit channel list, overrides `-e auto` (e.g. `tempmail,tempmailspot,maildrop`) |
+| `MAIL_CHANNEL_WEIGHTS` | no | preference, e.g. `tempmail:100,tempmailspot:70,maildrop:65` |
 | `MAIL_CHANNEL_CAPACITY` | no | max concurrent creates per channel before overflow |
 | `MAIL_POOL` | no | background inbox pool (**on by default**; `0` off) |
 | `MAIL_POOL_SIZE` / `_TARGET` / `_MINTERS` | no | same semantics as turnstile pool (auto from `-t`) |
@@ -172,6 +200,15 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 | `CLOUDFLARE_D1_DB_ID` | same | D1 database ID |
 | `ALIAS_MAIL_DOMAINS` | same | domains you control (comma-separated) |
 | `CLIPROXYAPI_AUTH_DIR` | no | default `./cliproxyapi_auth` |
+| `OAUTH_ASYNC` | no | **default `1`**: hand off to OAuth pool after SSO; `0` / `--no-oauth-async` = inline Build |
+| `OAUTH_WORKERS` | no | OAuth pool size (or `--oauth-workers`; default `max(-t, 2)`) |
+| `OAUTH_TRANSPORT_RETRIES` | no | session-reuse transport retries (default **3**) |
+| `OAUTH_ALLOW_DEVICE` | no | Device Flow after fast-path failure (default **`1`**; `0` = fast path only) |
+| `TRANSPORT_RETRY` | no | registration transport retries **without** proxy pool (default 3; SSL EOF / timeout) |
+| `VISIT_HOME` | no | `1` = visit console home before signup (**default 0** skip) |
+| `TURNSTILE_CLICK_EMAIL` | no | `1` = click email signup before mint (default **0**, early CF force-render) |
+| `TURNSTILE_NATIVE_POLL` | no | native assist seconds after force-render fails (default 4; `0` off) |
+| `TURNSTILE_FORCE_POLL` | no | poll budget after force-render (default 12s) |
 | `HTTPS_PROXY` / `HTTP_PROXY` | no | single proxy (when no pool file) |
 | `PROXY_POOL_FILE` | no | proxy list file, **one URL per line**; exit-IP geo probe on start |
 | `PROXY_POOL` | no | small inline list; use FILE for large pools |
@@ -179,29 +216,35 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 | `PROXY_POOL_SCOPE` | no | `same_region` (**default**) / `all` |
 | `PROXY_GEO_WORKERS` | no | concurrent probes (default 16) |
 | `PROXY_GEO_CACHE` | no | probe cache (default `./.proxy_geo_cache.json`) |
+| `PROXY_RETRY` | no | per-account proxy rotate on transport fail when pool is on (default 8; covers SSL EOF) |
 
 ### Run (research / accounts you own)
 
 ```bash
-# Zero-config batch: -t 4 + token pool + mail pool + -e auto (prefer+overflow)
+# Zero-config batch: -t 4 reg + OAuth pool (default max(-t,2)) + token/mail pools + -e auto
 python run.py -n 20
 
 # Single-account smoke
 python run.py -n 1
 
-# Concurrency (token/mail pools auto-retune; -t 8 → size=8 minters=2)
+# Tune reg vs OAuth pool separately (recommend oauth-workers ≥ -t)
+python run.py -n 20 -t 4 --oauth-workers 6
+
+# Registration concurrency (token/mail follow -t; OAuth workers default max(-t,2))
 python run.py -n 20 -t 8
 
 # Force a single channel (solo: may block on wait/retry)
 python run.py -n 10 -e yyds
 python run.py -n 10 -e tempmail
+python run.py -n 10 -e tempmailspot
+python run.py -n 10 -e maildrop
 python run.py -n 1 -e cloudflare
 
 # Explicit multi-channel list
-MAIL_BACKENDS=tempmail,yyds python run.py -n 20 -t 8
+MAIL_BACKENDS=tempmail,tempmailspot,maildrop,yyds python run.py -n 20 -t 8
 
 # Weights / capacity (prefer tempmail; overflow when slots full)
-MAIL_CHANNEL_WEIGHTS=tempmail:100,yyds:40 MAIL_CHANNEL_CAPACITY=tempmail:3,yyds:2 \
+MAIL_CHANNEL_WEIGHTS=tempmail:100,tempmailspot:70,maildrop:65 MAIL_CHANNEL_CAPACITY=tempmail:3,maildrop:3 \
   python run.py -n 20 -t 8
 
 # Disable mail pool (create at register time; router still works)
@@ -225,8 +268,18 @@ PROXY_POOL_FILE=./proxies.txt PROXY_REGION=us python run.py -n 10 -t 4
 touch /tmp/grok-turnstile.pause
 rm    /tmp/grok-turnstile.pause
 
+# SSO only (no Build)
 python run.py -n 1 --no-oauth
+
+# Disable OAuth async pool: Build inline on the registration thread
+python run.py -n 4 -t 2 --no-oauth-async
+
+# Force Device Flow for the whole OAuth step (skips session-reuse; slower)
 python run.py -n 1 --no-oauth-protocol
+
+# Fast path only (no Device fallback) — useful when debugging session-reuse
+OAUTH_ALLOW_DEVICE=0 python run.py -n 5 -t 2 --oauth-workers 4
+
 python run.py -n 1 --cliproxyapi-auth-dir /path/to/CLIProxyAPI/data/auth
 python run.py -n 1 --accounts-output-dir ./accounts_output
 python run.py -n 1 --oauth-debug
@@ -245,10 +298,10 @@ python run.py -n 5 -t 4 --check-quota --failed-auth-dir ./cliproxyapi_auth_faile
 | `accounts_output/` | off | pipeline ledger (`--accounts-output-dir`) |
 
 Helpers:
-- `check_accounts.py` — auth usability / Build quota
-- `retry_oauth_from_sso.py` — SSO → CPA Device Flow
-- `xai_oauth_login.py` — interactive browser OAuth
-- `xai_oauth_export_cliproxyapi.py` — export oauth_output → CPA auth
+- `tools/check_accounts.py` — auth usability / Build quota
+- `tools/retry_oauth_from_sso.py` — SSO → CPA Device Flow
+- `tools/xai_oauth_login.py` — interactive browser OAuth
+- `tools/xai_oauth_export_cliproxyapi.py` — export oauth_output → CPA auth
 
 ---
 
@@ -288,25 +341,25 @@ Explicit `TURNSTILE_POOL_SIZE` / `_TARGET` / `_MINTERS` / `TURNSTILE_PARALLEL` w
 - Later mints reuse the page (`force-render` + CDP click) ≈ **2.3–2.5s/token** (first cold mint ≈ 10–16s)
 - Headed defaults: **minimized + off-screen** to avoid stealing OS focus
 
-### Tempmail free alignment
+### Free mailbox alignment
 
-- CLI default **`-t 4`** targets free-tier steady throughput
-- Without `TEMPMAIL_API_KEY`, inbox `create` is paced at **3s** (≈20/min) process-wide
-- Plus/Ultra key skips free create pacing; raise `-t` if needed
-- **Multi-channel**: free pacing / 429 only blocks tempmail *for that slot*; yyds/etc. overflow immediately; tempmail is preferred again when ready (not a full switch)
+- CLI default **`-t 4`** targets tempmail free-tier steady throughput
+- Without `TEMPMAIL_API_KEY`, tempmail `create` is paced at **3s** (≈20/min) process-wide
+- Plus/Ultra key skips tempmail free create pacing; raise `-t` if needed
+- **Multi-channel**: free pacing / 429 only blocks *that* channel for the slot; ready `tempmailspot` / `maildrop` / `yyds` / CF overflow immediately; high-weight channels are preferred again when ready (not a full switch)
 
 ### How to read startup logs
 
 ```text
 grok-build-auth: 20 accounts, 4 threads, email=auto, ... pool=on, mail-pool=on
-  mail-channels:        tempmail,yyds (prefer+overflow; weights via MAIL_CHANNEL_WEIGHTS)
+  mail-channels:        tempmail,tempmailspot,maildrop (prefer+overflow; weights via MAIL_CHANNEL_WEIGHTS)
   turnstile-pool:       size=4 target=2 minters=1 max_age=200s (auto from -t=4)
   mail-pool:            size=4 target=2 minters=1 max_age=600s (auto from -t=4)
   [ts-pool] pool +1 len=837 q=1/4 want=2 wait=0
   [mail-pool] mail pool +1 [tempmail] xai…@… q=2/4
   [mail] mail channel tempmail rate: … (next_slot≈3.0s; overflow/retry)
-  [mail] mail create via yyds: xai…@…
-  [3/20] [#2] email [yyds]: xai…@…
+  [mail] mail create via tempmailspot: …@…
+  [3/20] [#2] email [tempmailspot]: …@…
   [3/20] [#2] Turnstile 837 chars from pool (age=6s q=1)
 ```
 
@@ -320,9 +373,11 @@ Signup threads **only consume** ready `Mailbox(email, receiver, channel)` object
 
 | Channel | Default weight | Available when | Notes |
 |---|---|---|---|
-| **tempmail** | 100 | always (free or `TEMPMAIL_API_KEY`) | usually highest create RPM; preferred |
-| **yyds** | 40 | `YYDS_API_KEY` or `YYDS_JWT` | overflow / top-up; domain-level LB |
+| **tempmail** | 100 | always (free or `TEMPMAIL_API_KEY`) | Tempmail.lol; usually highest create RPM; preferred |
+| **tempmailspot** | 70 | always (no key) | live site `POST /api/mailbox/new|fetch` (public v1 docs incomplete); ≈10 create/min |
+| **maildrop** | 65 | always (no key) | [Maildrop](https://docs.maildrop.cc) GraphQL; local `*@maildrop.cc`; 50 req/10s; greylist possible for new MTAs |
 | **cloudflare** | 60 | `CLOUDFLARE_*` + `ALIAS_MAIL_DOMAINS` | self-hosted D1 alias mail |
+| **yyds** | 40 | `YYDS_API_KEY` or `YYDS_JWT` | overflow / top-up; domain-level LB |
 | **custom** | yours | `configured()` | `register_channel(ChannelSpec(...))` — auto picks up in CLI/`auto` |
 
 ```python
@@ -366,7 +421,7 @@ Select a backend with `TURNSTILE_SOLVER` (or `resolve_turnstile_solver(backend=.
 | `TURNSTILE_SOLVER` | Stack | Headed by default? | When to use |
 |---|---|---|---|
 | **`auto` (default)** | DrissionPage installed → **drission**; else → **browser** | follows backend | daily default |
-| **`drission`** | DrissionPage + system **Chrome** + `turnstilePatch/` | **yes** (`0`) | **recommended** for warm-page pool batches |
+| **`drission`** | DrissionPage + system **Chrome** + `extensions/turnstilePatch/` | **yes** (`0`) | **recommended** for warm-page pool batches |
 | **`camoufox`** | **Camoufox** anti-detect Firefox (via Playwright) | **yes** (`0`) | Firefox / anti-detect; needs `camoufox fetch` |
 | **`browser`** | Playwright Chromium/Chrome | **no** (`1`) | fallback without Drission |
 | **`safari`** | system Safari (macOS) | steals focus | manual/single path; pool minters fixed at 1 |
@@ -384,7 +439,7 @@ Aliases:
 pip install -r requirements.txt
 
 # drission (default path): system Google Chrome required
-# turnstilePatch/ ships in-repo
+# extensions/turnstilePatch/ ships in-repo
 
 # camoufox extra:
 pip install camoufox
@@ -431,10 +486,10 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 
 Notes:
 
-1. Signup / mail / SSO / OAuth use protocol HTTP; Turnstile mint is only needed before create-account.  
-2. **Token pool is default**: background mint; signup threads take `from pool`. `TURNSTILE_PARALLEL` applies only when pool is off.  
-3. Drission warm-page ≈ 2.4s/token; first cold mint is slower.  
-4. OAuth: SSO session-reuse first, Device Flow on failure.  
+1. Signup / mail / SSO use protocol HTTP; Turnstile mint is only before create-account. OAuth runs on a dedicated worker pool by default.  
+2. **Token pool is default**: background mint; signup threads take `from pool`. `TURNSTILE_PARALLEL` only when pool is off.  
+3. Drission warm-page ≈ 2.4s/token; **early force-render** by default (`TURNSTILE_CLICK_EMAIL=0`).  
+4. OAuth: **session-reuse first** (with retries) → Device Flow fallback; tune `-t` and `--oauth-workers` separately.  
 5. Prefer **headed + minimized/off-screen + warm reuse + pool** for batches.
 
 ### How to tell which path ran
@@ -449,6 +504,20 @@ Notes:
 ```
 
 ---
+
+## Repository layout
+
+```text
+.
+├── run.py                 # main entry (signup → SSO → Build OAuth)
+├── xconsole_client/       # protocol library (`paths.py` resolves runtime dirs)
+│                          # mail: mail_channels + tempmail/tempmailspot/maildrop/yyds transports
+├── tools/                 # helper CLIs (check / retry OAuth / probe / export)
+├── extensions/turnstilePatch/
+├── contrib/alias_mail/
+├── scripts/ + githooks/   # quality gate
+└── (gitignored) sso_output/ cliproxyapi_auth/ oauth_output/ …
+```
 
 ## Contributing
 

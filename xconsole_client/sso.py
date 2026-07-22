@@ -158,6 +158,7 @@ class SSOExtractor:
         self._base_headers = base_headers
         self._cookies = cookie_jar
         self.debug = debug
+        self.last_error: str = ""
 
     # ----------------------------------------------------------------- public
 
@@ -181,28 +182,39 @@ class SSOExtractor:
 
         Returns the ``sso`` JWT string, or ``None`` if extraction fails.
         """
+        self.last_error = ""
         # 1. find the JWT chain URL in the RSC body
         sso_url = parse_sso_jwt_url(rsc_body)
         if not sso_url:
+            self.last_error = "no JWT set-cookie URL in create_account RSC body"
             if self.debug:
-                print("  [sso] no JWT set-cookie URL in RSC body")
+                print(f"  [sso] {self.last_error}")
             return None
 
         if self.debug:
             print(f"  [sso] JWT URL: {sso_url[:80]}...")
 
-        # 2. decode the JWT to find the next hop (grokusercontent)
+        # 2. decode the JWT to find nested success_url hops
         jwt = _extract_jwt_from_url(sso_url)
         if not jwt:
+            self.last_error = "could not extract JWT from set-cookie URL"
             if self.debug:
-                print("  [sso] could not extract JWT from URL")
+                print(f"  [sso] {self.last_error}")
             return None
 
         success_url = self._resolve_success_url(jwt)
         if self.debug:
             print(f"  [sso] success_url: {success_url[:80]}...")
 
-        # 3. hit the grokusercontent endpoint (retry once on transport errors)
+        # 3. Walk the full chain. Transport uses allow_redirects=False, so we must
+        # follow Location ourselves and collect Set-Cookie at every hop.
+        # Order: first RSC URL (e.g. auth.grokipedia.com) then JWT success_url
+        # (auth.grokusercontent.com) then any further Location redirects.
+        hops: list[str] = []
+        for u in (sso_url, success_url):
+            if u and u not in hops:
+                hops.append(u)
+
         headers = self._base_headers()
         headers.update(
             {
@@ -213,58 +225,73 @@ class SSOExtractor:
                 "referer": C.ACCOUNTS_ORIGIN + "/",
             }
         )
-        set_cookies: List[str] = []
+        all_set_cookies: List[str] = []
         last_exc: Optional[BaseException] = None
-        for attempt in range(2):
-            try:
-                _status, _hdrs, set_cookies, _raw = self._request(
-                    "GET",
-                    success_url,
-                    headers=headers,
-                    body=None,
-                )
-                last_exc = None
-                if self.debug:
-                    print(
-                        f"  [sso] set-cookie hop HTTP {_status}, "
-                        f"set-cookies={len(set_cookies or [])}"
-                    )
-                break
-            except TypeError:
-                # Some transports accept headers as keyword-only without body=.
+        hop_notes: list[str] = []
+        for start_url in hops:
+            url = start_url
+            for depth in range(6):
                 try:
-                    _status, _hdrs, set_cookies, _raw = self._request(
-                        "GET",
-                        success_url,
-                        headers=headers,
-                    )
+                    try:
+                        status, hdrs, set_cookies, _raw = self._request(
+                            "GET",
+                            url,
+                            headers=headers,
+                            body=None,
+                        )
+                    except TypeError:
+                        status, hdrs, set_cookies, _raw = self._request(
+                            "GET",
+                            url,
+                            headers=headers,
+                        )
                     last_exc = None
-                    break
                 except Exception as exc:
                     last_exc = exc
-            except Exception as exc:
-                last_exc = exc
+                    hop_notes.append(f"err@{url[:48]}:{exc}")
+                    if self.debug:
+                        print(f"  [sso] hop failed: {exc}")
+                    break
+
+                scs = list(set_cookies or [])
+                all_set_cookies.extend(scs)
+                hop_notes.append(f"HTTP {status} sc={len(scs)} @ {url[:56]}")
                 if self.debug:
-                    print(f"  [sso] request failed (attempt {attempt + 1}): {exc}")
-                if attempt == 0:
-                    import time as _time
+                    print(f"  [sso] hop HTTP {status}, set-cookies={len(scs)} url={url[:72]}")
+                token = parse_sso_from_set_cookies(scs) or self._read_sso_from_jar()
+                if token:
+                    if save or email:
+                        path = save_sso(
+                            token, email=email, password=password, output_dir=output_dir
+                        )
+                        if self.debug:
+                            print(f"  [sso] saved to: {path}")
+                    return token
 
-                    _time.sleep(0.4)
+                if status not in (301, 302, 303, 307, 308):
+                    break
+                loc = ""
+                if isinstance(hdrs, dict):
+                    loc = str(hdrs.get("location") or hdrs.get("Location") or "").strip()
+                if not loc:
+                    break
+                # relative Location
+                if loc.startswith("/"):
+                    from urllib.parse import urljoin
+
+                    loc = urljoin(url, loc)
+                url = loc
+                headers["referer"] = start_url
+
         if last_exc is not None:
-            if self.debug:
-                print(f"  [sso] request failed: {last_exc}")
-            return None
-
-        # 4. prefer Set-Cookie header, then cookie jar
-        token = parse_sso_from_set_cookies(set_cookies or []) or self._read_sso_from_jar()
-
-        # 5. persist if requested
-        if token and (save or email):
-            path = save_sso(token, email=email, password=password, output_dir=output_dir)
-            if self.debug:
-                print(f"  [sso] saved to: {path}")
-
-        return token
+            self.last_error = f"set-cookie hop request failed: {last_exc}"
+        else:
+            self.last_error = (
+                "set-cookie chain yielded no sso cookie (" + "; ".join(hop_notes[-4:]) + ")"
+            )
+        if self.debug:
+            print(f"  [sso] {self.last_error}")
+        return self._read_sso_from_jar() or None
 
     # ----------------------------------------------------------------- internal
 
@@ -300,7 +327,9 @@ class SSOExtractor:
 
 # Default output directory, resolved relative to the xconsole repo root.
 def _default_output_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "sso_output"
+    from .paths import sso_output_dir
+
+    return sso_output_dir()
 
 
 # Serialize appends to sso_tokens.txt under concurrent -t N workers.

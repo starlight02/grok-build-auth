@@ -16,6 +16,10 @@ Env extras:
     not re-applied after launch if you restore/maximize the window
   TURNSTILE_FORCE_POLL — seconds to wait after force-render (default 12)
   TURNSTILE_RELOAD_ON_FAIL — 1=drop warm page and reload after empty token
+  TURNSTILE_CLICK_EMAIL — 1=click "sign up with email" before mint (default 0;
+    early CF force-render does not need the email path)
+  TURNSTILE_NATIVE_POLL — optional native-widget assist seconds after force-render
+    fails (default 4; set 0 to skip)
 
 Browser lifecycle: thread-local warm Chrome + one warm mint tab.
 """
@@ -26,11 +30,12 @@ import os
 import subprocess
 import threading
 import time
-from pathlib import Path
 from typing import Any, Optional
+
+from .paths import turnstile_extension_dir
 from urllib.parse import urlparse
 
-_EXT_DIR = Path(__file__).resolve().parent.parent / "turnstilePatch"
+_EXT_DIR = turnstile_extension_dir()
 
 _CHROMIUM_SLIM_FLAGS = [
     "--disable-gpu",
@@ -56,20 +61,15 @@ _solve_count_lock = threading.Lock()
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
-    raw = (os.environ.get(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on", "y"}
+    from .envutil import env_truthy
+
+    return env_truthy(name, default)
 
 
 def _proxy_from_env(explicit: str = "") -> str:
-    return (
-        (explicit or "").strip()
-        or (os.environ.get("HTTPS_PROXY") or "").strip()
-        or (os.environ.get("HTTP_PROXY") or "").strip()
-        or (os.environ.get("https_proxy") or "").strip()
-        or (os.environ.get("http_proxy") or "").strip()
-    )
+    from .envutil import proxy_from_env
+
+    return proxy_from_env(explicit)
 
 
 def _chrome_bin() -> Optional[str]:
@@ -149,8 +149,9 @@ for (const el of document.querySelectorAll(
 host = document.createElement('div');
 host.id = hostId;
 host.style.cssText =
-  'width:300px;height:80px;position:fixed;top:80px;left:20px;'
-  + 'z-index:999999;background:#fff;border:1px solid #ccc;';
+  'width:300px;height:80px;position:fixed;top:12px;left:12px;'
+  + 'z-index:2147483647;background:#fff;border:1px solid #ddd;'
+  + 'box-shadow:0 2px 8px rgba(0,0,0,.15);';
 document.body.appendChild(host);
 let inp = document.querySelector('input[name="cf-turnstile-response"]');
 if (!inp) {
@@ -531,6 +532,11 @@ class DrissionTurnstileSolver:
         """Safari-style warm page: navigate once, reuse for later force-renders.
 
         Returns (tab, navigated).
+
+        Order is intentional for early CF paint:
+          1) navigate
+          2) inject/wait turnstile API immediately
+          3) optional email-path click (short timeout; does not block API)
         """
         tab = getattr(_tls, "mint_tab", None)
         if self._mint_tab_alive(tab, url):
@@ -543,8 +549,12 @@ class DrissionTurnstileSolver:
         tab = self._get_tab(browser)
         nav_to = min(20, max(5, int(deadline - time.time())))
         self._log(f"navigate mint page once timeout={nav_to}s")
-        tab.get(url, timeout=nav_to)
-        time.sleep(0.15)
+        # Prefer first paint over full load — CF widget can appear sooner.
+        try:
+            tab.get(url, timeout=nav_to)
+        except Exception as exc:
+            self._log(f"navigate warn: {exc}")
+        time.sleep(0.05)
 
         title = ""
         try:
@@ -555,10 +565,16 @@ class DrissionTurnstileSolver:
             self._invalidate_mint_tab()
             raise RuntimeError(f"CF block/interstitial: {title}")
 
-        self._click_email_path(tab)
-        if not self._ensure_turnstile_api(tab, min(deadline, time.time() + 8)):
+        # Kick API load first so force-render can show the challenge ASAP.
+        if not self._ensure_turnstile_api(tab, min(deadline, time.time() + 6)):
             self._invalidate_mint_tab()
             raise RuntimeError("turnstile API not available on page")
+
+        # Email path is optional; keep short so it never delays first CF paint.
+        if _env_truthy("TURNSTILE_CLICK_EMAIL", False):
+            self._click_email_path(tab)
+        else:
+            self._log("skip email path (TURNSTILE_CLICK_EMAIL=0; early CF force-render)")
 
         _tls.mint_tab = tab
         _tls.mint_url = url
@@ -577,11 +593,11 @@ class DrissionTurnstileSolver:
     def _click_email_path(self, tab: Any) -> None:
         for text in ("使用邮箱注册", "Sign up with email", "Continue with email"):
             try:
-                ele = tab.ele(f"text:{text}", timeout=1.5)
+                ele = tab.ele(f"text:{text}", timeout=0.45)
                 if ele:
                     ele.click()
                     self._log(f"clicked: {text}")
-                    time.sleep(0.4)
+                    time.sleep(0.15)
                     return
             except Exception:
                 continue
@@ -864,37 +880,17 @@ return box;
                 tab, navigated = self._ensure_mint_page(browser, url, deadline)
                 mode = "nav" if navigated else "reuse"
 
-                # 1) Prefer the **native** managed widget (what the signup page shows).
-                #    Click immediately — waiting without CDP leaves the checkbox idle.
-                try:
-                    native_s = float(os.environ.get("TURNSTILE_NATIVE_POLL") or "10")
-                except ValueError:
-                    native_s = 10.0
-                native_s = max(3.0, min(native_s, 25.0))
-                self._log(f"native widget click+poll ({mode}) up to {native_s:.0f}s")
-                self._cdp_click_widget(tab)
-                token = self._poll_token(
-                    tab,
-                    min(deadline, time.time() + native_s),
-                    allow_cdp=True,
-                    click_every=2.0,
-                )
-                if token:
-                    with _solve_count_lock:
-                        _solve_count += 1
-                        n = _solve_count
-                    self._log(f"token ok len={len(token)} (native, solve#{n}, {mode})")
-                    return token
-
-                # 2) Fallback: explicit force-render host + CDP click.
+                # Early CF: force-render on the open page ASAP so the challenge
+                # paints without waiting for native widget / email-path timeouts.
                 prev = self._run_js(tab, _READ_TOKEN_JS) or ""
                 if not (isinstance(prev, str) and len(prev) >= 80):
                     prev = ""
 
                 meta = self._run_js(tab, _FORCE_RENDER_JS, key)
-                self._log(f"force render ({mode}): {meta}")
+                self._log(f"early force render ({mode}): {meta}")
                 still = self._run_js(tab, _READ_TOKEN_JS) or ""
                 if isinstance(still, str) and len(still) >= 80:
+                    # Stale token from a previous mint — clear and re-render once.
                     prev = still
                     self._run_js(
                         tab,
@@ -906,21 +902,47 @@ for (const el of document.querySelectorAll(
 return true;
 """,
                     )
-                time.sleep(0.3)
+                    meta = self._run_js(tab, _FORCE_RENDER_JS, key)
+                    self._log(f"re-force render after clear ({mode}): {meta}")
+
+                # Immediate CDP click so the checkbox is not left idle.
+                time.sleep(0.12)
                 self._cdp_click_widget(tab)
                 token = self._poll_token(
                     tab,
                     min(deadline, time.time() + force_s),
                     allow_cdp=True,
                     reject=prev if isinstance(prev, str) else "",
-                    click_every=1.8,
+                    click_every=1.5,
                 )
                 if token:
                     with _solve_count_lock:
                         _solve_count += 1
                         n = _solve_count
-                    self._log(f"token ok len={len(token)} (force-render, solve#{n}, {mode})")
+                    self._log(f"token ok len={len(token)} (early-force, solve#{n}, {mode})")
                     return token
+
+                # Optional short native assist if force-render alone failed.
+                try:
+                    native_s = float(os.environ.get("TURNSTILE_NATIVE_POLL") or "4")
+                except ValueError:
+                    native_s = 4.0
+                native_s = max(0.0, min(native_s, 15.0))
+                if native_s > 0.5 and time.time() < deadline - 1:
+                    self._log(f"native assist click+poll ({mode}) up to {native_s:.0f}s")
+                    self._cdp_click_widget(tab)
+                    token = self._poll_token(
+                        tab,
+                        min(deadline, time.time() + native_s),
+                        allow_cdp=True,
+                        click_every=1.5,
+                    )
+                    if token:
+                        with _solve_count_lock:
+                            _solve_count += 1
+                            n = _solve_count
+                        self._log(f"token ok len={len(token)} (native-assist, solve#{n}, {mode})")
+                        return token
 
                 last_err = RuntimeError(f"empty token after force-render ({force_s:.0f}s, {mode})")
                 self._log(f"attempt {attempt + 1}: {last_err}")

@@ -77,18 +77,20 @@ def code_challenge_s256(code_verifier: str) -> str:
 
 
 def parse_jwt_payload(jwt_token: str) -> Optional[Dict[str, Any]]:
-    try:
-        parts = jwt_token.split(".")
-        if len(parts) < 2:
-            return None
-        payload = parts[1] + "=" * (-len(parts[1]) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload))
-    except Exception:
-        return None
+    """Decode a JWT payload segment (no signature verification).
+
+    Canonical implementation lives in :mod:`xconsole_client.sso`; re-exported
+    here for callers that already import OAuth helpers.
+    """
+    from .sso import parse_jwt_payload as _parse
+
+    return _parse(jwt_token)
 
 
 def default_output_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "oauth_output"
+    from .paths import oauth_output_dir
+
+    return oauth_output_dir()
 
 
 @dataclass
@@ -789,7 +791,9 @@ def default_cliproxyapi_auth_dir() -> Path:
     env = (os.environ.get("CLIPROXYAPI_AUTH_DIR") or "").strip()
     if env:
         return Path(env).expanduser()
-    return Path(__file__).resolve().parent.parent / "cliproxyapi_auth"
+    from .paths import cliproxyapi_auth_dir as _default_cpa_dir
+
+    return _default_cpa_dir()
 
 
 def main() -> None:

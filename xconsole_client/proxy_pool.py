@@ -727,12 +727,24 @@ class ProxyPool:
         return [e for e in self._region_candidates() if e.url not in self._disabled]
 
     def mark_bad(self, url: str, reason: str = "") -> bool:
-        """Disable *url* for the rest of this process. True if newly disabled."""
+        """Disable *url* for the rest of this process. True if newly disabled.
+
+        Never disables the last live proxy in the active region — a sole
+        HTTPS_PROXY / depleted pool must keep retrying flaky TLS/EOF instead
+        of spinning on ``proxy pool exhausted``.
+        """
         url = (url or "").strip()
         if not url:
             return False
         with self._lock:
             if url in self._disabled:
+                return False
+            others_live = [
+                e for e in self._region_candidates() if e.url not in self._disabled and e.url != url
+            ]
+            if not others_live:
+                if reason:
+                    self._disabled_reasons[url] = f"(kept last live) {reason[:180]}"
                 return False
             self._disabled.add(url)
             if reason:
@@ -908,6 +920,18 @@ def is_proxy_transport_error(exc: BaseException) -> bool:
         "network is unreachable",
         "socks",
         "proxy_pool exhausted",
+        # Direct-path TLS / socket flakiness (dominant fail mode in long runs)
+        "unexpected_eof",
+        "ssl: unexpected_eof",
+        "ssleoferror",
+        "eof occurred in violation of protocol",
+        "urlopen error timed out",
+        "the read operation timed out",
+        "read timed out",
+        "max retries exceeded",
+        "remote end closed connection",
+        "broken pipe",
+        "connection aborted",
         # scrape got CF / block page through a bad exit IP
         "cloudflare challenge",
         "cloudflare block",

@@ -7,8 +7,8 @@ Grok Build endpoint and reads quota signals from response headers or 429 body.
 
 Examples:
 
-    python xai_build_quota_probe.py --auth-dir ./cliproxyapi_auth
-    python xai_build_quota_probe.py --auth-dir ./cliproxyapi_auth --include-disabled
+    python tools/xai_build_quota_probe.py --auth-dir ./cliproxyapi_auth
+    python tools/xai_build_quota_probe.py --auth-dir ./cliproxyapi_auth --include-disabled
 """
 
 from __future__ import annotations
@@ -16,13 +16,18 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urljoin
 
 import requests
 
-from check_accounts import (
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from xconsole_client.account_check import (
     BUILD_USAGE_BALANCE_EXHAUSTED,
     CHAT_ENDPOINT_DENIED,
     SPENDING_LIMIT_EXHAUSTED,
@@ -73,13 +78,13 @@ def build_url(base_url: str) -> str:
     return urljoin(base, "responses")
 
 
-def header_int(headers: requests.structures.CaseInsensitiveDict[str], name: str) -> int | None:
+def header_int(headers: Mapping[str, Any], name: str) -> int | None:
     raw = headers.get(name)
     if raw is None:
         return None
     try:
         return int(raw)
-    except ValueError:
+    except (TypeError, ValueError):
         return None
 
 

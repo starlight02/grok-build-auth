@@ -24,13 +24,17 @@ cliproxyapi_auth_failed/
 
 # Proxy geo probe cache
 .proxy_geo_cache.json
-*proxies*
+# Proxy lists (local only; prefer *.txt under repo root)
+*proxies*.txt
+proxies.txt
 
 # alias_mail runtime state
 .alias_domain_health.json
 .alias_domain_state.json
 alias_mail/.alias_domain_health.json
 alias_mail/.alias_domain_state.json
+contrib/alias_mail/.alias_domain_health.json
+contrib/alias_mail/.alias_domain_state.json
 
 # Local debug leftovers
 _dbg_*.py

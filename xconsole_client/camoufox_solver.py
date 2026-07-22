@@ -35,25 +35,16 @@ _solve_count = 0
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
-    raw = (os.environ.get(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on", "y"}
+    from .envutil import env_truthy
+
+    return env_truthy(name, default)
 
 
 def _proxy_from_env(explicit: str = "") -> str:
-    for key in (
-        "HTTPS_PROXY",
-        "HTTP_PROXY",
-        "ALL_PROXY",
-        "https_proxy",
-        "http_proxy",
-        "all_proxy",
-    ):
-        val = (os.environ.get(key) or "").strip()
-        if val:
-            return val
-    return (explicit or "").strip()
+    from .envutil import proxy_from_env
+
+    # Prefer explicit first is already handled by proxy_from_env.
+    return proxy_from_env(explicit, include_all=True)
 
 
 def _playwright_proxy(proxy: str) -> Optional[dict[str, str]]:

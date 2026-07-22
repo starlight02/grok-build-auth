@@ -33,6 +33,9 @@ from typing import Any, Optional
 
 import requests
 
+from xconsole_client.codes import extract_xai_code
+from xconsole_client.envutil import proxy_from_env
+
 
 DEFAULT_API_BASE = "https://maliapi.215.im/v1"
 
@@ -94,13 +97,7 @@ class YydsInbox:
             self.preferred_domains = _env("YYDS_DOMAINS")
 
     def _proxies(self) -> Optional[dict]:
-        p = (
-            (self.proxy or "").strip()
-            or _env("HTTPS_PROXY")
-            or _env("HTTP_PROXY")
-            or _env("https_proxy")
-            or _env("http_proxy")
-        )
+        p = proxy_from_env(self.proxy)
         if not p:
             return None
         return {"http": p, "https": p}
@@ -375,7 +372,7 @@ class YydsInbox:
                             ]
                         )
 
-                code = _extract_code(" ".join(parts))
+                code = extract_xai_code(" ".join(parts))
                 if code:
                     if self.debug:
                         print(f"  [YYDS] code found: {code}")
@@ -390,24 +387,3 @@ class YydsInbox:
             if self.debug:
                 print(f"  [YYDS] polling... ({len(seen_ids)} msgs so far, {remaining:.0f}s left)")
             time.sleep(min(self.interval, remaining))
-
-
-_CODE_PATTERNS = (
-    re.compile(r"(?<![A-Z0-9])([A-Z0-9]{3}-[A-Z0-9]{3})(?![A-Z0-9])"),
-    re.compile(r"(?<![A-Z0-9])([A-Z0-9]{6})(?![A-Z0-9])"),
-    re.compile(r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{3}-[A-Z0-9]{3})"),
-    re.compile(r"(?i)(?:code|otp|验证码|verification|verify)\s*[:：]?\s*([A-Z0-9]{6})"),
-)
-
-
-def _extract_code(text: str) -> Optional[str]:
-    if not text:
-        return None
-    for pat in _CODE_PATTERNS:
-        m = pat.search(text)
-        if m:
-            raw = m.group(1) if m.groups() else m.group(0)
-            if raw.replace("-", "").isdigit():
-                continue
-            return raw.upper()
-    return None
