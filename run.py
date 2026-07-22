@@ -23,10 +23,12 @@
     TURNSTILE_PAUSE_FILE   存在则暂停 mint/HID 点击（默认 /tmp/grok-turnstile.pause）
     TEMPMAIL_API_KEY       Optional Tempmail.lol Plus/Ultra（免费层无需；提高限额）
     TEMPMAIL_FREE_CREATE_INTERVAL  无 key 时 create 最小间隔秒（默认 3 ≈20/min）
+    TEMPMAILSPOT_API_BASE / TEMPMAILSPOT_CREATE_INTERVAL  TempMailSpot 免费渠道（始终可用）
+    MAILDROP_API_URL / MAILDROP_DOMAIN / MAILDROP_USE_ALIAS  Maildrop GraphQL 免费渠道（始终可用）
     YYDS_API_KEY / YYDS_JWT  YYDS 邮箱（-e yyds|auto；二选一）
     YYDS_API_BASE            默认 https://maliapi.215.im/v1
     YYDS_DOMAINS             可选域名白名单（空=全部已验证域名，负载均衡）
-    MAIL_BACKENDS           多渠道列表（如 tempmail,yyds）；空则看 -e
+    MAIL_BACKENDS           多渠道列表（如 tempmail,tempmailspot,maildrop,yyds）；空则看 -e
     MAIL_POOL               邮箱预创建池（默认开；0=关）
     MAIL_POOL_SIZE/TARGET/MINTERS  同 turnstile 池语义（默认随 -t）
     MAIL_POOL_MAX_AGE       池内邮箱最大年龄秒（默认 600）
@@ -552,6 +554,9 @@ def register_one(
                     "error": str(exc),
                 }
                 _log(index, f"ERROR: {exc}")
+                # Single/all proxies dead → stop thrashing new workers forever.
+                if "proxy pool exhausted" in str(exc).lower():
+                    request_stop("proxy-pool-exhausted")
                 break
 
             if attempt > 1:
@@ -984,7 +989,15 @@ def _register_one_attempt(
                 tag = f" (try {attempt}/{mail_attempts})" if mail_attempts > 1 else ""
                 _log(index, f"email [{channel}]: {addr}{tag}")
                 try:
-                    c.create_email_validation_code(addr)
+                    send_res = c.create_email_validation_code(addr)
+                    if not getattr(send_res, "ok", False):
+                        raw_len = len(getattr(send_res, "raw", b"") or b"")
+                        raise RuntimeError(
+                            "CreateEmailValidationCode rejected "
+                            f"(http={getattr(send_res, 'http_status', '?')}, "
+                            f"grpc={getattr(send_res, 'grpc_status', None)}, "
+                            f"raw_len={raw_len}) — domain blocked or empty gRPC body"
+                        )
                 except Exception as exc:  # noqa: BLE001
                     last_err = exc
                     code_box["err"] = exc

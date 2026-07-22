@@ -727,12 +727,24 @@ class ProxyPool:
         return [e for e in self._region_candidates() if e.url not in self._disabled]
 
     def mark_bad(self, url: str, reason: str = "") -> bool:
-        """Disable *url* for the rest of this process. True if newly disabled."""
+        """Disable *url* for the rest of this process. True if newly disabled.
+
+        Never disables the last live proxy in the active region — a sole
+        HTTPS_PROXY / depleted pool must keep retrying flaky TLS/EOF instead
+        of spinning on ``proxy pool exhausted``.
+        """
         url = (url or "").strip()
         if not url:
             return False
         with self._lock:
             if url in self._disabled:
+                return False
+            others_live = [
+                e for e in self._region_candidates() if e.url not in self._disabled and e.url != url
+            ]
+            if not others_live:
+                if reason:
+                    self._disabled_reasons[url] = f"(kept last live) {reason[:180]}"
                 return False
             self._disabled.add(url)
             if reason:

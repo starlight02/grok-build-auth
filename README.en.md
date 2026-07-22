@@ -82,6 +82,8 @@ flowchart TB
       R[ChannelRouter]
       MP --> R
       R -->|prefer| TM[tempmail]
+      R -->|overflow| TS[tempmailspot]
+      R -->|overflow| MD[maildrop]
       R -->|overflow| YY[yyds]
       R -->|overflow| CF[cloudflare]
     end
@@ -127,7 +129,7 @@ This is **not** a zero-config product. At minimum you need:
 
 - Python 3.11+
 - Turnstile: local browser backend (default Drission + headed Chrome; optional Camoufox / Playwright)
-- Mailbox: default `-e auto` — **all configured** channels (tempmail always; yyds/cloudflare when credentials exist); or force one with `-e tempmail|yyds|cloudflare`
+- Mailbox: default `-e auto` — **all configured** channels (tempmail/tempmailspot/maildrop always; yyds/cloudflare when credentials exist); or force one with `-e tempmail|tempmailspot|maildrop|yyds|cloudflare`
 - Optional HTTP(S) proxy
 - Optional local CLIProxyAPI install to load exported auth files
 
@@ -176,11 +178,17 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 | `TURNSTILE_BROWSER_REUSE` | no | `1` = warm browser reuse (default 1; drission warm-page) |
 | `TEMPMAIL_API_KEY` | no | Tempmail.lol Plus/Ultra (**free tier needs no key**) |
 | `TEMPMAIL_FREE_CREATE_INTERVAL` | no | free-tier create min interval seconds (default **3 ≈ 20/min**) |
+| `TEMPMAILSPOT_API_BASE` | no | default `https://tempmailspot.com` |
+| `TEMPMAILSPOT_CREATE_INTERVAL` | no | create min interval seconds (default **6 ≈ 10/min**) |
+| `MAILDROP_API_URL` | no | default `https://api.maildrop.cc/graphql` |
+| `MAILDROP_DOMAIN` | no | default `maildrop.cc` |
+| `MAILDROP_USE_ALIAS` | no | `1` = signup with altinbox alias, poll original mailbox |
+| `MAILDROP_POLL_INTERVAL` | no | poll interval seconds (default 5) |
 | `YYDS_API_KEY` / `YYDS_JWT` | no | YYDS mailbox (either; included by `-e auto` when set) |
 | `YYDS_API_BASE` | no | default `https://maliapi.215.im/v1` |
 | `YYDS_DOMAINS` | no | domain allow-list (empty = **all verified**, domain-level LB) |
-| `MAIL_BACKENDS` | no | explicit channel list, overrides `-e auto` (e.g. `tempmail,yyds`) |
-| `MAIL_CHANNEL_WEIGHTS` | no | preference, e.g. `tempmail:100,yyds:40,cloudflare:60` |
+| `MAIL_BACKENDS` | no | explicit channel list, overrides `-e auto` (e.g. `tempmail,tempmailspot,maildrop`) |
+| `MAIL_CHANNEL_WEIGHTS` | no | preference, e.g. `tempmail:100,tempmailspot:70,maildrop:65` |
 | `MAIL_CHANNEL_CAPACITY` | no | max concurrent creates per channel before overflow |
 | `MAIL_POOL` | no | background inbox pool (**on by default**; `0` off) |
 | `MAIL_POOL_SIZE` / `_TARGET` / `_MINTERS` | no | same semantics as turnstile pool (auto from `-t`) |
@@ -228,13 +236,15 @@ python run.py -n 20 -t 8
 # Force a single channel (solo: may block on wait/retry)
 python run.py -n 10 -e yyds
 python run.py -n 10 -e tempmail
+python run.py -n 10 -e tempmailspot
+python run.py -n 10 -e maildrop
 python run.py -n 1 -e cloudflare
 
 # Explicit multi-channel list
-MAIL_BACKENDS=tempmail,yyds python run.py -n 20 -t 8
+MAIL_BACKENDS=tempmail,tempmailspot,maildrop,yyds python run.py -n 20 -t 8
 
 # Weights / capacity (prefer tempmail; overflow when slots full)
-MAIL_CHANNEL_WEIGHTS=tempmail:100,yyds:40 MAIL_CHANNEL_CAPACITY=tempmail:3,yyds:2 \
+MAIL_CHANNEL_WEIGHTS=tempmail:100,tempmailspot:70,maildrop:65 MAIL_CHANNEL_CAPACITY=tempmail:3,maildrop:3 \
   python run.py -n 20 -t 8
 
 # Disable mail pool (create at register time; router still works)
@@ -331,25 +341,25 @@ Explicit `TURNSTILE_POOL_SIZE` / `_TARGET` / `_MINTERS` / `TURNSTILE_PARALLEL` w
 - Later mints reuse the page (`force-render` + CDP click) ≈ **2.3–2.5s/token** (first cold mint ≈ 10–16s)
 - Headed defaults: **minimized + off-screen** to avoid stealing OS focus
 
-### Tempmail free alignment
+### Free mailbox alignment
 
-- CLI default **`-t 4`** targets free-tier steady throughput
-- Without `TEMPMAIL_API_KEY`, inbox `create` is paced at **3s** (≈20/min) process-wide
-- Plus/Ultra key skips free create pacing; raise `-t` if needed
-- **Multi-channel**: free pacing / 429 only blocks tempmail *for that slot*; yyds/etc. overflow immediately; tempmail is preferred again when ready (not a full switch)
+- CLI default **`-t 4`** targets tempmail free-tier steady throughput
+- Without `TEMPMAIL_API_KEY`, tempmail `create` is paced at **3s** (≈20/min) process-wide
+- Plus/Ultra key skips tempmail free create pacing; raise `-t` if needed
+- **Multi-channel**: free pacing / 429 only blocks *that* channel for the slot; ready `tempmailspot` / `maildrop` / `yyds` / CF overflow immediately; high-weight channels are preferred again when ready (not a full switch)
 
 ### How to read startup logs
 
 ```text
 grok-build-auth: 20 accounts, 4 threads, email=auto, ... pool=on, mail-pool=on
-  mail-channels:        tempmail,yyds (prefer+overflow; weights via MAIL_CHANNEL_WEIGHTS)
+  mail-channels:        tempmail,tempmailspot,maildrop (prefer+overflow; weights via MAIL_CHANNEL_WEIGHTS)
   turnstile-pool:       size=4 target=2 minters=1 max_age=200s (auto from -t=4)
   mail-pool:            size=4 target=2 minters=1 max_age=600s (auto from -t=4)
   [ts-pool] pool +1 len=837 q=1/4 want=2 wait=0
   [mail-pool] mail pool +1 [tempmail] xai…@… q=2/4
   [mail] mail channel tempmail rate: … (next_slot≈3.0s; overflow/retry)
-  [mail] mail create via yyds: xai…@…
-  [3/20] [#2] email [yyds]: xai…@…
+  [mail] mail create via tempmailspot: …@…
+  [3/20] [#2] email [tempmailspot]: …@…
   [3/20] [#2] Turnstile 837 chars from pool (age=6s q=1)
 ```
 
@@ -363,9 +373,11 @@ Signup threads **only consume** ready `Mailbox(email, receiver, channel)` object
 
 | Channel | Default weight | Available when | Notes |
 |---|---|---|---|
-| **tempmail** | 100 | always (free or `TEMPMAIL_API_KEY`) | usually highest create RPM; preferred |
-| **yyds** | 40 | `YYDS_API_KEY` or `YYDS_JWT` | overflow / top-up; domain-level LB |
+| **tempmail** | 100 | always (free or `TEMPMAIL_API_KEY`) | Tempmail.lol; usually highest create RPM; preferred |
+| **tempmailspot** | 70 | always (no key) | live site `POST /api/mailbox/new|fetch` (public v1 docs incomplete); ≈10 create/min |
+| **maildrop** | 65 | always (no key) | [Maildrop](https://docs.maildrop.cc) GraphQL; local `*@maildrop.cc`; 50 req/10s; greylist possible for new MTAs |
 | **cloudflare** | 60 | `CLOUDFLARE_*` + `ALIAS_MAIL_DOMAINS` | self-hosted D1 alias mail |
+| **yyds** | 40 | `YYDS_API_KEY` or `YYDS_JWT` | overflow / top-up; domain-level LB |
 | **custom** | yours | `configured()` | `register_channel(ChannelSpec(...))` — auto picks up in CLI/`auto` |
 
 ```python
@@ -499,6 +511,7 @@ Notes:
 .
 ├── run.py                 # main entry (signup → SSO → Build OAuth)
 ├── xconsole_client/       # protocol library (`paths.py` resolves runtime dirs)
+│                          # mail: mail_channels + tempmail/tempmailspot/maildrop/yyds transports
 ├── tools/                 # helper CLIs (check / retry OAuth / probe / export)
 ├── extensions/turnstilePatch/
 ├── contrib/alias_mail/

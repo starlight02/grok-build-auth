@@ -78,6 +78,8 @@ flowchart TB
       R[ChannelRouter]
       MP --> R
       R -->|prefer| TM[tempmail]
+      R -->|overflow| TS[tempmailspot]
+      R -->|overflow| MD[maildrop]
       R -->|overflow| YY[yyds]
       R -->|overflow| CF[cloudflare]
     end
@@ -124,7 +126,7 @@ flowchart TB
 
 - Python 3.11+
 - Turnstile：本机浏览器后端（默认 Drission + Chrome 有头；可选 Camoufox / Playwright）
-- 邮箱：默认 `-e auto` —— 启用**所有已配置**渠道（tempmail 始终可用；yyds / cloudflare 有凭证才进池）；也可 `-e tempmail|yyds|cloudflare` 强制单渠道
+- 邮箱：默认 `-e auto` —— 启用**所有已配置**渠道（tempmail / tempmailspot / maildrop 始终可用；yyds / cloudflare 有凭证才进池）；也可 `-e tempmail|tempmailspot|maildrop|yyds|cloudflare` 强制单渠道
 - （可选）HTTP(S) 代理
 - （可选）本地已安装的 CLIProxyAPI，用于加载导出的 auth 目录
 
@@ -175,11 +177,17 @@ cp .env.example .env
 | `TURNSTILE_BROWSER_REUSE` | 否 | `1` = 热复用浏览器（默认 1；drission 暖页复用） |
 | `TEMPMAIL_API_KEY` | 否 | Tempmail.lol Plus/Ultra（**免费层无需 key**） |
 | `TEMPMAIL_FREE_CREATE_INTERVAL` | 否 | 无 key 时 create 最小间隔秒（默认 **3 ≈ 20/min**） |
+| `TEMPMAILSPOT_API_BASE` | 否 | 默认 `https://tempmailspot.com` |
+| `TEMPMAILSPOT_CREATE_INTERVAL` | 否 | create 最小间隔秒（默认 **6 ≈ 10/min**） |
+| `MAILDROP_API_URL` | 否 | 默认 `https://api.maildrop.cc/graphql` |
+| `MAILDROP_DOMAIN` | 否 | 默认 `maildrop.cc` |
+| `MAILDROP_USE_ALIAS` | 否 | `1` = 用 altinbox 别名注册，仍轮询原 mailbox |
+| `MAILDROP_POLL_INTERVAL` | 否 | 轮询间隔秒（默认 5） |
 | `YYDS_API_KEY` / `YYDS_JWT` | 否 | YYDS 邮箱（二选一；有则 `-e auto` 自动纳入） |
 | `YYDS_API_BASE` | 否 | 默认 `https://maliapi.215.im/v1` |
 | `YYDS_DOMAINS` | 否 | 域名白名单（空 = **全部已验证域名**，域名侧负载均衡） |
-| `MAIL_BACKENDS` | 否 | 显式渠道列表，覆盖 `-e auto`（如 `tempmail,yyds`） |
-| `MAIL_CHANNEL_WEIGHTS` | 否 | 优先级，如 `tempmail:100,yyds:40,cloudflare:60` |
+| `MAIL_BACKENDS` | 否 | 显式渠道列表，覆盖 `-e auto`（如 `tempmail,tempmailspot,maildrop`） |
+| `MAIL_CHANNEL_WEIGHTS` | 否 | 优先级，如 `tempmail:100,tempmailspot:70,maildrop:65` |
 | `MAIL_CHANNEL_CAPACITY` | 否 | 每渠道并发 create 容量，满则溢出 |
 | `MAIL_POOL` | 否 | 后台邮箱预创建池（**默认开**；`0` 关） |
 | `MAIL_POOL_SIZE` / `_TARGET` / `_MINTERS` | 否 | 同 turnstile 池语义（默认随 `-t`） |
@@ -229,13 +237,15 @@ python run.py -n 20 -t 8
 # 强制单渠道（solo：可阻塞 wait/retry，无多渠溢出）
 python run.py -n 10 -e yyds
 python run.py -n 10 -e tempmail
+python run.py -n 10 -e tempmailspot
+python run.py -n 10 -e maildrop
 python run.py -n 1 -e cloudflare
 
 # 显式多渠道列表（覆盖 auto 检测）
-MAIL_BACKENDS=tempmail,yyds python run.py -n 20 -t 8
+MAIL_BACKENDS=tempmail,tempmailspot,maildrop,yyds python run.py -n 20 -t 8
 
-# 调权重 / 容量（tempmail 优先；满 slot 才溢出 yyds）
-MAIL_CHANNEL_WEIGHTS=tempmail:100,yyds:40 MAIL_CHANNEL_CAPACITY=tempmail:3,yyds:2 \
+# 调权重 / 容量（tempmail 优先；满 slot 才溢出）
+MAIL_CHANNEL_WEIGHTS=tempmail:100,tempmailspot:70,maildrop:65 MAIL_CHANNEL_CAPACITY=tempmail:3,maildrop:3 \
   python run.py -n 20 -t 8
 
 # 关邮箱池（注册时现场 create；路由仍可用）
@@ -364,25 +374,25 @@ python tools/xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyap
 - 之后同页 `force-render` + CDP 点击，暖 mint 约 **2.3–2.5s/枚**（冷启动首枚约 10–16s）
 - 有头默认 **最小化 + 离屏**，尽量不抢系统焦点
 
-### 与 Tempmail free 对齐
+### 与免费邮箱层对齐
 
-- CLI 默认 **`-t 4`**：贴近 free 层稳态吞吐
-- 无 `TEMPMAIL_API_KEY` 时，`create` 进程级节流默认 **3s/次（≈20/min）**，减轻 429
-- 有 Plus/Ultra key 时跳过 free create 节流；可自行提高 `-t`
-- **多渠道时**：free pacing / 429 只让 tempmail「这一拍」不可用，yyds 等立即补量；slot 恢复后仍优先 tempmail（不是全切）
+- CLI 默认 **`-t 4`**：贴近 tempmail free 稳态吞吐
+- 无 `TEMPMAIL_API_KEY` 时，tempmail `create` 进程级节流默认 **3s/次（≈20/min）**，减轻 429
+- 有 Plus/Ultra key 时跳过 tempmail free create 节流；可自行提高 `-t`
+- **多渠道时**：任一渠道的 free pacing / 429 只挡「这一拍」；`tempmailspot` / `maildrop` / `yyds` / CF 等 ready 渠道立刻补量；slot 恢复后仍优先高 weight（不是全切）
 
 ### 启动日志怎么读
 
 ```text
 grok-build-auth: 20 accounts, 4 threads, email=auto, ... pool=on, mail-pool=on
-  mail-channels:        tempmail,yyds (prefer+overflow; weights via MAIL_CHANNEL_WEIGHTS)
+  mail-channels:        tempmail,tempmailspot,maildrop (prefer+overflow; weights via MAIL_CHANNEL_WEIGHTS)
   turnstile-pool:       size=4 target=2 minters=1 max_age=200s (auto from -t=4)
   mail-pool:            size=4 target=2 minters=1 max_age=600s (auto from -t=4)
   [ts-pool] pool +1 len=837 q=1/4 want=2 wait=0
   [mail-pool] mail pool +1 [tempmail] xai…@… q=2/4
   [mail] mail channel tempmail rate: … (next_slot≈3.0s; overflow/retry)
-  [mail] mail create via yyds: xai…@…
-  [3/20] [#2] email [yyds]: xai…@…
+  [mail] mail create via tempmailspot: …@…
+  [3/20] [#2] email [tempmailspot]: …@…
   [3/20] [#2] Turnstile 837 chars from pool (age=6s q=1)
 ```
 
@@ -396,9 +406,11 @@ grok-build-auth: 20 accounts, 4 threads, email=auto, ... pool=on, mail-pool=on
 
 | 渠道 | 默认 weight | 何时 available | 说明 |
 |---|---|---|---|
-| **tempmail** | 100 | 始终（free 或 `TEMPMAIL_API_KEY`） | 通常最高 create RPM；优先 |
-| **yyds** | 40 | `YYDS_API_KEY` 或 `YYDS_JWT` | 溢出补量；域名可全量 LB |
+| **tempmail** | 100 | 始终（free 或 `TEMPMAIL_API_KEY`） | Tempmail.lol；通常最高 create RPM；优先 |
+| **tempmailspot** | 70 | 始终（无需 key） | 站点真实接口 `POST /api/mailbox/new|fetch`（公开 v1 文档不完整）；≈10 create/min |
+| **maildrop** | 65 | 始终（无需 key） | [Maildrop](https://docs.maildrop.cc) GraphQL；本地生成 `*@maildrop.cc`；50 req/10s；陌生 MTA 可能 greylist |
 | **cloudflare** | 60 | `CLOUDFLARE_*` + `ALIAS_MAIL_DOMAINS` | 自建 D1 别名邮箱 |
+| **yyds** | 40 | `YYDS_API_KEY` 或 `YYDS_JWT` | 溢出补量；域名可全量 LB |
 | **自定义** | 自定 | `configured()` | `register_channel(ChannelSpec(...))`，CLI/`auto` 自动带上 |
 
 ```python
@@ -573,7 +585,10 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 │   ├── oauth_protocol.py          # SSO session-reuse OAuth
 │   ├── sso2auth.py                # Device Flow → CPA
 │   ├── xai_oauth.py / sso.py / ...
-│   ├── mail_channels.py / mailbox_pool.py / ...
+│   ├── mail_channels.py / mailbox_pool.py
+│   ├── tempmail_transport.py
+│   ├── tempmailspot_transport.py / maildrop_transport.py
+│   ├── yyds_transport.py / mailbox.py
 │   ├── turnstile_pool.py / solver.py
 │   └── drission_solver.py         # Drission + extensions/turnstilePatch
 ├── tools/                         # 辅助 CLI（非主路径）
@@ -602,8 +617,8 @@ TURNSTILE_SOLVER=browser TURNSTILE_HEADLESS=0 python run.py -n 1
 - 依赖第三方公开接口，部署变更可能导致链路失效
 - Turnstile 仍是瓶颈之一：冷启动首枚约 10–16s；**暖页约 2.4s/枚**；默认池按需生产，避免空闲狂 mint
 - headless / 脏 IP 更容易空 token；优先 `drission` 或 `camoufox` 有头
-- Tempmail **free** 有 RPM 上限：默认 `-t 4` + create 3s 节流；多渠道时 yyds/CF **补量**（非全切）；冲更高吞吐可 Plus key 或提高 tempmail capacity
-- 邮箱 / 代理 SSL 抖动会影响成功率；默认 30s 无码即换箱（换箱仍走路由/池）
+- 免费邮箱各有限额：tempmail free ≈20 create/min；tempmailspot ≈10 create/min；maildrop 50 req/10s。默认 `-t 4` + 多渠道 **prefer+overflow** 补量（非全切）；冲更高吞吐可 Plus key / 调 `MAIL_CHANNEL_CAPACITY`
+- Maildrop 对陌生发信服务器可能 greylist（首封延迟数分钟）；默认 30s 无码即换箱（换箱仍走路由/池）
 - 并发过高可能触发平台风控；研究用途请保持克制
 - 导出 CPA auth 需要完成 OAuth（协议或 Device Flow）
 - 注册 Turnstile 使用本机浏览器后端；OAuth 使用协议 session-reuse 与 Device Flow
